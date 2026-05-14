@@ -110,12 +110,13 @@ int main(int argc, char* argv[]) {
         // 统计写到 stderr，不会干扰 stdout 协议
         std::fprintf(stderr,
                      "[qwen2_chat] prefill=%d tok %.0f ms, decode=%d tok %.0f ms"
-                     " (%.2f tok/s)%s\n",
+                     " (%.2f tok/s)  stop=%s\n",
                      result.prefill_tokens, result.prefill_ms,
                      result.decode_tokens,  result.decode_ms,
                      result.decode_tokens > 0
                         ? result.decode_tokens / (result.decode_ms / 1000.0f) : 0.0f,
-                     result.hit_stop ? " [hit_stop]" : "");
+                     result.hit_stop       ? "eos" :
+                     result.hit_repetition ? "repetition" : "max_tokens");
         std::fflush(stdout);
     }
 

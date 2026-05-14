@@ -14,7 +14,7 @@ struct Qwen2Config {
     int   intermediate_size    = 8960;
     int   vocab_size           = 151936;
     float rms_norm_eps         = 1e-6f;
-    float rope_theta           = 500000.0f;
+    float rope_theta           = 1000000.0f;  // config.json: rope_theta=1000000
     int   max_position         = 512;
 
     // 便捷派生量
