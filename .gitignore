@@ -1,0 +1,56 @@
+# Model files (large, not tracked)
+# models/
+models/qwen1.5b/Qwen1.5B
+
+# Temp scripts
+dl_miniforge.py
+miniforge.sh
+
+# Build artifacts
+build/
+install/
+*.o
+*.a
+*.so
+*.so.*
+*.d
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+*.egg
+.venv/
+venv/
+env/
+
+# RKNN converted models
+*.rknn
+*.rkllm
+
+# ONNX exports
+*.onnx
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

@@ -1,0 +1,829 @@
+===========================================================================
+  Qwen1.5B (Qwen2ForCausalLM) 完整层布局  NPU/CPU 分配
+===========================================================================
+  配置: 28层 | hidden=1536 | heads=12 | KV_heads=2(GQA)
+         head_dim=128 | intermediate=8960 | vocab=151936 | act=silu
+===========================================================================
+
+┌─ 输入
+    🔵 CPU  Tokenizer                     文本 → token ids  (vocab=151936)
+    🔵 CPU  Embedding (embed_tokens)      [seq, 151936] → [seq, 1536]  (CPU, 大表查找)
+
+├─ TransformerBlock [00/27]
+    🔵 CPU    input_layernorm (RMSNorm)   [seq, 1536]  eps=1e-6
+  │  [Self-Attention  GQA  NH=12 NKV=2]
+    🟢 NPU  MatMul  q_proj                [M×1536] @ [1536×1536] + bias(CPU)
+    🔵 CPU      bias_add (q)              [M, 1536] + [1536]
+    🟢 NPU  MatMul  k_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (k)              [M, 256] + [256]
+    🟢 NPU  MatMul  v_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (v)              [M, 256] + [256]
+    🔵 CPU      RoPE (rotary_emb)         Q[M,12,128], K[M,2,128]  → 旋转位置编码
+    🔵 CPU      GQA expand K/V            KV heads 2 → 12  (repeat_kv)
+    🔵 CPU      KV Cache append           K,V concat历史  [past+M, 2, 128]
+    🟢 NPU  MatMul  QK^T (per head)        [M×128] @ [128×seqlen]  →score
+    🔵 CPU      scale + Softmax           score / sqrt(128)  → attn_weights [M, seqlen]
+    🟢 NPU  MatMul  score@V (per head)     [M×seqlen] @ [seqlen×128]
+          ⚠️ score@V 的 K=seqlen，seqlen必须是32的倍数！
+             prefill时需要pad序列长度；decode时KV cache长度需对齐
+    🟢 NPU  MatMul  o_proj                [M×1536] @ [1536×1536]
+    🔵 CPU    post_attn_layernorm (RMSNorm)  [M, 1536]  + 残差加法
+  │  [MLP  SwiGLU]
+    🟢 NPU  MatMul  gate_proj             [M×1536] @ [1536×8960]
+    🟢 NPU  MatMul  up_proj               [M×1536] @ [1536×8960]
+    🔵 CPU      SiLU(gate) * up           element-wise  [M, 8960]
+    🟢 NPU  MatMul  down_proj             [M×8960] @ [8960×1536]
+    🔵 CPU    residual add                [M, 1536]  + 残差
+  │
+  └─ → 残差输出传入下一层 hidden_state [M, 1536]
+
+├─ TransformerBlock [01/27]
+    🔵 CPU    input_layernorm (RMSNorm)   [seq, 1536]  eps=1e-6
+  │  [Self-Attention  GQA  NH=12 NKV=2]
+    🟢 NPU  MatMul  q_proj                [M×1536] @ [1536×1536] + bias(CPU)
+    🔵 CPU      bias_add (q)              [M, 1536] + [1536]
+    🟢 NPU  MatMul  k_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (k)              [M, 256] + [256]
+    🟢 NPU  MatMul  v_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (v)              [M, 256] + [256]
+    🔵 CPU      RoPE (rotary_emb)         Q[M,12,128], K[M,2,128]  → 旋转位置编码
+    🔵 CPU      GQA expand K/V            KV heads 2 → 12  (repeat_kv)
+    🔵 CPU      KV Cache append           K,V concat历史  [past+M, 2, 128]
+    🟢 NPU  MatMul  QK^T (per head)        [M×128] @ [128×seqlen]  →score
+    🔵 CPU      scale + Softmax           score / sqrt(128)  → attn_weights [M, seqlen]
+    🟢 NPU  MatMul  score@V (per head)     [M×seqlen] @ [seqlen×128]
+          ⚠️ score@V 的 K=seqlen，seqlen必须是32的倍数！
+             prefill时需要pad序列长度；decode时KV cache长度需对齐
+    🟢 NPU  MatMul  o_proj                [M×1536] @ [1536×1536]
+    🔵 CPU    post_attn_layernorm (RMSNorm)  [M, 1536]  + 残差加法
+  │  [MLP  SwiGLU]
+    🟢 NPU  MatMul  gate_proj             [M×1536] @ [1536×8960]
+    🟢 NPU  MatMul  up_proj               [M×1536] @ [1536×8960]
+    🔵 CPU      SiLU(gate) * up           element-wise  [M, 8960]
+    🟢 NPU  MatMul  down_proj             [M×8960] @ [8960×1536]
+    🔵 CPU    residual add                [M, 1536]  + 残差
+  │
+  └─ → 残差输出传入下一层 hidden_state [M, 1536]
+
+├─ TransformerBlock [02/27]
+    🔵 CPU    input_layernorm (RMSNorm)   [seq, 1536]  eps=1e-6
+  │  [Self-Attention  GQA  NH=12 NKV=2]
+    🟢 NPU  MatMul  q_proj                [M×1536] @ [1536×1536] + bias(CPU)
+    🔵 CPU      bias_add (q)              [M, 1536] + [1536]
+    🟢 NPU  MatMul  k_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (k)              [M, 256] + [256]
+    🟢 NPU  MatMul  v_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (v)              [M, 256] + [256]
+    🔵 CPU      RoPE (rotary_emb)         Q[M,12,128], K[M,2,128]  → 旋转位置编码
+    🔵 CPU      GQA expand K/V            KV heads 2 → 12  (repeat_kv)
+    🔵 CPU      KV Cache append           K,V concat历史  [past+M, 2, 128]
+    🟢 NPU  MatMul  QK^T (per head)        [M×128] @ [128×seqlen]  →score
+    🔵 CPU      scale + Softmax           score / sqrt(128)  → attn_weights [M, seqlen]
+    🟢 NPU  MatMul  score@V (per head)     [M×seqlen] @ [seqlen×128]
+          ⚠️ score@V 的 K=seqlen，seqlen必须是32的倍数！
+             prefill时需要pad序列长度；decode时KV cache长度需对齐
+    🟢 NPU  MatMul  o_proj                [M×1536] @ [1536×1536]
+    🔵 CPU    post_attn_layernorm (RMSNorm)  [M, 1536]  + 残差加法
+  │  [MLP  SwiGLU]
+    🟢 NPU  MatMul  gate_proj             [M×1536] @ [1536×8960]
+    🟢 NPU  MatMul  up_proj               [M×1536] @ [1536×8960]
+    🔵 CPU      SiLU(gate) * up           element-wise  [M, 8960]
+    🟢 NPU  MatMul  down_proj             [M×8960] @ [8960×1536]
+    🔵 CPU    residual add                [M, 1536]  + 残差
+  │
+  └─ → 残差输出传入下一层 hidden_state [M, 1536]
+
+├─ TransformerBlock [03/27]
+    🔵 CPU    input_layernorm (RMSNorm)   [seq, 1536]  eps=1e-6
+  │  [Self-Attention  GQA  NH=12 NKV=2]
+    🟢 NPU  MatMul  q_proj                [M×1536] @ [1536×1536] + bias(CPU)
+    🔵 CPU      bias_add (q)              [M, 1536] + [1536]
+    🟢 NPU  MatMul  k_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (k)              [M, 256] + [256]
+    🟢 NPU  MatMul  v_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (v)              [M, 256] + [256]
+    🔵 CPU      RoPE (rotary_emb)         Q[M,12,128], K[M,2,128]  → 旋转位置编码
+    🔵 CPU      GQA expand K/V            KV heads 2 → 12  (repeat_kv)
+    🔵 CPU      KV Cache append           K,V concat历史  [past+M, 2, 128]
+    🟢 NPU  MatMul  QK^T (per head)        [M×128] @ [128×seqlen]  →score
+    🔵 CPU      scale + Softmax           score / sqrt(128)  → attn_weights [M, seqlen]
+    🟢 NPU  MatMul  score@V (per head)     [M×seqlen] @ [seqlen×128]
+          ⚠️ score@V 的 K=seqlen，seqlen必须是32的倍数！
+             prefill时需要pad序列长度；decode时KV cache长度需对齐
+    🟢 NPU  MatMul  o_proj                [M×1536] @ [1536×1536]
+    🔵 CPU    post_attn_layernorm (RMSNorm)  [M, 1536]  + 残差加法
+  │  [MLP  SwiGLU]
+    🟢 NPU  MatMul  gate_proj             [M×1536] @ [1536×8960]
+    🟢 NPU  MatMul  up_proj               [M×1536] @ [1536×8960]
+    🔵 CPU      SiLU(gate) * up           element-wise  [M, 8960]
+    🟢 NPU  MatMul  down_proj             [M×8960] @ [8960×1536]
+    🔵 CPU    residual add                [M, 1536]  + 残差
+  │
+  └─ → 残差输出传入下一层 hidden_state [M, 1536]
+
+├─ TransformerBlock [04/27]
+    🔵 CPU    input_layernorm (RMSNorm)   [seq, 1536]  eps=1e-6
+  │  [Self-Attention  GQA  NH=12 NKV=2]
+    🟢 NPU  MatMul  q_proj                [M×1536] @ [1536×1536] + bias(CPU)
+    🔵 CPU      bias_add (q)              [M, 1536] + [1536]
+    🟢 NPU  MatMul  k_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (k)              [M, 256] + [256]
+    🟢 NPU  MatMul  v_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (v)              [M, 256] + [256]
+    🔵 CPU      RoPE (rotary_emb)         Q[M,12,128], K[M,2,128]  → 旋转位置编码
+    🔵 CPU      GQA expand K/V            KV heads 2 → 12  (repeat_kv)
+    🔵 CPU      KV Cache append           K,V concat历史  [past+M, 2, 128]
+    🟢 NPU  MatMul  QK^T (per head)        [M×128] @ [128×seqlen]  →score
+    🔵 CPU      scale + Softmax           score / sqrt(128)  → attn_weights [M, seqlen]
+    🟢 NPU  MatMul  score@V (per head)     [M×seqlen] @ [seqlen×128]
+          ⚠️ score@V 的 K=seqlen，seqlen必须是32的倍数！
+             prefill时需要pad序列长度；decode时KV cache长度需对齐
+    🟢 NPU  MatMul  o_proj                [M×1536] @ [1536×1536]
+    🔵 CPU    post_attn_layernorm (RMSNorm)  [M, 1536]  + 残差加法
+  │  [MLP  SwiGLU]
+    🟢 NPU  MatMul  gate_proj             [M×1536] @ [1536×8960]
+    🟢 NPU  MatMul  up_proj               [M×1536] @ [1536×8960]
+    🔵 CPU      SiLU(gate) * up           element-wise  [M, 8960]
+    🟢 NPU  MatMul  down_proj             [M×8960] @ [8960×1536]
+    🔵 CPU    residual add                [M, 1536]  + 残差
+  │
+  └─ → 残差输出传入下一层 hidden_state [M, 1536]
+
+├─ TransformerBlock [05/27]
+    🔵 CPU    input_layernorm (RMSNorm)   [seq, 1536]  eps=1e-6
+  │  [Self-Attention  GQA  NH=12 NKV=2]
+    🟢 NPU  MatMul  q_proj                [M×1536] @ [1536×1536] + bias(CPU)
+    🔵 CPU      bias_add (q)              [M, 1536] + [1536]
+    🟢 NPU  MatMul  k_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (k)              [M, 256] + [256]
+    🟢 NPU  MatMul  v_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (v)              [M, 256] + [256]
+    🔵 CPU      RoPE (rotary_emb)         Q[M,12,128], K[M,2,128]  → 旋转位置编码
+    🔵 CPU      GQA expand K/V            KV heads 2 → 12  (repeat_kv)
+    🔵 CPU      KV Cache append           K,V concat历史  [past+M, 2, 128]
+    🟢 NPU  MatMul  QK^T (per head)        [M×128] @ [128×seqlen]  →score
+    🔵 CPU      scale + Softmax           score / sqrt(128)  → attn_weights [M, seqlen]
+    🟢 NPU  MatMul  score@V (per head)     [M×seqlen] @ [seqlen×128]
+          ⚠️ score@V 的 K=seqlen，seqlen必须是32的倍数！
+             prefill时需要pad序列长度；decode时KV cache长度需对齐
+    🟢 NPU  MatMul  o_proj                [M×1536] @ [1536×1536]
+    🔵 CPU    post_attn_layernorm (RMSNorm)  [M, 1536]  + 残差加法
+  │  [MLP  SwiGLU]
+    🟢 NPU  MatMul  gate_proj             [M×1536] @ [1536×8960]
+    🟢 NPU  MatMul  up_proj               [M×1536] @ [1536×8960]
+    🔵 CPU      SiLU(gate) * up           element-wise  [M, 8960]
+    🟢 NPU  MatMul  down_proj             [M×8960] @ [8960×1536]
+    🔵 CPU    residual add                [M, 1536]  + 残差
+  │
+  └─ → 残差输出传入下一层 hidden_state [M, 1536]
+
+├─ TransformerBlock [06/27]
+    🔵 CPU    input_layernorm (RMSNorm)   [seq, 1536]  eps=1e-6
+  │  [Self-Attention  GQA  NH=12 NKV=2]
+    🟢 NPU  MatMul  q_proj                [M×1536] @ [1536×1536] + bias(CPU)
+    🔵 CPU      bias_add (q)              [M, 1536] + [1536]
+    🟢 NPU  MatMul  k_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (k)              [M, 256] + [256]
+    🟢 NPU  MatMul  v_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (v)              [M, 256] + [256]
+    🔵 CPU      RoPE (rotary_emb)         Q[M,12,128], K[M,2,128]  → 旋转位置编码
+    🔵 CPU      GQA expand K/V            KV heads 2 → 12  (repeat_kv)
+    🔵 CPU      KV Cache append           K,V concat历史  [past+M, 2, 128]
+    🟢 NPU  MatMul  QK^T (per head)        [M×128] @ [128×seqlen]  →score
+    🔵 CPU      scale + Softmax           score / sqrt(128)  → attn_weights [M, seqlen]
+    🟢 NPU  MatMul  score@V (per head)     [M×seqlen] @ [seqlen×128]
+          ⚠️ score@V 的 K=seqlen，seqlen必须是32的倍数！
+             prefill时需要pad序列长度；decode时KV cache长度需对齐
+    🟢 NPU  MatMul  o_proj                [M×1536] @ [1536×1536]
+    🔵 CPU    post_attn_layernorm (RMSNorm)  [M, 1536]  + 残差加法
+  │  [MLP  SwiGLU]
+    🟢 NPU  MatMul  gate_proj             [M×1536] @ [1536×8960]
+    🟢 NPU  MatMul  up_proj               [M×1536] @ [1536×8960]
+    🔵 CPU      SiLU(gate) * up           element-wise  [M, 8960]
+    🟢 NPU  MatMul  down_proj             [M×8960] @ [8960×1536]
+    🔵 CPU    residual add                [M, 1536]  + 残差
+  │
+  └─ → 残差输出传入下一层 hidden_state [M, 1536]
+
+├─ TransformerBlock [07/27]
+    🔵 CPU    input_layernorm (RMSNorm)   [seq, 1536]  eps=1e-6
+  │  [Self-Attention  GQA  NH=12 NKV=2]
+    🟢 NPU  MatMul  q_proj                [M×1536] @ [1536×1536] + bias(CPU)
+    🔵 CPU      bias_add (q)              [M, 1536] + [1536]
+    🟢 NPU  MatMul  k_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (k)              [M, 256] + [256]
+    🟢 NPU  MatMul  v_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (v)              [M, 256] + [256]
+    🔵 CPU      RoPE (rotary_emb)         Q[M,12,128], K[M,2,128]  → 旋转位置编码
+    🔵 CPU      GQA expand K/V            KV heads 2 → 12  (repeat_kv)
+    🔵 CPU      KV Cache append           K,V concat历史  [past+M, 2, 128]
+    🟢 NPU  MatMul  QK^T (per head)        [M×128] @ [128×seqlen]  →score
+    🔵 CPU      scale + Softmax           score / sqrt(128)  → attn_weights [M, seqlen]
+    🟢 NPU  MatMul  score@V (per head)     [M×seqlen] @ [seqlen×128]
+          ⚠️ score@V 的 K=seqlen，seqlen必须是32的倍数！
+             prefill时需要pad序列长度；decode时KV cache长度需对齐
+    🟢 NPU  MatMul  o_proj                [M×1536] @ [1536×1536]
+    🔵 CPU    post_attn_layernorm (RMSNorm)  [M, 1536]  + 残差加法
+  │  [MLP  SwiGLU]
+    🟢 NPU  MatMul  gate_proj             [M×1536] @ [1536×8960]
+    🟢 NPU  MatMul  up_proj               [M×1536] @ [1536×8960]
+    🔵 CPU      SiLU(gate) * up           element-wise  [M, 8960]
+    🟢 NPU  MatMul  down_proj             [M×8960] @ [8960×1536]
+    🔵 CPU    residual add                [M, 1536]  + 残差
+  │
+  └─ → 残差输出传入下一层 hidden_state [M, 1536]
+
+├─ TransformerBlock [08/27]
+    🔵 CPU    input_layernorm (RMSNorm)   [seq, 1536]  eps=1e-6
+  │  [Self-Attention  GQA  NH=12 NKV=2]
+    🟢 NPU  MatMul  q_proj                [M×1536] @ [1536×1536] + bias(CPU)
+    🔵 CPU      bias_add (q)              [M, 1536] + [1536]
+    🟢 NPU  MatMul  k_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (k)              [M, 256] + [256]
+    🟢 NPU  MatMul  v_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (v)              [M, 256] + [256]
+    🔵 CPU      RoPE (rotary_emb)         Q[M,12,128], K[M,2,128]  → 旋转位置编码
+    🔵 CPU      GQA expand K/V            KV heads 2 → 12  (repeat_kv)
+    🔵 CPU      KV Cache append           K,V concat历史  [past+M, 2, 128]
+    🟢 NPU  MatMul  QK^T (per head)        [M×128] @ [128×seqlen]  →score
+    🔵 CPU      scale + Softmax           score / sqrt(128)  → attn_weights [M, seqlen]
+    🟢 NPU  MatMul  score@V (per head)     [M×seqlen] @ [seqlen×128]
+          ⚠️ score@V 的 K=seqlen，seqlen必须是32的倍数！
+             prefill时需要pad序列长度；decode时KV cache长度需对齐
+    🟢 NPU  MatMul  o_proj                [M×1536] @ [1536×1536]
+    🔵 CPU    post_attn_layernorm (RMSNorm)  [M, 1536]  + 残差加法
+  │  [MLP  SwiGLU]
+    🟢 NPU  MatMul  gate_proj             [M×1536] @ [1536×8960]
+    🟢 NPU  MatMul  up_proj               [M×1536] @ [1536×8960]
+    🔵 CPU      SiLU(gate) * up           element-wise  [M, 8960]
+    🟢 NPU  MatMul  down_proj             [M×8960] @ [8960×1536]
+    🔵 CPU    residual add                [M, 1536]  + 残差
+  │
+  └─ → 残差输出传入下一层 hidden_state [M, 1536]
+
+├─ TransformerBlock [09/27]
+    🔵 CPU    input_layernorm (RMSNorm)   [seq, 1536]  eps=1e-6
+  │  [Self-Attention  GQA  NH=12 NKV=2]
+    🟢 NPU  MatMul  q_proj                [M×1536] @ [1536×1536] + bias(CPU)
+    🔵 CPU      bias_add (q)              [M, 1536] + [1536]
+    🟢 NPU  MatMul  k_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (k)              [M, 256] + [256]
+    🟢 NPU  MatMul  v_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (v)              [M, 256] + [256]
+    🔵 CPU      RoPE (rotary_emb)         Q[M,12,128], K[M,2,128]  → 旋转位置编码
+    🔵 CPU      GQA expand K/V            KV heads 2 → 12  (repeat_kv)
+    🔵 CPU      KV Cache append           K,V concat历史  [past+M, 2, 128]
+    🟢 NPU  MatMul  QK^T (per head)        [M×128] @ [128×seqlen]  →score
+    🔵 CPU      scale + Softmax           score / sqrt(128)  → attn_weights [M, seqlen]
+    🟢 NPU  MatMul  score@V (per head)     [M×seqlen] @ [seqlen×128]
+          ⚠️ score@V 的 K=seqlen，seqlen必须是32的倍数！
+             prefill时需要pad序列长度；decode时KV cache长度需对齐
+    🟢 NPU  MatMul  o_proj                [M×1536] @ [1536×1536]
+    🔵 CPU    post_attn_layernorm (RMSNorm)  [M, 1536]  + 残差加法
+  │  [MLP  SwiGLU]
+    🟢 NPU  MatMul  gate_proj             [M×1536] @ [1536×8960]
+    🟢 NPU  MatMul  up_proj               [M×1536] @ [1536×8960]
+    🔵 CPU      SiLU(gate) * up           element-wise  [M, 8960]
+    🟢 NPU  MatMul  down_proj             [M×8960] @ [8960×1536]
+    🔵 CPU    residual add                [M, 1536]  + 残差
+  │
+  └─ → 残差输出传入下一层 hidden_state [M, 1536]
+
+├─ TransformerBlock [10/27]
+    🔵 CPU    input_layernorm (RMSNorm)   [seq, 1536]  eps=1e-6
+  │  [Self-Attention  GQA  NH=12 NKV=2]
+    🟢 NPU  MatMul  q_proj                [M×1536] @ [1536×1536] + bias(CPU)
+    🔵 CPU      bias_add (q)              [M, 1536] + [1536]
+    🟢 NPU  MatMul  k_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (k)              [M, 256] + [256]
+    🟢 NPU  MatMul  v_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (v)              [M, 256] + [256]
+    🔵 CPU      RoPE (rotary_emb)         Q[M,12,128], K[M,2,128]  → 旋转位置编码
+    🔵 CPU      GQA expand K/V            KV heads 2 → 12  (repeat_kv)
+    🔵 CPU      KV Cache append           K,V concat历史  [past+M, 2, 128]
+    🟢 NPU  MatMul  QK^T (per head)        [M×128] @ [128×seqlen]  →score
+    🔵 CPU      scale + Softmax           score / sqrt(128)  → attn_weights [M, seqlen]
+    🟢 NPU  MatMul  score@V (per head)     [M×seqlen] @ [seqlen×128]
+          ⚠️ score@V 的 K=seqlen，seqlen必须是32的倍数！
+             prefill时需要pad序列长度；decode时KV cache长度需对齐
+    🟢 NPU  MatMul  o_proj                [M×1536] @ [1536×1536]
+    🔵 CPU    post_attn_layernorm (RMSNorm)  [M, 1536]  + 残差加法
+  │  [MLP  SwiGLU]
+    🟢 NPU  MatMul  gate_proj             [M×1536] @ [1536×8960]
+    🟢 NPU  MatMul  up_proj               [M×1536] @ [1536×8960]
+    🔵 CPU      SiLU(gate) * up           element-wise  [M, 8960]
+    🟢 NPU  MatMul  down_proj             [M×8960] @ [8960×1536]
+    🔵 CPU    residual add                [M, 1536]  + 残差
+  │
+  └─ → 残差输出传入下一层 hidden_state [M, 1536]
+
+├─ TransformerBlock [11/27]
+    🔵 CPU    input_layernorm (RMSNorm)   [seq, 1536]  eps=1e-6
+  │  [Self-Attention  GQA  NH=12 NKV=2]
+    🟢 NPU  MatMul  q_proj                [M×1536] @ [1536×1536] + bias(CPU)
+    🔵 CPU      bias_add (q)              [M, 1536] + [1536]
+    🟢 NPU  MatMul  k_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (k)              [M, 256] + [256]
+    🟢 NPU  MatMul  v_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (v)              [M, 256] + [256]
+    🔵 CPU      RoPE (rotary_emb)         Q[M,12,128], K[M,2,128]  → 旋转位置编码
+    🔵 CPU      GQA expand K/V            KV heads 2 → 12  (repeat_kv)
+    🔵 CPU      KV Cache append           K,V concat历史  [past+M, 2, 128]
+    🟢 NPU  MatMul  QK^T (per head)        [M×128] @ [128×seqlen]  →score
+    🔵 CPU      scale + Softmax           score / sqrt(128)  → attn_weights [M, seqlen]
+    🟢 NPU  MatMul  score@V (per head)     [M×seqlen] @ [seqlen×128]
+          ⚠️ score@V 的 K=seqlen，seqlen必须是32的倍数！
+             prefill时需要pad序列长度；decode时KV cache长度需对齐
+    🟢 NPU  MatMul  o_proj                [M×1536] @ [1536×1536]
+    🔵 CPU    post_attn_layernorm (RMSNorm)  [M, 1536]  + 残差加法
+  │  [MLP  SwiGLU]
+    🟢 NPU  MatMul  gate_proj             [M×1536] @ [1536×8960]
+    🟢 NPU  MatMul  up_proj               [M×1536] @ [1536×8960]
+    🔵 CPU      SiLU(gate) * up           element-wise  [M, 8960]
+    🟢 NPU  MatMul  down_proj             [M×8960] @ [8960×1536]
+    🔵 CPU    residual add                [M, 1536]  + 残差
+  │
+  └─ → 残差输出传入下一层 hidden_state [M, 1536]
+
+├─ TransformerBlock [12/27]
+    🔵 CPU    input_layernorm (RMSNorm)   [seq, 1536]  eps=1e-6
+  │  [Self-Attention  GQA  NH=12 NKV=2]
+    🟢 NPU  MatMul  q_proj                [M×1536] @ [1536×1536] + bias(CPU)
+    🔵 CPU      bias_add (q)              [M, 1536] + [1536]
+    🟢 NPU  MatMul  k_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (k)              [M, 256] + [256]
+    🟢 NPU  MatMul  v_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (v)              [M, 256] + [256]
+    🔵 CPU      RoPE (rotary_emb)         Q[M,12,128], K[M,2,128]  → 旋转位置编码
+    🔵 CPU      GQA expand K/V            KV heads 2 → 12  (repeat_kv)
+    🔵 CPU      KV Cache append           K,V concat历史  [past+M, 2, 128]
+    🟢 NPU  MatMul  QK^T (per head)        [M×128] @ [128×seqlen]  →score
+    🔵 CPU      scale + Softmax           score / sqrt(128)  → attn_weights [M, seqlen]
+    🟢 NPU  MatMul  score@V (per head)     [M×seqlen] @ [seqlen×128]
+          ⚠️ score@V 的 K=seqlen，seqlen必须是32的倍数！
+             prefill时需要pad序列长度；decode时KV cache长度需对齐
+    🟢 NPU  MatMul  o_proj                [M×1536] @ [1536×1536]
+    🔵 CPU    post_attn_layernorm (RMSNorm)  [M, 1536]  + 残差加法
+  │  [MLP  SwiGLU]
+    🟢 NPU  MatMul  gate_proj             [M×1536] @ [1536×8960]
+    🟢 NPU  MatMul  up_proj               [M×1536] @ [1536×8960]
+    🔵 CPU      SiLU(gate) * up           element-wise  [M, 8960]
+    🟢 NPU  MatMul  down_proj             [M×8960] @ [8960×1536]
+    🔵 CPU    residual add                [M, 1536]  + 残差
+  │
+  └─ → 残差输出传入下一层 hidden_state [M, 1536]
+
+├─ TransformerBlock [13/27]
+    🔵 CPU    input_layernorm (RMSNorm)   [seq, 1536]  eps=1e-6
+  │  [Self-Attention  GQA  NH=12 NKV=2]
+    🟢 NPU  MatMul  q_proj                [M×1536] @ [1536×1536] + bias(CPU)
+    🔵 CPU      bias_add (q)              [M, 1536] + [1536]
+    🟢 NPU  MatMul  k_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (k)              [M, 256] + [256]
+    🟢 NPU  MatMul  v_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (v)              [M, 256] + [256]
+    🔵 CPU      RoPE (rotary_emb)         Q[M,12,128], K[M,2,128]  → 旋转位置编码
+    🔵 CPU      GQA expand K/V            KV heads 2 → 12  (repeat_kv)
+    🔵 CPU      KV Cache append           K,V concat历史  [past+M, 2, 128]
+    🟢 NPU  MatMul  QK^T (per head)        [M×128] @ [128×seqlen]  →score
+    🔵 CPU      scale + Softmax           score / sqrt(128)  → attn_weights [M, seqlen]
+    🟢 NPU  MatMul  score@V (per head)     [M×seqlen] @ [seqlen×128]
+          ⚠️ score@V 的 K=seqlen，seqlen必须是32的倍数！
+             prefill时需要pad序列长度；decode时KV cache长度需对齐
+    🟢 NPU  MatMul  o_proj                [M×1536] @ [1536×1536]
+    🔵 CPU    post_attn_layernorm (RMSNorm)  [M, 1536]  + 残差加法
+  │  [MLP  SwiGLU]
+    🟢 NPU  MatMul  gate_proj             [M×1536] @ [1536×8960]
+    🟢 NPU  MatMul  up_proj               [M×1536] @ [1536×8960]
+    🔵 CPU      SiLU(gate) * up           element-wise  [M, 8960]
+    🟢 NPU  MatMul  down_proj             [M×8960] @ [8960×1536]
+    🔵 CPU    residual add                [M, 1536]  + 残差
+  │
+  └─ → 残差输出传入下一层 hidden_state [M, 1536]
+
+├─ TransformerBlock [14/27]
+    🔵 CPU    input_layernorm (RMSNorm)   [seq, 1536]  eps=1e-6
+  │  [Self-Attention  GQA  NH=12 NKV=2]
+    🟢 NPU  MatMul  q_proj                [M×1536] @ [1536×1536] + bias(CPU)
+    🔵 CPU      bias_add (q)              [M, 1536] + [1536]
+    🟢 NPU  MatMul  k_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (k)              [M, 256] + [256]
+    🟢 NPU  MatMul  v_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (v)              [M, 256] + [256]
+    🔵 CPU      RoPE (rotary_emb)         Q[M,12,128], K[M,2,128]  → 旋转位置编码
+    🔵 CPU      GQA expand K/V            KV heads 2 → 12  (repeat_kv)
+    🔵 CPU      KV Cache append           K,V concat历史  [past+M, 2, 128]
+    🟢 NPU  MatMul  QK^T (per head)        [M×128] @ [128×seqlen]  →score
+    🔵 CPU      scale + Softmax           score / sqrt(128)  → attn_weights [M, seqlen]
+    🟢 NPU  MatMul  score@V (per head)     [M×seqlen] @ [seqlen×128]
+          ⚠️ score@V 的 K=seqlen，seqlen必须是32的倍数！
+             prefill时需要pad序列长度；decode时KV cache长度需对齐
+    🟢 NPU  MatMul  o_proj                [M×1536] @ [1536×1536]
+    🔵 CPU    post_attn_layernorm (RMSNorm)  [M, 1536]  + 残差加法
+  │  [MLP  SwiGLU]
+    🟢 NPU  MatMul  gate_proj             [M×1536] @ [1536×8960]
+    🟢 NPU  MatMul  up_proj               [M×1536] @ [1536×8960]
+    🔵 CPU      SiLU(gate) * up           element-wise  [M, 8960]
+    🟢 NPU  MatMul  down_proj             [M×8960] @ [8960×1536]
+    🔵 CPU    residual add                [M, 1536]  + 残差
+  │
+  └─ → 残差输出传入下一层 hidden_state [M, 1536]
+
+├─ TransformerBlock [15/27]
+    🔵 CPU    input_layernorm (RMSNorm)   [seq, 1536]  eps=1e-6
+  │  [Self-Attention  GQA  NH=12 NKV=2]
+    🟢 NPU  MatMul  q_proj                [M×1536] @ [1536×1536] + bias(CPU)
+    🔵 CPU      bias_add (q)              [M, 1536] + [1536]
+    🟢 NPU  MatMul  k_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (k)              [M, 256] + [256]
+    🟢 NPU  MatMul  v_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (v)              [M, 256] + [256]
+    🔵 CPU      RoPE (rotary_emb)         Q[M,12,128], K[M,2,128]  → 旋转位置编码
+    🔵 CPU      GQA expand K/V            KV heads 2 → 12  (repeat_kv)
+    🔵 CPU      KV Cache append           K,V concat历史  [past+M, 2, 128]
+    🟢 NPU  MatMul  QK^T (per head)        [M×128] @ [128×seqlen]  →score
+    🔵 CPU      scale + Softmax           score / sqrt(128)  → attn_weights [M, seqlen]
+    🟢 NPU  MatMul  score@V (per head)     [M×seqlen] @ [seqlen×128]
+          ⚠️ score@V 的 K=seqlen，seqlen必须是32的倍数！
+             prefill时需要pad序列长度；decode时KV cache长度需对齐
+    🟢 NPU  MatMul  o_proj                [M×1536] @ [1536×1536]
+    🔵 CPU    post_attn_layernorm (RMSNorm)  [M, 1536]  + 残差加法
+  │  [MLP  SwiGLU]
+    🟢 NPU  MatMul  gate_proj             [M×1536] @ [1536×8960]
+    🟢 NPU  MatMul  up_proj               [M×1536] @ [1536×8960]
+    🔵 CPU      SiLU(gate) * up           element-wise  [M, 8960]
+    🟢 NPU  MatMul  down_proj             [M×8960] @ [8960×1536]
+    🔵 CPU    residual add                [M, 1536]  + 残差
+  │
+  └─ → 残差输出传入下一层 hidden_state [M, 1536]
+
+├─ TransformerBlock [16/27]
+    🔵 CPU    input_layernorm (RMSNorm)   [seq, 1536]  eps=1e-6
+  │  [Self-Attention  GQA  NH=12 NKV=2]
+    🟢 NPU  MatMul  q_proj                [M×1536] @ [1536×1536] + bias(CPU)
+    🔵 CPU      bias_add (q)              [M, 1536] + [1536]
+    🟢 NPU  MatMul  k_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (k)              [M, 256] + [256]
+    🟢 NPU  MatMul  v_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (v)              [M, 256] + [256]
+    🔵 CPU      RoPE (rotary_emb)         Q[M,12,128], K[M,2,128]  → 旋转位置编码
+    🔵 CPU      GQA expand K/V            KV heads 2 → 12  (repeat_kv)
+    🔵 CPU      KV Cache append           K,V concat历史  [past+M, 2, 128]
+    🟢 NPU  MatMul  QK^T (per head)        [M×128] @ [128×seqlen]  →score
+    🔵 CPU      scale + Softmax           score / sqrt(128)  → attn_weights [M, seqlen]
+    🟢 NPU  MatMul  score@V (per head)     [M×seqlen] @ [seqlen×128]
+          ⚠️ score@V 的 K=seqlen，seqlen必须是32的倍数！
+             prefill时需要pad序列长度；decode时KV cache长度需对齐
+    🟢 NPU  MatMul  o_proj                [M×1536] @ [1536×1536]
+    🔵 CPU    post_attn_layernorm (RMSNorm)  [M, 1536]  + 残差加法
+  │  [MLP  SwiGLU]
+    🟢 NPU  MatMul  gate_proj             [M×1536] @ [1536×8960]
+    🟢 NPU  MatMul  up_proj               [M×1536] @ [1536×8960]
+    🔵 CPU      SiLU(gate) * up           element-wise  [M, 8960]
+    🟢 NPU  MatMul  down_proj             [M×8960] @ [8960×1536]
+    🔵 CPU    residual add                [M, 1536]  + 残差
+  │
+  └─ → 残差输出传入下一层 hidden_state [M, 1536]
+
+├─ TransformerBlock [17/27]
+    🔵 CPU    input_layernorm (RMSNorm)   [seq, 1536]  eps=1e-6
+  │  [Self-Attention  GQA  NH=12 NKV=2]
+    🟢 NPU  MatMul  q_proj                [M×1536] @ [1536×1536] + bias(CPU)
+    🔵 CPU      bias_add (q)              [M, 1536] + [1536]
+    🟢 NPU  MatMul  k_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (k)              [M, 256] + [256]
+    🟢 NPU  MatMul  v_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (v)              [M, 256] + [256]
+    🔵 CPU      RoPE (rotary_emb)         Q[M,12,128], K[M,2,128]  → 旋转位置编码
+    🔵 CPU      GQA expand K/V            KV heads 2 → 12  (repeat_kv)
+    🔵 CPU      KV Cache append           K,V concat历史  [past+M, 2, 128]
+    🟢 NPU  MatMul  QK^T (per head)        [M×128] @ [128×seqlen]  →score
+    🔵 CPU      scale + Softmax           score / sqrt(128)  → attn_weights [M, seqlen]
+    🟢 NPU  MatMul  score@V (per head)     [M×seqlen] @ [seqlen×128]
+          ⚠️ score@V 的 K=seqlen，seqlen必须是32的倍数！
+             prefill时需要pad序列长度；decode时KV cache长度需对齐
+    🟢 NPU  MatMul  o_proj                [M×1536] @ [1536×1536]
+    🔵 CPU    post_attn_layernorm (RMSNorm)  [M, 1536]  + 残差加法
+  │  [MLP  SwiGLU]
+    🟢 NPU  MatMul  gate_proj             [M×1536] @ [1536×8960]
+    🟢 NPU  MatMul  up_proj               [M×1536] @ [1536×8960]
+    🔵 CPU      SiLU(gate) * up           element-wise  [M, 8960]
+    🟢 NPU  MatMul  down_proj             [M×8960] @ [8960×1536]
+    🔵 CPU    residual add                [M, 1536]  + 残差
+  │
+  └─ → 残差输出传入下一层 hidden_state [M, 1536]
+
+├─ TransformerBlock [18/27]
+    🔵 CPU    input_layernorm (RMSNorm)   [seq, 1536]  eps=1e-6
+  │  [Self-Attention  GQA  NH=12 NKV=2]
+    🟢 NPU  MatMul  q_proj                [M×1536] @ [1536×1536] + bias(CPU)
+    🔵 CPU      bias_add (q)              [M, 1536] + [1536]
+    🟢 NPU  MatMul  k_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (k)              [M, 256] + [256]
+    🟢 NPU  MatMul  v_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (v)              [M, 256] + [256]
+    🔵 CPU      RoPE (rotary_emb)         Q[M,12,128], K[M,2,128]  → 旋转位置编码
+    🔵 CPU      GQA expand K/V            KV heads 2 → 12  (repeat_kv)
+    🔵 CPU      KV Cache append           K,V concat历史  [past+M, 2, 128]
+    🟢 NPU  MatMul  QK^T (per head)        [M×128] @ [128×seqlen]  →score
+    🔵 CPU      scale + Softmax           score / sqrt(128)  → attn_weights [M, seqlen]
+    🟢 NPU  MatMul  score@V (per head)     [M×seqlen] @ [seqlen×128]
+          ⚠️ score@V 的 K=seqlen，seqlen必须是32的倍数！
+             prefill时需要pad序列长度；decode时KV cache长度需对齐
+    🟢 NPU  MatMul  o_proj                [M×1536] @ [1536×1536]
+    🔵 CPU    post_attn_layernorm (RMSNorm)  [M, 1536]  + 残差加法
+  │  [MLP  SwiGLU]
+    🟢 NPU  MatMul  gate_proj             [M×1536] @ [1536×8960]
+    🟢 NPU  MatMul  up_proj               [M×1536] @ [1536×8960]
+    🔵 CPU      SiLU(gate) * up           element-wise  [M, 8960]
+    🟢 NPU  MatMul  down_proj             [M×8960] @ [8960×1536]
+    🔵 CPU    residual add                [M, 1536]  + 残差
+  │
+  └─ → 残差输出传入下一层 hidden_state [M, 1536]
+
+├─ TransformerBlock [19/27]
+    🔵 CPU    input_layernorm (RMSNorm)   [seq, 1536]  eps=1e-6
+  │  [Self-Attention  GQA  NH=12 NKV=2]
+    🟢 NPU  MatMul  q_proj                [M×1536] @ [1536×1536] + bias(CPU)
+    🔵 CPU      bias_add (q)              [M, 1536] + [1536]
+    🟢 NPU  MatMul  k_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (k)              [M, 256] + [256]
+    🟢 NPU  MatMul  v_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (v)              [M, 256] + [256]
+    🔵 CPU      RoPE (rotary_emb)         Q[M,12,128], K[M,2,128]  → 旋转位置编码
+    🔵 CPU      GQA expand K/V            KV heads 2 → 12  (repeat_kv)
+    🔵 CPU      KV Cache append           K,V concat历史  [past+M, 2, 128]
+    🟢 NPU  MatMul  QK^T (per head)        [M×128] @ [128×seqlen]  →score
+    🔵 CPU      scale + Softmax           score / sqrt(128)  → attn_weights [M, seqlen]
+    🟢 NPU  MatMul  score@V (per head)     [M×seqlen] @ [seqlen×128]
+          ⚠️ score@V 的 K=seqlen，seqlen必须是32的倍数！
+             prefill时需要pad序列长度；decode时KV cache长度需对齐
+    🟢 NPU  MatMul  o_proj                [M×1536] @ [1536×1536]
+    🔵 CPU    post_attn_layernorm (RMSNorm)  [M, 1536]  + 残差加法
+  │  [MLP  SwiGLU]
+    🟢 NPU  MatMul  gate_proj             [M×1536] @ [1536×8960]
+    🟢 NPU  MatMul  up_proj               [M×1536] @ [1536×8960]
+    🔵 CPU      SiLU(gate) * up           element-wise  [M, 8960]
+    🟢 NPU  MatMul  down_proj             [M×8960] @ [8960×1536]
+    🔵 CPU    residual add                [M, 1536]  + 残差
+  │
+  └─ → 残差输出传入下一层 hidden_state [M, 1536]
+
+├─ TransformerBlock [20/27]
+    🔵 CPU    input_layernorm (RMSNorm)   [seq, 1536]  eps=1e-6
+  │  [Self-Attention  GQA  NH=12 NKV=2]
+    🟢 NPU  MatMul  q_proj                [M×1536] @ [1536×1536] + bias(CPU)
+    🔵 CPU      bias_add (q)              [M, 1536] + [1536]
+    🟢 NPU  MatMul  k_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (k)              [M, 256] + [256]
+    🟢 NPU  MatMul  v_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (v)              [M, 256] + [256]
+    🔵 CPU      RoPE (rotary_emb)         Q[M,12,128], K[M,2,128]  → 旋转位置编码
+    🔵 CPU      GQA expand K/V            KV heads 2 → 12  (repeat_kv)
+    🔵 CPU      KV Cache append           K,V concat历史  [past+M, 2, 128]
+    🟢 NPU  MatMul  QK^T (per head)        [M×128] @ [128×seqlen]  →score
+    🔵 CPU      scale + Softmax           score / sqrt(128)  → attn_weights [M, seqlen]
+    🟢 NPU  MatMul  score@V (per head)     [M×seqlen] @ [seqlen×128]
+          ⚠️ score@V 的 K=seqlen，seqlen必须是32的倍数！
+             prefill时需要pad序列长度；decode时KV cache长度需对齐
+    🟢 NPU  MatMul  o_proj                [M×1536] @ [1536×1536]
+    🔵 CPU    post_attn_layernorm (RMSNorm)  [M, 1536]  + 残差加法
+  │  [MLP  SwiGLU]
+    🟢 NPU  MatMul  gate_proj             [M×1536] @ [1536×8960]
+    🟢 NPU  MatMul  up_proj               [M×1536] @ [1536×8960]
+    🔵 CPU      SiLU(gate) * up           element-wise  [M, 8960]
+    🟢 NPU  MatMul  down_proj             [M×8960] @ [8960×1536]
+    🔵 CPU    residual add                [M, 1536]  + 残差
+  │
+  └─ → 残差输出传入下一层 hidden_state [M, 1536]
+
+├─ TransformerBlock [21/27]
+    🔵 CPU    input_layernorm (RMSNorm)   [seq, 1536]  eps=1e-6
+  │  [Self-Attention  GQA  NH=12 NKV=2]
+    🟢 NPU  MatMul  q_proj                [M×1536] @ [1536×1536] + bias(CPU)
+    🔵 CPU      bias_add (q)              [M, 1536] + [1536]
+    🟢 NPU  MatMul  k_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (k)              [M, 256] + [256]
+    🟢 NPU  MatMul  v_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (v)              [M, 256] + [256]
+    🔵 CPU      RoPE (rotary_emb)         Q[M,12,128], K[M,2,128]  → 旋转位置编码
+    🔵 CPU      GQA expand K/V            KV heads 2 → 12  (repeat_kv)
+    🔵 CPU      KV Cache append           K,V concat历史  [past+M, 2, 128]
+    🟢 NPU  MatMul  QK^T (per head)        [M×128] @ [128×seqlen]  →score
+    🔵 CPU      scale + Softmax           score / sqrt(128)  → attn_weights [M, seqlen]
+    🟢 NPU  MatMul  score@V (per head)     [M×seqlen] @ [seqlen×128]
+          ⚠️ score@V 的 K=seqlen，seqlen必须是32的倍数！
+             prefill时需要pad序列长度；decode时KV cache长度需对齐
+    🟢 NPU  MatMul  o_proj                [M×1536] @ [1536×1536]
+    🔵 CPU    post_attn_layernorm (RMSNorm)  [M, 1536]  + 残差加法
+  │  [MLP  SwiGLU]
+    🟢 NPU  MatMul  gate_proj             [M×1536] @ [1536×8960]
+    🟢 NPU  MatMul  up_proj               [M×1536] @ [1536×8960]
+    🔵 CPU      SiLU(gate) * up           element-wise  [M, 8960]
+    🟢 NPU  MatMul  down_proj             [M×8960] @ [8960×1536]
+    🔵 CPU    residual add                [M, 1536]  + 残差
+  │
+  └─ → 残差输出传入下一层 hidden_state [M, 1536]
+
+├─ TransformerBlock [22/27]
+    🔵 CPU    input_layernorm (RMSNorm)   [seq, 1536]  eps=1e-6
+  │  [Self-Attention  GQA  NH=12 NKV=2]
+    🟢 NPU  MatMul  q_proj                [M×1536] @ [1536×1536] + bias(CPU)
+    🔵 CPU      bias_add (q)              [M, 1536] + [1536]
+    🟢 NPU  MatMul  k_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (k)              [M, 256] + [256]
+    🟢 NPU  MatMul  v_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (v)              [M, 256] + [256]
+    🔵 CPU      RoPE (rotary_emb)         Q[M,12,128], K[M,2,128]  → 旋转位置编码
+    🔵 CPU      GQA expand K/V            KV heads 2 → 12  (repeat_kv)
+    🔵 CPU      KV Cache append           K,V concat历史  [past+M, 2, 128]
+    🟢 NPU  MatMul  QK^T (per head)        [M×128] @ [128×seqlen]  →score
+    🔵 CPU      scale + Softmax           score / sqrt(128)  → attn_weights [M, seqlen]
+    🟢 NPU  MatMul  score@V (per head)     [M×seqlen] @ [seqlen×128]
+          ⚠️ score@V 的 K=seqlen，seqlen必须是32的倍数！
+             prefill时需要pad序列长度；decode时KV cache长度需对齐
+    🟢 NPU  MatMul  o_proj                [M×1536] @ [1536×1536]
+    🔵 CPU    post_attn_layernorm (RMSNorm)  [M, 1536]  + 残差加法
+  │  [MLP  SwiGLU]
+    🟢 NPU  MatMul  gate_proj             [M×1536] @ [1536×8960]
+    🟢 NPU  MatMul  up_proj               [M×1536] @ [1536×8960]
+    🔵 CPU      SiLU(gate) * up           element-wise  [M, 8960]
+    🟢 NPU  MatMul  down_proj             [M×8960] @ [8960×1536]
+    🔵 CPU    residual add                [M, 1536]  + 残差
+  │
+  └─ → 残差输出传入下一层 hidden_state [M, 1536]
+
+├─ TransformerBlock [23/27]
+    🔵 CPU    input_layernorm (RMSNorm)   [seq, 1536]  eps=1e-6
+  │  [Self-Attention  GQA  NH=12 NKV=2]
+    🟢 NPU  MatMul  q_proj                [M×1536] @ [1536×1536] + bias(CPU)
+    🔵 CPU      bias_add (q)              [M, 1536] + [1536]
+    🟢 NPU  MatMul  k_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (k)              [M, 256] + [256]
+    🟢 NPU  MatMul  v_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (v)              [M, 256] + [256]
+    🔵 CPU      RoPE (rotary_emb)         Q[M,12,128], K[M,2,128]  → 旋转位置编码
+    🔵 CPU      GQA expand K/V            KV heads 2 → 12  (repeat_kv)
+    🔵 CPU      KV Cache append           K,V concat历史  [past+M, 2, 128]
+    🟢 NPU  MatMul  QK^T (per head)        [M×128] @ [128×seqlen]  →score
+    🔵 CPU      scale + Softmax           score / sqrt(128)  → attn_weights [M, seqlen]
+    🟢 NPU  MatMul  score@V (per head)     [M×seqlen] @ [seqlen×128]
+          ⚠️ score@V 的 K=seqlen，seqlen必须是32的倍数！
+             prefill时需要pad序列长度；decode时KV cache长度需对齐
+    🟢 NPU  MatMul  o_proj                [M×1536] @ [1536×1536]
+    🔵 CPU    post_attn_layernorm (RMSNorm)  [M, 1536]  + 残差加法
+  │  [MLP  SwiGLU]
+    🟢 NPU  MatMul  gate_proj             [M×1536] @ [1536×8960]
+    🟢 NPU  MatMul  up_proj               [M×1536] @ [1536×8960]
+    🔵 CPU      SiLU(gate) * up           element-wise  [M, 8960]
+    🟢 NPU  MatMul  down_proj             [M×8960] @ [8960×1536]
+    🔵 CPU    residual add                [M, 1536]  + 残差
+  │
+  └─ → 残差输出传入下一层 hidden_state [M, 1536]
+
+├─ TransformerBlock [24/27]
+    🔵 CPU    input_layernorm (RMSNorm)   [seq, 1536]  eps=1e-6
+  │  [Self-Attention  GQA  NH=12 NKV=2]
+    🟢 NPU  MatMul  q_proj                [M×1536] @ [1536×1536] + bias(CPU)
+    🔵 CPU      bias_add (q)              [M, 1536] + [1536]
+    🟢 NPU  MatMul  k_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (k)              [M, 256] + [256]
+    🟢 NPU  MatMul  v_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (v)              [M, 256] + [256]
+    🔵 CPU      RoPE (rotary_emb)         Q[M,12,128], K[M,2,128]  → 旋转位置编码
+    🔵 CPU      GQA expand K/V            KV heads 2 → 12  (repeat_kv)
+    🔵 CPU      KV Cache append           K,V concat历史  [past+M, 2, 128]
+    🟢 NPU  MatMul  QK^T (per head)        [M×128] @ [128×seqlen]  →score
+    🔵 CPU      scale + Softmax           score / sqrt(128)  → attn_weights [M, seqlen]
+    🟢 NPU  MatMul  score@V (per head)     [M×seqlen] @ [seqlen×128]
+          ⚠️ score@V 的 K=seqlen，seqlen必须是32的倍数！
+             prefill时需要pad序列长度；decode时KV cache长度需对齐
+    🟢 NPU  MatMul  o_proj                [M×1536] @ [1536×1536]
+    🔵 CPU    post_attn_layernorm (RMSNorm)  [M, 1536]  + 残差加法
+  │  [MLP  SwiGLU]
+    🟢 NPU  MatMul  gate_proj             [M×1536] @ [1536×8960]
+    🟢 NPU  MatMul  up_proj               [M×1536] @ [1536×8960]
+    🔵 CPU      SiLU(gate) * up           element-wise  [M, 8960]
+    🟢 NPU  MatMul  down_proj             [M×8960] @ [8960×1536]
+    🔵 CPU    residual add                [M, 1536]  + 残差
+  │
+  └─ → 残差输出传入下一层 hidden_state [M, 1536]
+
+├─ TransformerBlock [25/27]
+    🔵 CPU    input_layernorm (RMSNorm)   [seq, 1536]  eps=1e-6
+  │  [Self-Attention  GQA  NH=12 NKV=2]
+    🟢 NPU  MatMul  q_proj                [M×1536] @ [1536×1536] + bias(CPU)
+    🔵 CPU      bias_add (q)              [M, 1536] + [1536]
+    🟢 NPU  MatMul  k_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (k)              [M, 256] + [256]
+    🟢 NPU  MatMul  v_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (v)              [M, 256] + [256]
+    🔵 CPU      RoPE (rotary_emb)         Q[M,12,128], K[M,2,128]  → 旋转位置编码
+    🔵 CPU      GQA expand K/V            KV heads 2 → 12  (repeat_kv)
+    🔵 CPU      KV Cache append           K,V concat历史  [past+M, 2, 128]
+    🟢 NPU  MatMul  QK^T (per head)        [M×128] @ [128×seqlen]  →score
+    🔵 CPU      scale + Softmax           score / sqrt(128)  → attn_weights [M, seqlen]
+    🟢 NPU  MatMul  score@V (per head)     [M×seqlen] @ [seqlen×128]
+          ⚠️ score@V 的 K=seqlen，seqlen必须是32的倍数！
+             prefill时需要pad序列长度；decode时KV cache长度需对齐
+    🟢 NPU  MatMul  o_proj                [M×1536] @ [1536×1536]
+    🔵 CPU    post_attn_layernorm (RMSNorm)  [M, 1536]  + 残差加法
+  │  [MLP  SwiGLU]
+    🟢 NPU  MatMul  gate_proj             [M×1536] @ [1536×8960]
+    🟢 NPU  MatMul  up_proj               [M×1536] @ [1536×8960]
+    🔵 CPU      SiLU(gate) * up           element-wise  [M, 8960]
+    🟢 NPU  MatMul  down_proj             [M×8960] @ [8960×1536]
+    🔵 CPU    residual add                [M, 1536]  + 残差
+  │
+  └─ → 残差输出传入下一层 hidden_state [M, 1536]
+
+├─ TransformerBlock [26/27]
+    🔵 CPU    input_layernorm (RMSNorm)   [seq, 1536]  eps=1e-6
+  │  [Self-Attention  GQA  NH=12 NKV=2]
+    🟢 NPU  MatMul  q_proj                [M×1536] @ [1536×1536] + bias(CPU)
+    🔵 CPU      bias_add (q)              [M, 1536] + [1536]
+    🟢 NPU  MatMul  k_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (k)              [M, 256] + [256]
+    🟢 NPU  MatMul  v_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (v)              [M, 256] + [256]
+    🔵 CPU      RoPE (rotary_emb)         Q[M,12,128], K[M,2,128]  → 旋转位置编码
+    🔵 CPU      GQA expand K/V            KV heads 2 → 12  (repeat_kv)
+    🔵 CPU      KV Cache append           K,V concat历史  [past+M, 2, 128]
+    🟢 NPU  MatMul  QK^T (per head)        [M×128] @ [128×seqlen]  →score
+    🔵 CPU      scale + Softmax           score / sqrt(128)  → attn_weights [M, seqlen]
+    🟢 NPU  MatMul  score@V (per head)     [M×seqlen] @ [seqlen×128]
+          ⚠️ score@V 的 K=seqlen，seqlen必须是32的倍数！
+             prefill时需要pad序列长度；decode时KV cache长度需对齐
+    🟢 NPU  MatMul  o_proj                [M×1536] @ [1536×1536]
+    🔵 CPU    post_attn_layernorm (RMSNorm)  [M, 1536]  + 残差加法
+  │  [MLP  SwiGLU]
+    🟢 NPU  MatMul  gate_proj             [M×1536] @ [1536×8960]
+    🟢 NPU  MatMul  up_proj               [M×1536] @ [1536×8960]
+    🔵 CPU      SiLU(gate) * up           element-wise  [M, 8960]
+    🟢 NPU  MatMul  down_proj             [M×8960] @ [8960×1536]
+    🔵 CPU    residual add                [M, 1536]  + 残差
+  │
+  └─ → 残差输出传入下一层 hidden_state [M, 1536]
+
+├─ TransformerBlock [27/27]
+    🔵 CPU    input_layernorm (RMSNorm)   [seq, 1536]  eps=1e-6
+  │  [Self-Attention  GQA  NH=12 NKV=2]
+    🟢 NPU  MatMul  q_proj                [M×1536] @ [1536×1536] + bias(CPU)
+    🔵 CPU      bias_add (q)              [M, 1536] + [1536]
+    🟢 NPU  MatMul  k_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (k)              [M, 256] + [256]
+    🟢 NPU  MatMul  v_proj                [M×1536] @ [1536×256] + bias(CPU)
+    🔵 CPU      bias_add (v)              [M, 256] + [256]
+    🔵 CPU      RoPE (rotary_emb)         Q[M,12,128], K[M,2,128]  → 旋转位置编码
+    🔵 CPU      GQA expand K/V            KV heads 2 → 12  (repeat_kv)
+    🔵 CPU      KV Cache append           K,V concat历史  [past+M, 2, 128]
+    🟢 NPU  MatMul  QK^T (per head)        [M×128] @ [128×seqlen]  →score
+    🔵 CPU      scale + Softmax           score / sqrt(128)  → attn_weights [M, seqlen]
+    🟢 NPU  MatMul  score@V (per head)     [M×seqlen] @ [seqlen×128]
+          ⚠️ score@V 的 K=seqlen，seqlen必须是32的倍数！
+             prefill时需要pad序列长度；decode时KV cache长度需对齐
+    🟢 NPU  MatMul  o_proj                [M×1536] @ [1536×1536]
+    🔵 CPU    post_attn_layernorm (RMSNorm)  [M, 1536]  + 残差加法
+  │  [MLP  SwiGLU]
+    🟢 NPU  MatMul  gate_proj             [M×1536] @ [1536×8960]
+    🟢 NPU  MatMul  up_proj               [M×1536] @ [1536×8960]
+    🔵 CPU      SiLU(gate) * up           element-wise  [M, 8960]
+    🟢 NPU  MatMul  down_proj             [M×8960] @ [8960×1536]
+    🔵 CPU    residual add                [M, 1536]  + 残差
+
+└─ 输出
+    🔵 CPU    final_norm (RMSNorm)        [M, 1536]
+    🟢 NPU  MatMul  lm_head (tied weights)  [M×1536] @ [1536×151936]
+    🔵 CPU    Softmax / Sampling          [M, 151936] → next token
+
+===========================================================================
+  汇总统计
+===========================================================================
+  投影层 MatMul:  7 × 28层 = 196 次/token
+  Attention MatMul: (QK^T + score@V) × 28层 = 56 次/token
+  lm_head MatMul: 1 次/token
+  合计 MatMul: 253 次/token（约占总计算量90%+）
+
+  CPU 算子清单:
+    - RMSNorm × 57 次  (每层2次 + 最终1次)
+    - RoPE × 28 次
+    - GQA repeat_kv × 28 次
+    - KV Cache append/read × 28 次
+    - Softmax × 28 次
+    - SiLU × 28 次 (element-wise)
+    - Residual add × 56 次
+    - bias add × 84 次 (q/k/v_proj 有bias)
+    - Embedding lookup × 1 次
+    - Sampling × 1 次
+
+  K维度32对齐检查:
+    ✅ q/k/v/o proj K (hidden_size) = 1536  (1536÷32=48)
+    ✅ gate/up proj K (hidden_size) = 1536  (1536÷32=48)
+    ✅ down_proj K (intermediate_size) = 8960  (8960÷32=280)
+    ✅ QK^T K (head_dim) = 128  (128÷32=4)
+    ✅ lm_head K (hidden_size) = 1536  (1536÷32=48)
+    ⚠️  score@V K (seqlen): 动态！必须保证seqlen是32的倍数（padding）
+
+  模型拆分建议 (按层均分到多个worker):
+    4节点方案: Embedding+L0~L6 | L7~L13 | L14~L20 | L21~L27+lm_head
+===========================================================================
