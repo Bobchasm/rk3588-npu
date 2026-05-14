@@ -2,22 +2,27 @@
 #include <cstdint>
 #include <cstring>
 
+// ============================================================
+// 基础浮点格式互转（BF16 / FP16 / FP32）
+// 纯 header，所有算子/后端都依赖它，不依赖任何其它模块
+// ============================================================
+
 // ---------- BF16 <-> FP32 ----------
 // BF16 = 高16位的 float32（1 sign, 8 exp, 7 mant）
 inline float bf16_to_f32(uint16_t b) {
     uint32_t u = (uint32_t)b << 16;
-    float f; memcpy(&f, &u, sizeof(f)); return f;
+    float f; std::memcpy(&f, &u, sizeof(f)); return f;
 }
 
 inline uint16_t f32_to_bf16(float f) {
-    uint32_t u; memcpy(&u, &f, sizeof(u));
+    uint32_t u; std::memcpy(&u, &f, sizeof(u));
     return (uint16_t)(u >> 16);
 }
 
 // ---------- FP16 <-> FP32 ----------
-// FP16: 1 sign, 5 exp, 10 mant  (IEEE 754 half)
+// FP16: 1 sign, 5 exp, 10 mant (IEEE 754 half)
 inline uint16_t f32_to_f16(float f) {
-    uint32_t x; memcpy(&x, &f, sizeof(x));
+    uint32_t x; std::memcpy(&x, &f, sizeof(x));
     uint16_t sign = (uint16_t)((x >> 16) & 0x8000u);
     int32_t  exp  = (int32_t)((x >> 23) & 0xFFu) - 127 + 15;
     uint32_t mant = x & 0x7FFFFFu;
@@ -34,7 +39,7 @@ inline float f16_to_f32(uint16_t h) {
     if      (exp == 0)  x = sign | (mant << 13);               // subnormal
     else if (exp == 31) x = sign | 0x7F800000u | (mant << 13); // inf / nan
     else                x = sign | ((exp + 112u) << 23) | (mant << 13);
-    float result; memcpy(&result, &x, sizeof(result)); return result;
+    float result; std::memcpy(&result, &x, sizeof(result)); return result;
 }
 
 // ---------- BF16 -> FP16（经 FP32 中转）----------
