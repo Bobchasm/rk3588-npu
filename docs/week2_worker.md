@@ -220,7 +220,7 @@ source ~/miniforge3/etc/profile.d/conda.sh && conda activate rk3588
 cd /home/deep/d-rk3588-npu
 python3 -c "
 from transformers import AutoTokenizer
-tok = AutoTokenizer.from_pretrained('model/Qwen1.5B')
+tok = AutoTokenizer.from_pretrained('models/qwen1.5b-instruct/Qwen2-1.5B-Instruct')
 msgs = [{'role':'user','content':'你好'}]
 text = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
 ids = tok.encode(text)
@@ -230,8 +230,8 @@ print('./qwen2_demo Qwen1.5B', ' '.join(map(str, ids)))
 # 解码板子输出的 token id
 python3 -c "
 from transformers import AutoTokenizer
-tkz = AutoTokenizer.from_pretrained('model/Qwen1.5B')
-ids = [108386, 3837, 35946, 85106, 46944]  # 替换为实际输出
+tkz = AutoTokenizer.from_pretrained('models/qwen1.5b-instruct/Qwen2-1.5B-Instruct')
+ids = [108386,6313,104139,109944,100364,103929,101037,11319]  # 替换为实际输出
 print(tkz.decode(ids))
 "
 ```
@@ -267,9 +267,9 @@ cd /home/deep/d-rk3588-npu
 python3 -c "
 import torch, time
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
-tkz = AutoTokenizer.from_pretrained('model/Qwen1.5B')
-model = AutoModelForCausalLM.from_pretrained('model/Qwen1.5B', torch_dtype=torch.bfloat16, device_map='cpu', low_cpu_mem_usage=True)
-msgs = [{'role':'user','content':'你好'}]
+tkz = AutoTokenizer.from_pretrained('models/qwen1.5b-instruct/Qwen2-1.5B-Instruct')
+model = AutoModelForCausalLM.from_pretrained('models/qwen1.5b-instruct/Qwen2-1.5B-Instruct', torch_dtype=torch.bfloat16, device_map='cpu', low_cpu_mem_usage=True)
+msgs = [{'role':'user','content':'1+1='}]
 text = tkz.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
 ids = tkz.encode(text, return_tensors='pt')
 streamer = TextStreamer(tkz, skip_prompt=True)

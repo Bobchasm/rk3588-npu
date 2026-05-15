@@ -6,7 +6,7 @@ import time
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-MODEL_PATH = "../models/qwen1.5b/Qwen1.5B"
+MODEL_PATH = "../models/qwen1.5b-instruct/Qwen2-1.5B-Instruct"
 
 print("加载 tokenizer...")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)

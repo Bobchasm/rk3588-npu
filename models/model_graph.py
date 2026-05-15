@@ -8,8 +8,8 @@
 import os, json, sys, io
 from safetensors import safe_open
 
-MODEL_PATH = "./qwen1.5b/Qwen1.5B"
-OUTPUT_FILE = "./qwen1.5b/qwen1.5b_layout.txt"
+MODEL_PATH = "./qwen1.5b-instruct/Qwen2-1.5B-Instruct"
+OUTPUT_FILE = "./qwen1.5b-instruct/qwen1.5b-instruct_layout.txt"
 
 class Tee:
     def __init__(self, *streams):
