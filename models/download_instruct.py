@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 下载 Qwen2-1.5B-Instruct 模型
-保存路径：models/qwen1.5b-instruct/Qwen2-1.5B-Instruct/（与 qwen1.5b/ 同级）
+保存路径：models/qwen1.5b-instruct/Qwen2-1.5B-Instruct/
 
 用法：
-    # 自动选源（优先 ModelScope，再 hf-mirror，最后官方）
+    # 自动选源
     python3 models/download_instruct.py
 
     # 强制指定来源
@@ -18,10 +18,10 @@ import sys
 import argparse
 
 # ---- 配置 ----
-HF_MODEL_ID  = "Qwen/Qwen2-1.5B-Instruct"
-MS_MODEL_ID  = "qwen/Qwen2-1.5B-Instruct"    # ModelScope ID（阿里云，国内最快）
-SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
-SAVE_DIR     = os.path.join(SCRIPT_DIR, "qwen1.5b-instruct/Qwen2-1.5B-Instruct")
+HF_MODEL_ID = "Qwen/Qwen2-1.5B-Instruct"
+MS_MODEL_ID = "qwen/Qwen2-1.5B-Instruct"  # ModelScope ID（阿里云，国内最快）
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SAVE_DIR = os.path.join(SCRIPT_DIR, "qwen1.5b-instruct/Qwen2-1.5B-Instruct")
 
 
 # ============================================================
@@ -38,8 +38,8 @@ def download_modelscope():
     print(f"  模型：{MS_MODEL_ID}")
     print(f"  目标：{SAVE_DIR}")
     ms_dl(
-        model_id  = MS_MODEL_ID,
-        local_dir = SAVE_DIR,
+        model_id=MS_MODEL_ID,
+        local_dir=SAVE_DIR,
     )
 
 
@@ -67,9 +67,9 @@ def download_hf(endpoint=None):
     print(f"  目标：{SAVE_DIR}")
 
     snapshot_download(
-        repo_id         = HF_MODEL_ID,
-        local_dir       = SAVE_DIR,
-        ignore_patterns = ["*.msgpack", "flax_model*", "tf_model*", "rust_model*"],
+        repo_id=HF_MODEL_ID,
+        local_dir=SAVE_DIR,
+        ignore_patterns=["*.msgpack", "flax_model*", "tf_model*", "rust_model*"],
     )
 
 
@@ -103,9 +103,9 @@ def main():
     os.makedirs(SAVE_DIR, exist_ok=True)
 
     sources = [
-        ("huggingface",  lambda: download_hf(None)),
-        ("modelscope",   lambda: download_modelscope()),
-        ("hf-mirror",    lambda: download_hf("https://hf-mirror.com")),
+        ("huggingface", lambda: download_hf(None)),
+        ("modelscope", lambda: download_modelscope()),
+        ("hf-mirror", lambda: download_hf("https://hf-mirror.com")),
     ]
 
     # 单一来源模式
@@ -135,14 +135,20 @@ def main():
 
     print(f"\n[完成] 模型已保存到：{SAVE_DIR}")
     print("\n--- 验证（本机 PyTorch CPU）---")
-    print("python3 -c \"")
+    print('python3 -c "')
     print("import torch")
     print("from transformers import AutoTokenizer, AutoModelForCausalLM")
     print(f"t = AutoTokenizer.from_pretrained('{SAVE_DIR}')")
-    print(f"m = AutoModelForCausalLM.from_pretrained('{SAVE_DIR}', torch_dtype=torch.bfloat16, device_map='cpu')")
-    print("ids = t.encode(t.apply_chat_template([{'role':'user','content':'1+1等于几'}], tokenize=False, add_generation_prompt=True), return_tensors='pt')")
-    print("print(t.decode(m.generate(ids, max_new_tokens=16)[0][ids.shape[1]:], skip_special_tokens=True))")
-    print("\"")
+    print(
+        f"m = AutoModelForCausalLM.from_pretrained('{SAVE_DIR}', torch_dtype=torch.bfloat16, device_map='cpu')"
+    )
+    print(
+        "ids = t.encode(t.apply_chat_template([{'role':'user','content':'1+1等于几'}], tokenize=False, add_generation_prompt=True), return_tensors='pt')"
+    )
+    print(
+        "print(t.decode(m.generate(ids, max_new_tokens=16)[0][ids.shape[1]:], skip_special_tokens=True))"
+    )
+    print('"')
 
 
 if __name__ == "__main__":

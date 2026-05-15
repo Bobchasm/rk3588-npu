@@ -1,6 +1,6 @@
 # RK3588 NPU Worker 架构文档
 
-> 本文档描述 `worker/` 目录的完整代码架构、各层职责、关键数据流与接口约定，供后续分工优化使用。
+> 本文档描述 `/worker/` 目录的完整代码架构、各层职责、关键数据流与接口约定，供后续分工优化使用。
 
 ---
 
@@ -112,7 +112,7 @@ namespace rk {
 
 ### `include/core/model_config.h`
 
-描述 Qwen2 系列模型结构的超参数，以默认值覆盖 Qwen2-1.5B：
+描述 Qwen2 系列模型结构的超参数，以默认值覆盖 Qwen2-1.5B-Instruct：
 
 ```cpp
 struct Qwen2Config {
@@ -491,7 +491,7 @@ using TokenCallback = std::function<void(int step, int id, float elapsed_ms)>;
 ```bash
 python3 -c "
 from transformers import AutoTokenizer
-t = AutoTokenizer.from_pretrained('path/to/Qwen1.5B')
+t = AutoTokenizer.from_pretrained('path/to/Qwen2-1.5B-Instruct')
 m = [{'role':'user','content':'你好'}]
 s = t.apply_chat_template(m, tokenize=False, add_generation_prompt=True)
 print(' '.join(map(str, t.encode(s))))
@@ -523,30 +523,6 @@ REPL 模式，**模型只加载一次，常驻进程**，通过 stdin/stdout 管
 ```bash
 ./qwen2_chat <model_dir> [max_new_tokens]
 # 默认 max_new_tokens = 128
-```
-
-### `scripts/chat.py`（Python 文字包装器）
-
-在 `qwen2_chat` 之上封装 tokenizer，实现**真正可打字的文字对话**：
-
-```
-用户输入（str）
-    ↓ AutoTokenizer.apply_chat_template + encode
-token ids（list[int]）
-    ↓ subprocess stdin
-qwen2_chat（C++ 常驻进程）
-    ↓ subprocess stdout
-token ids（list[int]）
-    ↓ tokenizer.decode
-文字回复（str）
-```
-
-```bash
-python3 scripts/chat.py \
-    --binary    /root/install/qwen2_chat \
-    --model     /root/Qwen1.5B \
-    --tokenizer /root/Qwen1.5B \
-    --max-new-tokens 128
 ```
 
 ---
@@ -584,48 +560,7 @@ qwen2_chat → worker_core
 
 ---
 
-## 十、扩展指南
-
-### 替换 Linear 后端（如 CPU GEMM fallback）
-
-1. 在 `include/backend/` 下新建 `cpu_linear.h`，继承 `ILinearOp`；
-2. 在 `src/backend/cpu_linear.cpp` 实现；
-3. 在 `LinearBackend` 枚举中加 `CPU_GEMM`；
-4. 在 `make_linear` 工厂中加对应 case；
-5. `load()` 时传 `LinearBackend::CPU_GEMM` 即可，模型层 / API 层无需改动。
-
-### 替换 KV Cache（如 PagedAttention）
-
-1. 新建 `include/model/paged_kv_cache.h`，保持与 `KVCache` 相同的公开接口；
-2. 在 `Qwen2Model` 中把成员 `KVCache kv_cache_` 改为对应类型；
-3. `op_attention` 的 `k_cache` / `v_cache` 指针调用方式不变。
-
-### 增加采样策略
-
-在 `src/ops/op_sampling.cpp` 和 `include/ops/op_sampling.h` 中增加函数：
-
-```cpp
-int op_sample_topk(const std::vector<float>& logits, int k, float temperature);
-int op_sample_topp(const std::vector<float>& logits, float p, float temperature);
-```
-
-在 `LLMEngine::generate` 的 decode 循环中根据 `GenerationConfig` 调用对应函数。
-
-### 多轮对话
-
-在 Python 端（`scripts/chat.py`）维护 `messages` 列表，每轮追加历史：
-
-```python
-messages.append({"role": "user", "content": user_input})
-prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-# 注意：此时不要向 qwen2_chat 发 RESET，让 KV Cache 保留历史
-```
-
-C++ 侧 `qwen2_chat` 把 `RESET` 控制权留给 Python 端，支持多轮复用 KV Cache。
-
----
-
-## 十一、数据格式约定
+## 十、数据格式约定
 
 | 位置 | 格式 | 说明 |
 |---|---|---|
@@ -637,5 +572,3 @@ C++ 侧 `qwen2_chat` 把 `RESET` 控制权留给 Python 端，支持多轮复用
 | logits 输出 | FP32 | lm_head 输出 FP16 后转换 |
 
 ---
-
-*最后更新：Worker 分层重构完成后*
