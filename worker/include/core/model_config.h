@@ -15,7 +15,7 @@ struct Qwen2Config {
     int   vocab_size           = 151936;
     float rms_norm_eps         = 1e-6f;
     float rope_theta           = 1000000.0f;  // config.json: rope_theta=1000000
-    int   max_position         = 512;
+    int   max_position         = 32768;
 
     // 便捷派生量
     int kv_dim() const { return num_kv_heads * head_dim; }
