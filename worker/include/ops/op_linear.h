@@ -7,6 +7,7 @@
 //
 // 模型里所有线性变换统一通过 ILinearOp 调用，具体后端在 backend/ 下实现：
 //   - NPU 单核（当前）
+//   - NPU 按 N 维分片并发（lm_head 等大矩阵）
 //   - NPU 多核调度（规划中）
 //   - CPU fallback
 //
@@ -34,6 +35,7 @@ public:
 // 线性后端类型
 enum class LinearBackend {
     NPU,
+    NPU_SHARDED,
     CPU,
     // 预留：NPU_MULTI_CORE 等
 };

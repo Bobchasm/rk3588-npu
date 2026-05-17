@@ -36,6 +36,13 @@ bool NpuLinear::init(int K, int N, const uint16_t* weight_kn) {
         return false;
     };
 
+    if (has_core_mask_) {
+        ret = rknn_matmul_set_core_mask(ctx_, core_mask_);
+        if (ret < 0) {
+            return fail("rknn_matmul_set_core_mask", ret);
+        }
+    }
+
     // 分配 B 内存
     B_mem_ = rknn_create_mem(ctx_, io_attr_.B.size);
     if (!B_mem_) {
@@ -54,17 +61,14 @@ bool NpuLinear::init(int K, int N, const uint16_t* weight_kn) {
         return fail("rknn_matmul_set_io_mem(B)", ret);
     }
 
-    if (!rebuild_ac(1)) {
-        destroy();
-        return false;
-    }
+    // A/C are activation buffers. Do not allocate them during load:
+    // hundreds of Linear contexts would otherwise keep hundreds of dmabuf fds
+    // open before inference even starts. forward() allocates lazily and reuses.
     return true;
 }
 
 bool NpuLinear::rebuild_ac(int M) {
-    if (A_mem_) { rknn_destroy_mem(ctx_, A_mem_); A_mem_ = nullptr; }
-    if (C_mem_) { rknn_destroy_mem(ctx_, C_mem_); C_mem_ = nullptr; }
-    cur_M_ = 0;
+    release_ac();
 
     // FP16 = 2 bytes/elem
     uint32_t A_size = (uint32_t)(M * K_ * 2);
@@ -76,6 +80,7 @@ bool NpuLinear::rebuild_ac(int M) {
         if (A_mem_) { rknn_destroy_mem(ctx_, A_mem_); A_mem_ = nullptr; }
         if (C_mem_) { rknn_destroy_mem(ctx_, C_mem_); C_mem_ = nullptr; }
         cur_M_ = 0;
+        alloc_M_ = 0;
     };
     if (!A_mem_ || !C_mem_) {
         std::fprintf(stderr, "[NpuLinear] rknn_create_mem(A/C) failed M=%d\n", M);
@@ -83,30 +88,63 @@ bool NpuLinear::rebuild_ac(int M) {
         return false;
     }
 
+    alloc_M_ = M;
+
+    if (!bind_ac(M)) {
+        cleanup_ac();
+        return false;
+    }
+
+    return true;
+}
+
+bool NpuLinear::bind_ac(int M, bool quiet) {
     rknn_matmul_tensor_attr A_attr = io_attr_.A;
     A_attr.dims[0] = M;
-    A_attr.size    = A_size;
+    A_attr.size    = (uint32_t)(M * K_ * 2);
 
     rknn_matmul_tensor_attr C_attr = io_attr_.C;
     C_attr.dims[0] = M;
-    C_attr.size    = C_size;
+    C_attr.size    = (uint32_t)(M * N_ * 2);
 
     int ret = rknn_matmul_set_io_mem(ctx_, A_mem_, &A_attr);
     if (ret < 0) {
-        std::fprintf(stderr, "[NpuLinear] set A failed: %d\n", ret);
-        cleanup_ac();
+        if (!quiet) {
+            std::fprintf(stderr, "[NpuLinear] set A failed: %d\n", ret);
+        }
         return false;
     }
 
     ret = rknn_matmul_set_io_mem(ctx_, C_mem_, &C_attr);
     if (ret < 0) {
-        std::fprintf(stderr, "[NpuLinear] set C failed: %d\n", ret);
-        cleanup_ac();
+        if (!quiet) {
+            std::fprintf(stderr, "[NpuLinear] set C failed: %d\n", ret);
+        }
         return false;
     }
 
     cur_M_ = M;
     return true;
+}
+
+bool NpuLinear::ensure_ac(int M) {
+    if (!A_mem_ || !C_mem_ || M > alloc_M_) {
+        return rebuild_ac(M);
+    }
+    if (M != cur_M_) {
+        if (bind_ac(M, /*quiet=*/true)) {
+            return true;
+        }
+        return rebuild_ac(M);
+    }
+    return true;
+}
+
+void NpuLinear::release_ac() {
+    if (A_mem_) { rknn_destroy_mem(ctx_, A_mem_); A_mem_ = nullptr; }
+    if (C_mem_) { rknn_destroy_mem(ctx_, C_mem_); C_mem_ = nullptr; }
+    cur_M_ = 0;
+    alloc_M_ = 0;
 }
 
 bool NpuLinear::forward(const uint16_t* input_f16, int M, uint16_t* output_f16) {
@@ -115,8 +153,8 @@ bool NpuLinear::forward(const uint16_t* input_f16, int M, uint16_t* output_f16) 
         return false;
     }
 
-    if (M != cur_M_) {
-        if (!rebuild_ac(M)) return false;
+    if (!ensure_ac(M)) {
+        return false;
     }
 
     std::memcpy(A_mem_->virt_addr, input_f16, (size_t)M * K_ * 2);
@@ -124,6 +162,7 @@ bool NpuLinear::forward(const uint16_t* input_f16, int M, uint16_t* output_f16) 
     int ret = rknn_matmul_run(ctx_);
     if (ret < 0) {
         std::fprintf(stderr, "[NpuLinear] rknn_matmul_run failed: %d\n", ret);
+        release_ac();
         return false;
     }
 
@@ -132,11 +171,16 @@ bool NpuLinear::forward(const uint16_t* input_f16, int M, uint16_t* output_f16) 
 }
 
 void NpuLinear::destroy() {
-    if (A_mem_) { rknn_destroy_mem(ctx_, A_mem_); A_mem_ = nullptr; }
+    release_ac();
     if (B_mem_) { rknn_destroy_mem(ctx_, B_mem_); B_mem_ = nullptr; }
-    if (C_mem_) { rknn_destroy_mem(ctx_, C_mem_); C_mem_ = nullptr; }
     if (ctx_)   { rknn_matmul_destroy(ctx_);      ctx_    = 0;     }
     K_ = 0;
     N_ = 0;
     cur_M_ = 0;
+    alloc_M_ = 0;
+}
+
+void NpuLinear::set_core_mask(rknn_core_mask mask) {
+    core_mask_ = mask;
+    has_core_mask_ = true;
 }

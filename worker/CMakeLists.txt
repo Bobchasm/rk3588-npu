@@ -36,6 +36,7 @@ set(OPS_SOURCES
 set(BACKEND_SOURCES
     src/backend/cpu_linear.cpp
     src/backend/npu_linear.cpp
+    src/backend/sharded_npu_linear.cpp
 )
 
 set(MODEL_SOURCES

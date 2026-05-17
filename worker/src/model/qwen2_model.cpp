@@ -40,6 +40,75 @@ static bool init_linear(std::unique_ptr<ILinearOp>& linear,
     return true;
 }
 
+static bool init_fused_qkv_linear(std::unique_ptr<ILinearOp>& linear,
+                                  LinearBackend backend,
+                                  const std::string& sf_path,
+                                  const TensorMap&   meta,
+                                  const std::string& q_weight_name,
+                                  const std::string& k_weight_name,
+                                  const std::string& v_weight_name,
+                                  int hidden, int kv_dim)
+{
+    auto q_w = load_tensor_f16(sf_path, meta.at(q_weight_name), /*transpose=*/true);
+    auto k_w = load_tensor_f16(sf_path, meta.at(k_weight_name), /*transpose=*/true);
+    auto v_w = load_tensor_f16(sf_path, meta.at(v_weight_name), /*transpose=*/true);
+
+    const int fused_N = hidden + kv_dim * 2;
+    std::vector<uint16_t> fused_w((size_t)hidden * fused_N);
+    for (int k = 0; k < hidden; ++k) {
+        uint16_t* dst = fused_w.data() + (size_t)k * fused_N;
+        std::memcpy(dst,
+                    q_w.data() + (size_t)k * hidden,
+                    (size_t)hidden * sizeof(uint16_t));
+        std::memcpy(dst + hidden,
+                    k_w.data() + (size_t)k * kv_dim,
+                    (size_t)kv_dim * sizeof(uint16_t));
+        std::memcpy(dst + hidden + kv_dim,
+                    v_w.data() + (size_t)k * kv_dim,
+                    (size_t)kv_dim * sizeof(uint16_t));
+    }
+
+    linear = make_linear(backend);
+    if (!linear || !linear->init(hidden, fused_N, fused_w.data())) {
+        if (linear) linear->destroy();
+        linear.reset();
+        return false;
+    }
+    return true;
+}
+
+static bool init_fused_gate_up_linear(std::unique_ptr<ILinearOp>& linear,
+                                      LinearBackend backend,
+                                      const std::string& sf_path,
+                                      const TensorMap&   meta,
+                                      const std::string& gate_weight_name,
+                                      const std::string& up_weight_name,
+                                      int K, int intermediate)
+{
+    auto gate_w = load_tensor_f16(sf_path, meta.at(gate_weight_name), /*transpose=*/true);
+    auto up_w   = load_tensor_f16(sf_path, meta.at(up_weight_name),   /*transpose=*/true);
+
+    const int fused_N = intermediate * 2;
+    std::vector<uint16_t> fused_w((size_t)K * fused_N);
+    for (int k = 0; k < K; ++k) {
+        uint16_t* dst = fused_w.data() + (size_t)k * fused_N;
+        std::memcpy(dst,
+                    gate_w.data() + (size_t)k * intermediate,
+                    (size_t)intermediate * sizeof(uint16_t));
+        std::memcpy(dst + intermediate,
+                    up_w.data() + (size_t)k * intermediate,
+                    (size_t)intermediate * sizeof(uint16_t));
+    }
+
+    linear = make_linear(backend);
+    if (!linear || !linear->init(K, fused_N, fused_w.data())) {
+        if (linear) linear->destroy();
+        linear.reset();
+        return false;
+    }
+    return true;
+}
+
 static void run_linear_or_throw(const std::unique_ptr<ILinearOp>& linear,
                                 const char* name,
                                 const uint16_t* input_f16,
@@ -64,14 +133,37 @@ static bool qwen2_profile_enabled() {
 
 static LinearBackend select_lm_head_backend() {
     const char* v = std::getenv("RKLLM_LM_HEAD_BACKEND");
-    if (v && (std::strcmp(v, "NPU") == 0 || std::strcmp(v, "npu") == 0)) {
+    if (!v || v[0] == '\0') {
+        return LinearBackend::NPU_SHARDED;
+    }
+    if (std::strcmp(v, "CPU") == 0 || std::strcmp(v, "cpu") == 0) {
+        return LinearBackend::CPU;
+    }
+    if (std::strcmp(v, "NPU") == 0 || std::strcmp(v, "npu") == 0) {
+        return LinearBackend::NPU_SHARDED;
+    }
+    if (std::strcmp(v, "NPU_SINGLE") == 0 || std::strcmp(v, "npu_single") == 0 ||
+        std::strcmp(v, "SINGLE_NPU") == 0 || std::strcmp(v, "single_npu") == 0) {
         return LinearBackend::NPU;
     }
-    return LinearBackend::CPU;
+    if (std::strcmp(v, "NPU_SHARDED") == 0 || std::strcmp(v, "npu_sharded") == 0 ||
+        std::strcmp(v, "SHARDED_NPU") == 0 || std::strcmp(v, "sharded_npu") == 0) {
+        return LinearBackend::NPU_SHARDED;
+    }
+
+    std::fprintf(stderr,
+                 "[load] unknown RKLLM_LM_HEAD_BACKEND=%s, use NPU_SHARDED\n",
+                 v);
+    return LinearBackend::NPU_SHARDED;
 }
 
 static const char* linear_backend_name(LinearBackend backend) {
-    return backend == LinearBackend::NPU ? "NPU" : "CPU";
+    switch (backend) {
+        case LinearBackend::CPU: return "CPU";
+        case LinearBackend::NPU: return "NPU_SINGLE";
+        case LinearBackend::NPU_SHARDED: return "NPU_SHARDED";
+        default: return "UNKNOWN";
+    }
 }
 
 struct ForwardProfile {
@@ -170,22 +262,39 @@ bool Qwen2Model::load(const std::string& model_dir, LinearBackend backend) {
 
             L->input_layernorm = load_tensor_f32(sf_path, meta.at(pfx + "input_layernorm.weight"));
 
-            if (!init_linear(L->q_proj, backend, sf_path, meta, pfx + "self_attn.q_proj.weight", H, H)) return fail();
+            if (backend == LinearBackend::NPU) {
+                if (!init_fused_qkv_linear(L->qkv_proj, LinearBackend::NPU_SHARDED,
+                                           sf_path, meta,
+                                           pfx + "self_attn.q_proj.weight",
+                                           pfx + "self_attn.k_proj.weight",
+                                           pfx + "self_attn.v_proj.weight",
+                                           H, kvd)) return fail();
+            } else {
+                if (!init_linear(L->q_proj, backend, sf_path, meta, pfx + "self_attn.q_proj.weight", H, H)) return fail();
+                if (!init_linear(L->k_proj, backend, sf_path, meta, pfx + "self_attn.k_proj.weight", H, kvd)) return fail();
+                if (!init_linear(L->v_proj, backend, sf_path, meta, pfx + "self_attn.v_proj.weight", H, kvd)) return fail();
+            }
             L->q_bias = load_tensor_f32(sf_path, meta.at(pfx + "self_attn.q_proj.bias"));
-
-            if (!init_linear(L->k_proj, backend, sf_path, meta, pfx + "self_attn.k_proj.weight", H, kvd)) return fail();
             L->k_bias = load_tensor_f32(sf_path, meta.at(pfx + "self_attn.k_proj.bias"));
-
-            if (!init_linear(L->v_proj, backend, sf_path, meta, pfx + "self_attn.v_proj.weight", H, kvd)) return fail();
             L->v_bias = load_tensor_f32(sf_path, meta.at(pfx + "self_attn.v_proj.bias"));
 
             if (!init_linear(L->o_proj, backend, sf_path, meta, pfx + "self_attn.o_proj.weight", H, H)) return fail();
 
             L->post_attention_layernorm = load_tensor_f32(sf_path, meta.at(pfx + "post_attention_layernorm.weight"));
 
-            if (!init_linear(L->gate_proj, backend, sf_path, meta, pfx + "mlp.gate_proj.weight", H,  IS)) return fail();
-            if (!init_linear(L->up_proj,   backend, sf_path, meta, pfx + "mlp.up_proj.weight",   H,  IS)) return fail();
-            if (!init_linear(L->down_proj, backend, sf_path, meta, pfx + "mlp.down_proj.weight", IS, H )) return fail();
+            if (backend == LinearBackend::NPU) {
+                if (!init_fused_gate_up_linear(L->gate_up_proj, LinearBackend::NPU_SHARDED,
+                                               sf_path, meta,
+                                               pfx + "mlp.gate_proj.weight",
+                                               pfx + "mlp.up_proj.weight",
+                                               H, IS)) return fail();
+            } else {
+                if (!init_linear(L->gate_proj, backend, sf_path, meta, pfx + "mlp.gate_proj.weight", H,  IS)) return fail();
+                if (!init_linear(L->up_proj,   backend, sf_path, meta, pfx + "mlp.up_proj.weight",   H,  IS)) return fail();
+            }
+            LinearBackend down_backend =
+                (backend == LinearBackend::NPU) ? LinearBackend::NPU_SHARDED : backend;
+            if (!init_linear(L->down_proj, down_backend, sf_path, meta, pfx + "mlp.down_proj.weight", IS, H )) return fail();
 
             layers_[i] = std::move(L);
         }
@@ -277,24 +386,40 @@ std::vector<float> Qwen2Model::forward(const std::vector<int>& tokens) {
                        seq, H, c.rms_norm_eps);
         });
 
-        // ---- 2. Q / K / V proj (NPU, M=1) ----
-        std::vector<uint16_t> q_f16((size_t)seq * H);
-        std::vector<uint16_t> k_f16((size_t)seq * kv_dim);
-        std::vector<uint16_t> v_f16((size_t)seq * kv_dim);
-
+        // ---- 2. Q / K / V proj (NPU, M=1 per token) ----
         std::vector<float> q((size_t)seq * H);
         std::vector<float> k((size_t)seq * kv_dim);
         std::vector<float> v((size_t)seq * kv_dim);
         profile_block(prof.qkv_proj_us, [&]() {
-            for (int s = 0; s < seq; ++s) {
-                op_f32_to_f16(buf.data() + s * H, npu_in.data(), H);
-                run_linear_or_throw(L.q_proj, "q_proj", npu_in.data(), 1, q_f16.data() + s * H);
-                run_linear_or_throw(L.k_proj, "k_proj", npu_in.data(), 1, k_f16.data() + s * kv_dim);
-                run_linear_or_throw(L.v_proj, "v_proj", npu_in.data(), 1, v_f16.data() + s * kv_dim);
+            if (L.qkv_proj) {
+                const int qkv_dim = H + kv_dim * 2;
+                std::vector<uint16_t> qkv_f16((size_t)seq * qkv_dim);
+                for (int s = 0; s < seq; ++s) {
+                    op_f32_to_f16(buf.data() + s * H, npu_in.data(), H);
+                    run_linear_or_throw(L.qkv_proj, "qkv_proj",
+                                        npu_in.data(), 1,
+                                        qkv_f16.data() + (size_t)s * qkv_dim);
+                }
+                for (int s = 0; s < seq; ++s) {
+                    const uint16_t* row = qkv_f16.data() + (size_t)s * qkv_dim;
+                    op_f16_to_f32(row,                q.data() + (size_t)s * H,      H);
+                    op_f16_to_f32(row + H,            k.data() + (size_t)s * kv_dim, kv_dim);
+                    op_f16_to_f32(row + H + kv_dim,   v.data() + (size_t)s * kv_dim, kv_dim);
+                }
+            } else {
+                std::vector<uint16_t> q_f16((size_t)seq * H);
+                std::vector<uint16_t> k_f16((size_t)seq * kv_dim);
+                std::vector<uint16_t> v_f16((size_t)seq * kv_dim);
+                for (int s = 0; s < seq; ++s) {
+                    op_f32_to_f16(buf.data() + s * H, npu_in.data(), H);
+                    run_linear_or_throw(L.q_proj, "q_proj", npu_in.data(), 1, q_f16.data() + s * H);
+                    run_linear_or_throw(L.k_proj, "k_proj", npu_in.data(), 1, k_f16.data() + s * kv_dim);
+                    run_linear_or_throw(L.v_proj, "v_proj", npu_in.data(), 1, v_f16.data() + s * kv_dim);
+                }
+                op_f16_to_f32(q_f16.data(), q.data(), seq * H);
+                op_f16_to_f32(k_f16.data(), k.data(), seq * kv_dim);
+                op_f16_to_f32(v_f16.data(), v.data(), seq * kv_dim);
             }
-            op_f16_to_f32(q_f16.data(), q.data(), seq * H);
-            op_f16_to_f32(k_f16.data(), k.data(), seq * kv_dim);
-            op_f16_to_f32(v_f16.data(), v.data(), seq * kv_dim);
             op_vec_add_bias(q.data(), L.q_bias.data(), seq, H);
             op_vec_add_bias(k.data(), L.k_bias.data(), seq, kv_dim);
             op_vec_add_bias(v.data(), L.v_bias.data(), seq, kv_dim);
@@ -334,7 +459,7 @@ std::vector<float> Qwen2Model::forward(const std::vector<int>& tokens) {
                          /*pos_base=*/pos);
         });
 
-        // ---- 6. O proj (NPU, M=1) ----
+        // ---- 6. O proj (NPU, M=1 per token) ----
         npu_out.resize((size_t)seq * H);
         profile_block(prof.o_proj_us, [&]() {
             for (int s = 0; s < seq; ++s) {
@@ -353,19 +478,35 @@ std::vector<float> Qwen2Model::forward(const std::vector<int>& tokens) {
                        seq, H, c.rms_norm_eps);
         });
 
-        // ---- 9. FFN: gate & up proj (NPU, M=1) ----
+        // ---- 9. FFN: gate & up proj (NPU, M=1 per token) ----
         std::vector<uint16_t> gate_f16((size_t)seq * IS);
         std::vector<uint16_t> up_f16((size_t)seq * IS);
         std::vector<float> gate((size_t)seq * IS);
         std::vector<float> up  ((size_t)seq * IS);
         profile_block(prof.gate_up_proj_us, [&]() {
-            for (int s = 0; s < seq; ++s) {
-                op_f32_to_f16(buf.data() + s * H, npu_in.data(), H);
-                run_linear_or_throw(L.gate_proj, "gate_proj", npu_in.data(), 1, gate_f16.data() + s * IS);
-                run_linear_or_throw(L.up_proj,   "up_proj",   npu_in.data(), 1, up_f16.data()   + s * IS);
+            if (L.gate_up_proj) {
+                std::vector<uint16_t> gate_up_f16((size_t)seq * IS * 2);
+                for (int s = 0; s < seq; ++s) {
+                    op_f32_to_f16(buf.data() + s * H, npu_in.data(), H);
+                    run_linear_or_throw(L.gate_up_proj, "gate_up_proj",
+                                        npu_in.data(), 1,
+                                        gate_up_f16.data() + (size_t)s * IS * 2);
+                }
+
+                for (int s = 0; s < seq; ++s) {
+                    const uint16_t* row = gate_up_f16.data() + (size_t)s * IS * 2;
+                    op_f16_to_f32(row,      gate.data() + (size_t)s * IS, IS);
+                    op_f16_to_f32(row + IS, up.data()   + (size_t)s * IS, IS);
+                }
+            } else {
+                for (int s = 0; s < seq; ++s) {
+                    op_f32_to_f16(buf.data() + s * H, npu_in.data(), H);
+                    run_linear_or_throw(L.gate_proj, "gate_proj", npu_in.data(), 1, gate_f16.data() + s * IS);
+                    run_linear_or_throw(L.up_proj,   "up_proj",   npu_in.data(), 1, up_f16.data()   + s * IS);
+                }
+                op_f16_to_f32(gate_f16.data(), gate.data(), seq * IS);
+                op_f16_to_f32(up_f16.data(),   up.data(),   seq * IS);
             }
-            op_f16_to_f32(gate_f16.data(), gate.data(), seq * IS);
-            op_f16_to_f32(up_f16.data(),   up.data(),   seq * IS);
         });
 
         // SiLU(gate) * up
@@ -374,7 +515,7 @@ std::vector<float> Qwen2Model::forward(const std::vector<int>& tokens) {
             for (int i = 0; i < seq * IS; ++i) gate[i] *= up[i];
         });
 
-        // ---- 10. down proj (NPU, M=1) ----
+        // ---- 10. down proj (NPU, M=1 per token) ----
         std::vector<uint16_t> ffn_in_f16(IS);
         std::vector<uint16_t> ffn_out_f16((size_t)seq * H);
         std::vector<float> ffn_out((size_t)seq * H);
@@ -397,7 +538,7 @@ std::vector<float> Qwen2Model::forward(const std::vector<int>& tokens) {
                    1, H, c.rms_norm_eps);
     });
 
-    // ---- lm_head (CPU fallback) ----
+    // ---- lm_head ----
     std::vector<uint16_t> lm_in(H);
     std::vector<uint16_t> lm_out(c.vocab_size);
     profile_block(prof.lm_head_us, [&]() {
