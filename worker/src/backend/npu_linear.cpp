@@ -1,9 +1,52 @@
 #include "backend/npu_linear.h"
 #include <cstdio>
 #include <cstring>
+#include <sys/resource.h>
+
+namespace {
+
+void ensure_nofile_limit() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+
+    constexpr rlim_t kTargetNoFile = 4096;
+    struct rlimit lim {};
+    if (getrlimit(RLIMIT_NOFILE, &lim) != 0) {
+        return;
+    }
+    if (lim.rlim_cur >= kTargetNoFile) {
+        return;
+    }
+
+    rlim_t new_soft = kTargetNoFile;
+    if (lim.rlim_max != RLIM_INFINITY && lim.rlim_max < new_soft) {
+        new_soft = lim.rlim_max;
+    }
+    if (new_soft <= lim.rlim_cur) {
+        std::fprintf(stderr,
+                     "[NpuLinear] RLIMIT_NOFILE soft=%llu hard=%llu; "
+                     "consider `ulimit -n 4096` before running\n",
+                     (unsigned long long)lim.rlim_cur,
+                     (unsigned long long)lim.rlim_max);
+        return;
+    }
+
+    struct rlimit updated = lim;
+    updated.rlim_cur = new_soft;
+    if (setrlimit(RLIMIT_NOFILE, &updated) == 0) {
+        std::fprintf(stderr,
+                     "[NpuLinear] raised RLIMIT_NOFILE soft limit to %llu\n",
+                     (unsigned long long)new_soft);
+    }
+}
+
+}  // namespace
 
 bool NpuLinear::init(int K, int N, const uint16_t* weight_kn) {
     destroy();
+
+    ensure_nofile_limit();
 
     K_ = K; N_ = N;
 

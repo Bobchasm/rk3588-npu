@@ -131,20 +131,26 @@ static bool qwen2_profile_enabled() {
     return v && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0');
 }
 
+static bool is_npu_backend(LinearBackend backend) {
+    return backend == LinearBackend::NPU ||
+           backend == LinearBackend::NPU_SINGLE ||
+           backend == LinearBackend::NPU_SHARDED;
+}
+
 static LinearBackend select_lm_head_backend() {
     const char* v = std::getenv("RKLLM_LM_HEAD_BACKEND");
     if (!v || v[0] == '\0') {
-        return LinearBackend::NPU_SHARDED;
+        return LinearBackend::NPU;
     }
     if (std::strcmp(v, "CPU") == 0 || std::strcmp(v, "cpu") == 0) {
         return LinearBackend::CPU;
     }
     if (std::strcmp(v, "NPU") == 0 || std::strcmp(v, "npu") == 0) {
-        return LinearBackend::NPU_SHARDED;
+        return LinearBackend::NPU;
     }
     if (std::strcmp(v, "NPU_SINGLE") == 0 || std::strcmp(v, "npu_single") == 0 ||
         std::strcmp(v, "SINGLE_NPU") == 0 || std::strcmp(v, "single_npu") == 0) {
-        return LinearBackend::NPU;
+        return LinearBackend::NPU_SINGLE;
     }
     if (std::strcmp(v, "NPU_SHARDED") == 0 || std::strcmp(v, "npu_sharded") == 0 ||
         std::strcmp(v, "SHARDED_NPU") == 0 || std::strcmp(v, "sharded_npu") == 0) {
@@ -152,15 +158,16 @@ static LinearBackend select_lm_head_backend() {
     }
 
     std::fprintf(stderr,
-                 "[load] unknown RKLLM_LM_HEAD_BACKEND=%s, use NPU_SHARDED\n",
+                 "[load] unknown RKLLM_LM_HEAD_BACKEND=%s, use NPU_AUTO\n",
                  v);
-    return LinearBackend::NPU_SHARDED;
+    return LinearBackend::NPU;
 }
 
 static const char* linear_backend_name(LinearBackend backend) {
     switch (backend) {
         case LinearBackend::CPU: return "CPU";
-        case LinearBackend::NPU: return "NPU_SINGLE";
+        case LinearBackend::NPU: return "NPU_AUTO";
+        case LinearBackend::NPU_SINGLE: return "NPU_SINGLE";
         case LinearBackend::NPU_SHARDED: return "NPU_SHARDED";
         default: return "UNKNOWN";
     }
@@ -262,8 +269,8 @@ bool Qwen2Model::load(const std::string& model_dir, LinearBackend backend) {
 
             L->input_layernorm = load_tensor_f32(sf_path, meta.at(pfx + "input_layernorm.weight"));
 
-            if (backend == LinearBackend::NPU) {
-                if (!init_fused_qkv_linear(L->qkv_proj, LinearBackend::NPU_SHARDED,
+            if (is_npu_backend(backend)) {
+                if (!init_fused_qkv_linear(L->qkv_proj, backend,
                                            sf_path, meta,
                                            pfx + "self_attn.q_proj.weight",
                                            pfx + "self_attn.k_proj.weight",
@@ -282,8 +289,8 @@ bool Qwen2Model::load(const std::string& model_dir, LinearBackend backend) {
 
             L->post_attention_layernorm = load_tensor_f32(sf_path, meta.at(pfx + "post_attention_layernorm.weight"));
 
-            if (backend == LinearBackend::NPU) {
-                if (!init_fused_gate_up_linear(L->gate_up_proj, LinearBackend::NPU_SHARDED,
+            if (is_npu_backend(backend)) {
+                if (!init_fused_gate_up_linear(L->gate_up_proj, backend,
                                                sf_path, meta,
                                                pfx + "mlp.gate_proj.weight",
                                                pfx + "mlp.up_proj.weight",
@@ -292,9 +299,7 @@ bool Qwen2Model::load(const std::string& model_dir, LinearBackend backend) {
                 if (!init_linear(L->gate_proj, backend, sf_path, meta, pfx + "mlp.gate_proj.weight", H,  IS)) return fail();
                 if (!init_linear(L->up_proj,   backend, sf_path, meta, pfx + "mlp.up_proj.weight",   H,  IS)) return fail();
             }
-            LinearBackend down_backend =
-                (backend == LinearBackend::NPU) ? LinearBackend::NPU_SHARDED : backend;
-            if (!init_linear(L->down_proj, down_backend, sf_path, meta, pfx + "mlp.down_proj.weight", IS, H )) return fail();
+            if (!init_linear(L->down_proj, backend, sf_path, meta, pfx + "mlp.down_proj.weight", IS, H )) return fail();
 
             layers_[i] = std::move(L);
         }
