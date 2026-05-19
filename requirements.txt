@@ -1,0 +1,6 @@
+transformers>=4.30
+tokenizers>=0.13
+sentencepiece
+requests
+numpy
+tqdm

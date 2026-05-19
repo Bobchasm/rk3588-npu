@@ -4,6 +4,9 @@ project(qwen2_worker CXX)
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+option(BUILD_WORKER_APPS "Build worker example apps" ON)
+option(BUILD_WITH_RKNN "Link RKNN runtime when building worker core" ON)
+
 # ---------- RKNN SDK 路径 ----------
 set(RKNN_SDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/lib/rknpu2")
 set(RKNN_INC      "${RKNN_SDK_ROOT}/runtime/Linux/librknn_api/include")
@@ -59,20 +62,32 @@ target_include_directories(worker_core PUBLIC
     ${RKNN_INC}
     ${FP16_INC}
 )
-target_link_directories(worker_core PUBLIC ${RKNN_LIB})
-target_link_libraries(worker_core PUBLIC rknnrt m pthread)
+if(BUILD_WITH_RKNN)
+    target_link_directories(worker_core PUBLIC ${RKNN_LIB})
+    target_link_libraries(worker_core PUBLIC rknnrt m pthread)
+else()
+    target_link_libraries(worker_core PUBLIC m pthread)
+endif()
 
-# ---------- 入口 1：qwen2_demo（token id 命令行，保留旧用法）----------
-add_executable(qwen2_demo src/main.cpp)
-target_link_libraries(qwen2_demo PRIVATE worker_core)
+# ---------- 入口 1：qwen2_demo（token id 命令行）----------
+if(BUILD_WORKER_APPS)
+    add_executable(qwen2_demo src/main.cpp)
+    target_link_libraries(qwen2_demo PRIVATE worker_core)
 
-# ---------- 入口 2：qwen2_chat（REPL，供 Python 包装器驱动）----------
-add_executable(qwen2_chat src/chat_main.cpp)
-target_link_libraries(qwen2_chat PRIVATE worker_core)
+    # ---------- 入口 2：qwen2_chat（REPL，供 Python 包装器驱动）----------
+    add_executable(qwen2_chat src/chat_main.cpp)
+    target_link_libraries(qwen2_chat PRIVATE worker_core)
+
+    # ---------- 入口 3：worker_rpc_server（RPC服务版）----------
+    add_executable(worker_rpc_server src/worker_rpc_server.cpp src/network/worker_service.cpp src/network/rpc_server.cpp)
+    target_link_libraries(worker_rpc_server PRIVATE worker_core pthread)
+endif()
 
 # ---------- install ----------
-install(TARGETS qwen2_demo qwen2_chat
-        DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/install)
+if(BUILD_WORKER_APPS)
+    install(TARGETS qwen2_demo qwen2_chat worker_rpc_server
+            DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/install)
+endif()
 install(FILES
     ${RKNN_LIB}/librknnrt.so
     DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/install

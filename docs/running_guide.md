@@ -1,6 +1,6 @@
-# RK3588 NPU Worker 运行指南
-
 本文档描述当前项目的运行步骤，包括本地环境设置、将文字转换为 token id、在 RK3588 板子上测试推理、以及将输出解码回文字。
+
+# 单板 Worker
 
 ## 1. 本地环境设置
 
@@ -125,4 +125,68 @@ new_ids = out[0][ids.shape[1]:].tolist()
 print('token ids:', new_ids)
 print(f'耗时: {t1-t0:.1f}s，平均 {10/(t1-t0):.2f} tok/s')
 "
+```
+
+
+# 引入调度器后的系统运行
+
+## 1. 环境
+
+使用脚本安装 Python 依赖
+
+```bash
+chmod +x scripts/setup_python_deps.sh
+./scripts/setup_python_deps.sh
+```
+
+
+## 2. 编译运行 worker
+
+### 本地编译
+
+```bash
+cd ~/worker
+./build-linux.sh
+```
+
+输出目录：
+- `~/rk3588-npu/worker/install/qwen2_demo`
+- `~/rk3588-npu/worker/install/qwen2_chat`
+- `~/rk3588-npu/worker/install/worker_rpc_server`
+- `~/rk3588-npu/worker/install/librknnrt.so`
+
+> 如果 `./build-linux.sh` 报 "请设置 GCC_COMPILER"，请先执行：
+> ```bash
+> export GCC_COMPILER=aarch64-linux-gnu
+> ```
+
+### 将产物传到板子
+
+`worker/install/worker_rpc_server` 传到板子 `/root/matmul/worker_test/` 下
+
+
+
+### 板子上运行 worker
+
+```bash
+./worker_rpc_server Qwen1.5B 0.0.0.0:5001
+```
+
+
+## 3. 本地运行调度器
+
+### 在本地 WSL 构建 scheduler
+
+```bash
+cd scheduler
+mkdir -p build && cd build
+cmake .. -DSCHEDULER_USE_WORKER_CORE=OFF
+cmake --build . -- -j4
+```
+
+### 运行 scheduler CLI 指向板子 RPC 服务
+
+```bash
+cd /scheduler/build
+./scheduler_cli /models/qwen1.5b-instruct/Qwen2-1.5B-Instruct <rk3588 ip>:5001
 ```
