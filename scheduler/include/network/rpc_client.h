@@ -11,12 +11,8 @@ public:
     bool connect(const std::string& endpoint);
     bool send_ping();
 
-    bool send_prefill(const PrefillRequest& req, PrefillResponse& resp);
-    bool send_generate(const SessionId& session_id,
-                       RequestId request_id,
-                       const std::vector<int>& input_ids,
-                       int max_new_tokens,
-                       GenerationResult& result);
+    bool send_generate_tokens(const GenerateTokensRequest& req, GenerateTokensResponse& resp);
+    bool send_forward_stage(const StageForwardRequest& req, StageForwardResponse& resp);
 
 private:
     std::string endpoint_;

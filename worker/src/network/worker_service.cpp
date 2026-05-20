@@ -1,36 +1,24 @@
 #include "network/worker_service.h"
-#include "network/rpc_server.h"
-#include <api/llm_engine.h>
-#include <cstdint>
+
+#include <api/generation_config.h>
+
 #include <iostream>
-#include <sstream>
-#include <string>
+#include <utility>
 #include <vector>
 
-static std::vector<int> parse_ids(const std::string& token_list) {
-    std::vector<int> ids;
-    std::istringstream iss(token_list);
-    std::string token;
-    while (std::getline(iss, token, ',')) {
-        if (token.empty()) continue;
-        ids.push_back(std::stoi(token));
-    }
-    return ids;
+namespace {
+
+GenerationConfig make_generation_config(const distributed::GenerationParameters& params) {
+    GenerationConfig cfg;
+    cfg.max_new_tokens = params.max_new_tokens;
+    cfg.repetition_window = params.repetition_window;
+    return cfg;
 }
 
-static std::string serialize_ids(const std::vector<int>& ids) {
-    std::ostringstream oss;
-    for (size_t i = 0; i < ids.size(); ++i) {
-        if (i) oss << ',';
-        oss << ids[i];
-    }
-    return oss.str();
-}
+}  // namespace
 
 WorkerService::WorkerService()
-    : loaded_(false)
-{
-}
+    : loaded_(false) {}
 
 WorkerService::~WorkerService() {
     rpc_server_.stop();
@@ -49,46 +37,74 @@ bool WorkerService::register_service(const std::string& address,
     });
 }
 
+distributed::GenerateTokensResponse WorkerService::handle_generate_tokens(
+    const distributed::GenerateTokensRequest& request) {
+    distributed::GenerateTokensResponse response;
+    response.context = request.context;
+
+    if (request.input_token_ids.empty()) {
+        response.status = distributed::StatusCode::kError;
+        response.message = "input_token_ids is empty";
+        return response;
+    }
+
+    engine_.reset();
+    const GenerationConfig cfg = make_generation_config(request.generation);
+    const auto generation = engine_.generate(
+        std::vector<int>(request.input_token_ids.begin(), request.input_token_ids.end()),
+        cfg,
+        nullptr);
+
+    response.status = distributed::StatusCode::kOk;
+    response.output_token_ids.assign(generation.output_ids.begin(), generation.output_ids.end());
+    response.prefill_tokens = generation.prefill_tokens;
+    response.decode_tokens = generation.decode_tokens;
+    response.prefill_ms = generation.prefill_ms;
+    response.decode_ms = generation.decode_ms;
+    response.hit_stop = generation.hit_stop;
+    response.hit_repetition = generation.hit_repetition;
+    return response;
+}
+
+distributed::StageForwardResponse WorkerService::handle_stage_forward(
+    const distributed::StageForwardRequest& request) {
+    distributed::StageForwardResponse response;
+    response.context = request.context;
+    response.status = distributed::StatusCode::kUnsupported;
+    response.message =
+        "current worker only supports single-node full-model generation; "
+        "stage forwarding is reserved for future multi-worker pipeline";
+    return response;
+}
+
 std::string WorkerService::handle_request(const std::string& request) {
     if (!loaded_) {
-        return "ERR|0|model-not-loaded";
+        distributed::RequestContext context;
+        return distributed::serialize_error_response(
+            distributed::RpcCommand::kGenerateTokens,
+            context,
+            distributed::StatusCode::kError,
+            "model-not-loaded");
     }
 
-    std::vector<std::string> parts;
-    std::istringstream iss(request);
-    std::string part;
-    while (std::getline(iss, part, '|')) {
-        parts.push_back(part);
+    if (distributed::is_ping_payload(request)) {
+        return "PONG";
     }
 
-    if (parts.size() < 4) {
-        return "ERR|0|invalid-request-format";
+    distributed::GenerateTokensRequest generate_request;
+    if (distributed::deserialize_generate_request(request, generate_request)) {
+        return distributed::serialize_generate_response(handle_generate_tokens(generate_request));
     }
 
-    const std::string& command = parts[0];
-    uint64_t request_id = std::stoull(parts[1]);
-    int max_new_tokens = std::stoi(parts[2]);
-    std::vector<int> input_ids = parse_ids(parts[3]);
-
-    if (command == "PREFILL") {
-        engine_.reset();
-        GenerationConfig cfg;
-        cfg.max_new_tokens = max_new_tokens;
-        engine_.generate(input_ids, cfg, nullptr);
-        return "OK|" + std::to_string(request_id) + "|0|0|";
+    distributed::StageForwardRequest stage_request;
+    if (distributed::deserialize_stage_request(request, stage_request)) {
+        return distributed::serialize_stage_response(handle_stage_forward(stage_request));
     }
 
-    if (command == "GENERATE") {
-        engine_.reset();
-        GenerationConfig cfg;
-        cfg.max_new_tokens = max_new_tokens;
-        GenerationResult result = engine_.generate(input_ids, cfg, nullptr);
-        std::string payload = serialize_ids(result.output_ids);
-        std::ostringstream resp;
-        resp << "OK|" << request_id << "|" << result.prefill_ms << "|"
-             << result.decode_ms << "|" << payload;
-        return resp.str();
-    }
-
-    return "ERR|" + std::to_string(request_id) + "|unsupported-command";
+    distributed::RequestContext context;
+    return distributed::serialize_error_response(
+        distributed::RpcCommand::kGenerateTokens,
+        context,
+        distributed::StatusCode::kError,
+        "invalid-or-unsupported-request");
 }

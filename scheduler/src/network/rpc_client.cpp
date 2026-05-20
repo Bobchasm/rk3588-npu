@@ -1,4 +1,5 @@
 #include "network/rpc_client.h"
+
 #include <arpa/inet.h>
 #include <cerrno>
 #include <cstring>
@@ -96,21 +97,18 @@ bool RpcClient::send_ping() {
     int sock;
     if (!open_connection(endpoint_, sock)) return false;
     std::string response;
-    bool ok = send_line(sock, "PING|0|0|") && recv_line(sock, response) && response == "PONG|0";
+    bool ok = send_line(sock, distributed::serialize_ping_request()) &&
+              recv_line(sock, response) &&
+              response == "PONG";
     close(sock);
     return ok;
 }
 
-bool RpcClient::send_prefill(const PrefillRequest& req, PrefillResponse& resp) {
+bool RpcClient::send_generate_tokens(const GenerateTokensRequest& req,
+                                     GenerateTokensResponse& resp) {
     int sock;
     if (!open_connection(endpoint_, sock)) return false;
-    std::ostringstream oss;
-    oss << "PREFILL|" << req.request_id << "|" << req.max_new_tokens << "|";
-    for (size_t i = 0; i < req.input_ids.size(); ++i) {
-        if (i) oss << ',';
-        oss << req.input_ids[i];
-    }
-    if (!send_line(sock, oss.str())) {
+    if (!send_line(sock, distributed::serialize_generate_request(req))) {
         close(sock);
         return false;
     }
@@ -119,39 +117,14 @@ bool RpcClient::send_prefill(const PrefillRequest& req, PrefillResponse& resp) {
     bool ok = recv_line(sock, response);
     close(sock);
     if (!ok) return false;
-
-    std::istringstream rs(response);
-    std::string status;
-    std::getline(rs, status, '|');
-    if (status != "OK") {
-        std::string error_msg;
-        std::getline(rs, error_msg, '|');
-        resp.status = RequestStatus::ERROR;
-        resp.message = error_msg;
-        return true;
-    }
-
-    std::string request_id_str;
-    std::getline(rs, request_id_str, '|');
-    resp.request_id = std::stoull(request_id_str);
-    resp.status = RequestStatus::OK;
-    return true;
+    return distributed::deserialize_generate_response(response, resp);
 }
 
-bool RpcClient::send_generate(const SessionId& session_id,
-                              RequestId request_id,
-                              const std::vector<int>& input_ids,
-                              int max_new_tokens,
-                              GenerationResult& result) {
+bool RpcClient::send_forward_stage(const StageForwardRequest& req,
+                                   StageForwardResponse& resp) {
     int sock;
     if (!open_connection(endpoint_, sock)) return false;
-    std::ostringstream oss;
-    oss << "GENERATE|" << request_id << "|" << max_new_tokens << "|";
-    for (size_t i = 0; i < input_ids.size(); ++i) {
-        if (i) oss << ',';
-        oss << input_ids[i];
-    }
-    if (!send_line(sock, oss.str())) {
+    if (!send_line(sock, distributed::serialize_stage_request(req))) {
         close(sock);
         return false;
     }
@@ -160,34 +133,5 @@ bool RpcClient::send_generate(const SessionId& session_id,
     bool ok = recv_line(sock, response);
     close(sock);
     if (!ok) return false;
-
-    std::istringstream rs(response);
-    std::string status;
-    std::getline(rs, status, '|');
-    if (status != "OK") {
-        std::string err_msg;
-        std::getline(rs, err_msg, '|');
-        result.error_message = err_msg;
-        return false;
-    }
-
-    std::string request_id_str;
-    std::getline(rs, request_id_str, '|');
-    std::string prefill_ms_str;
-    std::getline(rs, prefill_ms_str, '|');
-    std::string decode_ms_str;
-    std::getline(rs, decode_ms_str, '|');
-    std::string ids_str;
-    std::getline(rs, ids_str, '|');
-
-    result.prefill_ms = std::stof(prefill_ms_str);
-    result.decode_ms = std::stof(decode_ms_str);
-    result.output_ids.clear();
-    std::istringstream iss(ids_str);
-    std::string id_token;
-    while (std::getline(iss, id_token, ',')) {
-        if (id_token.empty()) continue;
-        result.output_ids.push_back(std::stoi(id_token));
-    }
-    return true;
+    return distributed::deserialize_stage_response(response, resp);
 }

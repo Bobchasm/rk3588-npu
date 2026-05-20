@@ -18,6 +18,7 @@ set(FP16_INC      "${RKNN_SDK_ROOT}/fp16/include")
 # 源文件里用 "ops/op_rmsnorm.h" 这样的带前缀路径
 include_directories(
     include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
     ${RKNN_INC}
     ${FP16_INC}
 )
@@ -59,6 +60,7 @@ add_library(worker_core STATIC
 )
 target_include_directories(worker_core PUBLIC
     include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
     ${RKNN_INC}
     ${FP16_INC}
 )

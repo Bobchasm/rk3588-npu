@@ -1,4 +1,5 @@
 #include "worker_interface.h"
+
 #include "network/rpc_client.h"
 #include <iostream>
 
@@ -49,55 +50,41 @@ public:
         return false;
     }
 
-    GenerationResult generate_local(
-        const SessionId& session_id,
-        const std::vector<int>& input_ids,
-        int max_new_tokens,
-        TokenCallback on_token = nullptr) override
+    GenerationResult generate_tokens(const GenerateTokensRequest& req,
+                                     TokenCallback on_token = nullptr) override
     {
+        (void)req.context;
 #ifdef SCHEDULER_USE_WORKER_CORE
         GenerationConfig cfg;
-        cfg.max_new_tokens = max_new_tokens;
-        return engine_.generate(input_ids, cfg, on_token);
+        cfg.max_new_tokens = req.generation.max_new_tokens;
+        cfg.repetition_window = req.generation.repetition_window;
+
+        const auto local_result = engine_.generate(
+            std::vector<int>(req.input_token_ids.begin(), req.input_token_ids.end()),
+            cfg,
+            on_token);
+
+        GenerationResult result;
+        result.output_ids.assign(local_result.output_ids.begin(), local_result.output_ids.end());
+        result.prefill_tokens = local_result.prefill_tokens;
+        result.decode_tokens = local_result.decode_tokens;
+        result.prefill_ms = local_result.prefill_ms;
+        result.decode_ms = local_result.decode_ms;
+        result.hit_stop = local_result.hit_stop;
+        result.hit_repetition = local_result.hit_repetition;
+        return result;
 #else
         GenerationResult result;
-        result.prefill_ms = 0;
-        result.decode_ms = 0;
-        result.output_ids.clear();
         result.error_message = "Host stub build: no RKNN backend available.";
         return result;
 #endif
     }
 
-    PrefillResponse prefill(const PrefillRequest& req) override {
-        PrefillResponse resp;
-        resp.request_id = req.request_id;
-#ifdef SCHEDULER_USE_WORKER_CORE
-        engine_.reset();
-        GenerationConfig cfg;
-        cfg.max_new_tokens = req.max_new_tokens;
-        engine_.generate(req.input_ids, cfg, nullptr);
-        resp.status = RequestStatus::OK;
-#else
-        resp.status = RequestStatus::ERROR;
-        resp.message = "Host stub build: prefill unavailable.";
-#endif
-        return resp;
-    }
-
-    StageRunResponse run_stage(const StageRunRequest& req) override {
-        StageRunResponse resp;
-        resp.request_id = req.request_id;
-        resp.status = RequestStatus::ERROR;
-        resp.message = "Stage execution not supported by LocalWorker";
-        return resp;
-    }
-
-    DecodeStepResponse decode_step(const DecodeStepRequest& req) override {
-        DecodeStepResponse resp;
-        resp.request_id = req.request_id;
-        resp.status = RequestStatus::ERROR;
-        resp.message = "Decode step not supported by LocalWorker";
+    StageForwardResponse forward_stage(const StageForwardRequest& req) override {
+        StageForwardResponse resp;
+        resp.context = req.context;
+        resp.status = RequestStatus::kUnsupported;
+        resp.message = "LocalWorker does not support stage forwarding yet";
         return resp;
     }
 
@@ -147,11 +134,8 @@ public:
         return connected_;
     }
 
-    GenerationResult generate_local(
-        const SessionId& session_id,
-        const std::vector<int>& input_ids,
-        int max_new_tokens,
-        TokenCallback on_token = nullptr) override
+    GenerationResult generate_tokens(const GenerateTokensRequest& req,
+                                     TokenCallback on_token = nullptr) override
     {
         GenerationResult result;
         if (!connected_) {
@@ -159,11 +143,29 @@ public:
             return result;
         }
 
-        RequestId request_id = next_request_id_++;
-        if (!client_.send_generate(session_id, request_id, input_ids, max_new_tokens, result)) {
-            result.error_message = "Remote generation failed";
+        GenerateTokensRequest request = req;
+        if (request.context.request_id == 0) {
+            request.context.request_id = next_request_id_++;
+        }
+        request.context.route.target_worker_id = worker_id_;
+
+        GenerateTokensResponse response;
+        if (!client_.send_generate_tokens(request, response)) {
+            result.error_message = "Remote generate RPC failed";
             return result;
         }
+        if (!distributed::is_success(response.status)) {
+            result.error_message = response.message;
+            return result;
+        }
+
+        result.output_ids.assign(response.output_token_ids.begin(), response.output_token_ids.end());
+        result.prefill_tokens = response.prefill_tokens;
+        result.decode_tokens = response.decode_tokens;
+        result.prefill_ms = response.prefill_ms;
+        result.decode_ms = response.decode_ms;
+        result.hit_stop = response.hit_stop;
+        result.hit_repetition = response.hit_repetition;
 
         if (on_token) {
             for (int step = 0; step < (int)result.output_ids.size(); ++step) {
@@ -174,34 +176,18 @@ public:
         return result;
     }
 
-    PrefillResponse prefill(const PrefillRequest& req) override {
-        PrefillResponse resp;
-        resp.request_id = req.request_id;
+    StageForwardResponse forward_stage(const StageForwardRequest& req) override {
+        StageForwardResponse resp;
+        resp.context = req.context;
         if (!connected_) {
-            resp.status = RequestStatus::ERROR;
+            resp.status = RequestStatus::kError;
             resp.message = "RemoteWorker not connected";
             return resp;
         }
-        if (!client_.send_prefill(req, resp)) {
-            resp.status = RequestStatus::ERROR;
-            resp.message = "Remote prefill failed";
+        if (!client_.send_forward_stage(req, resp)) {
+            resp.status = RequestStatus::kError;
+            resp.message = "Remote stage RPC failed";
         }
-        return resp;
-    }
-
-    StageRunResponse run_stage(const StageRunRequest& req) override {
-        StageRunResponse resp;
-        resp.request_id = req.request_id;
-        resp.status = RequestStatus::ERROR;
-        resp.message = "Stage execution not supported by RemoteWorker";
-        return resp;
-    }
-
-    DecodeStepResponse decode_step(const DecodeStepRequest& req) override {
-        DecodeStepResponse resp;
-        resp.request_id = req.request_id;
-        resp.status = RequestStatus::ERROR;
-        resp.message = "Decode step not supported by RemoteWorker";
         return resp;
     }
 
