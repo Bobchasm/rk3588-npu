@@ -6,9 +6,10 @@
 // op_linear: Linear 算子抽象接口
 //
 // 模型里所有线性变换统一通过 ILinearOp 调用，具体后端在 backend/ 下实现：
-//   - NPU 单核（当前）
-//   - NPU 多核调度（规划中）
-//   - CPU GEMM fallback（规划中）
+//   - NPU 自动规划（根据矩阵规模选择单核或分片）
+//   - NPU 单核
+//   - NPU 按 N 维分片并发（lm_head 等大矩阵）
+//   - CPU fallback
 //
 // 约定：
 //   - 权重格式为 [K, N] 的 FP16，即原 PyTorch 权重的转置结果
@@ -33,8 +34,10 @@ public:
 
 // 线性后端类型
 enum class LinearBackend {
-    NPU,
-    // 预留：NPU_MULTI_CORE, CPU_GEMM 等
+    NPU,          // 自动规划：大矩阵使用三核分片，小矩阵使用单核
+    NPU_SINGLE,   // 强制单核 NPU
+    NPU_SHARDED,  // 强制三核 NPU 分片
+    CPU,
 };
 
 // 工厂：根据后端类型创建对应的 ILinearOp 实例

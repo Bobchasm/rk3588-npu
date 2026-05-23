@@ -1,8 +1,53 @@
 #include "backend/npu_linear.h"
 #include <cstdio>
 #include <cstring>
+#include <sys/resource.h>
+
+namespace {
+
+void ensure_nofile_limit() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+
+    constexpr rlim_t kTargetNoFile = 4096;
+    struct rlimit lim {};
+    if (getrlimit(RLIMIT_NOFILE, &lim) != 0) {
+        return;
+    }
+    if (lim.rlim_cur >= kTargetNoFile) {
+        return;
+    }
+
+    rlim_t new_soft = kTargetNoFile;
+    if (lim.rlim_max != RLIM_INFINITY && lim.rlim_max < new_soft) {
+        new_soft = lim.rlim_max;
+    }
+    if (new_soft <= lim.rlim_cur) {
+        std::fprintf(stderr,
+                     "[NpuLinear] RLIMIT_NOFILE soft=%llu hard=%llu; "
+                     "consider `ulimit -n 4096` before running\n",
+                     (unsigned long long)lim.rlim_cur,
+                     (unsigned long long)lim.rlim_max);
+        return;
+    }
+
+    struct rlimit updated = lim;
+    updated.rlim_cur = new_soft;
+    if (setrlimit(RLIMIT_NOFILE, &updated) == 0) {
+        std::fprintf(stderr,
+                     "[NpuLinear] raised RLIMIT_NOFILE soft limit to %llu\n",
+                     (unsigned long long)new_soft);
+    }
+}
+
+}  // namespace
 
 bool NpuLinear::init(int K, int N, const uint16_t* weight_kn) {
+    destroy();
+
+    ensure_nofile_limit();
+
     K_ = K; N_ = N;
 
     // 创建 matmul 上下文（M=1 作为基础，实际 M 在 rebuild_ac 中适配）
@@ -19,38 +64,54 @@ bool NpuLinear::init(int K, int N, const uint16_t* weight_kn) {
     int ret = rknn_matmul_create(&ctx_, &info, &io_attr_);
     if (ret < 0) {
         std::fprintf(stderr, "[NpuLinear] rknn_matmul_create failed: %d (K=%d N=%d)\n", ret, K_, N_);
+        K_ = 0;
+        N_ = 0;
         return false;
+    }
+
+    auto fail = [this](const char* msg, int code) {
+        if (code < 0) {
+            std::fprintf(stderr, "[NpuLinear] %s failed: %d\n", msg, code);
+        } else {
+            std::fprintf(stderr, "[NpuLinear] %s failed\n", msg);
+        }
+        destroy();
+        return false;
+    };
+
+    if (has_core_mask_) {
+        ret = rknn_matmul_set_core_mask(ctx_, core_mask_);
+        if (ret < 0) {
+            return fail("rknn_matmul_set_core_mask", ret);
+        }
     }
 
     // 分配 B 内存
     B_mem_ = rknn_create_mem(ctx_, io_attr_.B.size);
     if (!B_mem_) {
-        std::fprintf(stderr, "[NpuLinear] rknn_create_mem(B) failed\n");
-        rknn_matmul_destroy(ctx_);
-        ctx_ = 0;
-        return false;
+        return fail("rknn_create_mem(B)", 0);
     }
 
     // normal layout 权重 -> native layout
     ret = rknn_B_normal_layout_to_native_layout(
         (void*)weight_kn, B_mem_->virt_addr, K_, N_, &info);
     if (ret < 0) {
-        std::fprintf(stderr, "[NpuLinear] rknn_B_normal_layout_to_native_layout failed: %d\n", ret);
-        return false;
+        return fail("rknn_B_normal_layout_to_native_layout", ret);
     }
 
     ret = rknn_matmul_set_io_mem(ctx_, B_mem_, &io_attr_.B);
     if (ret < 0) {
-        std::fprintf(stderr, "[NpuLinear] rknn_matmul_set_io_mem(B) failed: %d\n", ret);
-        return false;
+        return fail("rknn_matmul_set_io_mem(B)", ret);
     }
 
-    return rebuild_ac(1);
+    // A/C are activation buffers. Do not allocate them during load:
+    // hundreds of Linear contexts would otherwise keep hundreds of dmabuf fds
+    // open before inference even starts. forward() allocates lazily and reuses.
+    return true;
 }
 
 bool NpuLinear::rebuild_ac(int M) {
-    if (A_mem_) { rknn_destroy_mem(ctx_, A_mem_); A_mem_ = nullptr; }
-    if (C_mem_) { rknn_destroy_mem(ctx_, C_mem_); C_mem_ = nullptr; }
+    release_ac();
 
     // FP16 = 2 bytes/elem
     uint32_t A_size = (uint32_t)(M * K_ * 2);
@@ -58,32 +119,85 @@ bool NpuLinear::rebuild_ac(int M) {
 
     A_mem_ = rknn_create_mem(ctx_, A_size);
     C_mem_ = rknn_create_mem(ctx_, C_size);
+    auto cleanup_ac = [this]() {
+        if (A_mem_) { rknn_destroy_mem(ctx_, A_mem_); A_mem_ = nullptr; }
+        if (C_mem_) { rknn_destroy_mem(ctx_, C_mem_); C_mem_ = nullptr; }
+        cur_M_ = 0;
+        alloc_M_ = 0;
+    };
     if (!A_mem_ || !C_mem_) {
         std::fprintf(stderr, "[NpuLinear] rknn_create_mem(A/C) failed M=%d\n", M);
+        cleanup_ac();
         return false;
     }
 
+    alloc_M_ = M;
+
+    if (!bind_ac(M)) {
+        cleanup_ac();
+        return false;
+    }
+
+    return true;
+}
+
+bool NpuLinear::bind_ac(int M, bool quiet) {
     rknn_matmul_tensor_attr A_attr = io_attr_.A;
     A_attr.dims[0] = M;
-    A_attr.size    = A_size;
+    A_attr.size    = (uint32_t)(M * K_ * 2);
 
     rknn_matmul_tensor_attr C_attr = io_attr_.C;
     C_attr.dims[0] = M;
-    C_attr.size    = C_size;
+    C_attr.size    = (uint32_t)(M * N_ * 2);
 
     int ret = rknn_matmul_set_io_mem(ctx_, A_mem_, &A_attr);
-    if (ret < 0) { std::fprintf(stderr, "[NpuLinear] set A failed: %d\n", ret); return false; }
+    if (ret < 0) {
+        if (!quiet) {
+            std::fprintf(stderr, "[NpuLinear] set A failed: %d\n", ret);
+        }
+        return false;
+    }
 
     ret = rknn_matmul_set_io_mem(ctx_, C_mem_, &C_attr);
-    if (ret < 0) { std::fprintf(stderr, "[NpuLinear] set C failed: %d\n", ret); return false; }
+    if (ret < 0) {
+        if (!quiet) {
+            std::fprintf(stderr, "[NpuLinear] set C failed: %d\n", ret);
+        }
+        return false;
+    }
 
     cur_M_ = M;
     return true;
 }
 
-bool NpuLinear::forward(const uint16_t* input_f16, int M, uint16_t* output_f16) {
+bool NpuLinear::ensure_ac(int M) {
+    if (!A_mem_ || !C_mem_ || M > alloc_M_) {
+        return rebuild_ac(M);
+    }
     if (M != cur_M_) {
-        if (!rebuild_ac(M)) return false;
+        if (bind_ac(M, /*quiet=*/true)) {
+            return true;
+        }
+        return rebuild_ac(M);
+    }
+    return true;
+}
+
+void NpuLinear::release_ac() {
+    if (A_mem_) { rknn_destroy_mem(ctx_, A_mem_); A_mem_ = nullptr; }
+    if (C_mem_) { rknn_destroy_mem(ctx_, C_mem_); C_mem_ = nullptr; }
+    cur_M_ = 0;
+    alloc_M_ = 0;
+}
+
+bool NpuLinear::forward(const uint16_t* input_f16, int M, uint16_t* output_f16) {
+    if (!ctx_ || !input_f16 || !output_f16 || K_ <= 0 || N_ <= 0 || M <= 0) {
+        std::fprintf(stderr, "[NpuLinear] invalid forward args M=%d K=%d N=%d\n", M, K_, N_);
+        return false;
+    }
+
+    if (!ensure_ac(M)) {
+        return false;
     }
 
     std::memcpy(A_mem_->virt_addr, input_f16, (size_t)M * K_ * 2);
@@ -91,6 +205,7 @@ bool NpuLinear::forward(const uint16_t* input_f16, int M, uint16_t* output_f16) 
     int ret = rknn_matmul_run(ctx_);
     if (ret < 0) {
         std::fprintf(stderr, "[NpuLinear] rknn_matmul_run failed: %d\n", ret);
+        release_ac();
         return false;
     }
 
@@ -99,18 +214,16 @@ bool NpuLinear::forward(const uint16_t* input_f16, int M, uint16_t* output_f16) 
 }
 
 void NpuLinear::destroy() {
-    if (A_mem_) { rknn_destroy_mem(ctx_, A_mem_); A_mem_ = nullptr; }
+    release_ac();
     if (B_mem_) { rknn_destroy_mem(ctx_, B_mem_); B_mem_ = nullptr; }
-    if (C_mem_) { rknn_destroy_mem(ctx_, C_mem_); C_mem_ = nullptr; }
     if (ctx_)   { rknn_matmul_destroy(ctx_);      ctx_    = 0;     }
+    K_ = 0;
+    N_ = 0;
     cur_M_ = 0;
+    alloc_M_ = 0;
 }
 
-// ---------- 工厂实现：op_linear.h 的 make_linear ----------
-std::unique_ptr<ILinearOp> make_linear(LinearBackend backend) {
-    switch (backend) {
-        case LinearBackend::NPU:
-        default:
-            return std::unique_ptr<ILinearOp>(new NpuLinear());
-    }
+void NpuLinear::set_core_mask(rknn_core_mask mask) {
+    core_mask_ = mask;
+    has_core_mask_ = true;
 }

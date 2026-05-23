@@ -14,6 +14,7 @@
 struct TransformerLayer {
     // --- Attention ---
     std::vector<float>          input_layernorm;   // [hidden]
+    std::unique_ptr<ILinearOp>  qkv_proj;          // optional fused [hidden, hidden + 2 * kv_dim]
     std::unique_ptr<ILinearOp>  q_proj;            // [hidden, hidden]
     std::unique_ptr<ILinearOp>  k_proj;            // [hidden, kv_dim]
     std::unique_ptr<ILinearOp>  v_proj;            // [hidden, kv_dim]
@@ -24,6 +25,7 @@ struct TransformerLayer {
 
     // --- FFN ---
     std::vector<float>          post_attention_layernorm;  // [hidden]
+    std::unique_ptr<ILinearOp>  gate_up_proj; // optional fused [hidden, 2 * intermediate]
     std::unique_ptr<ILinearOp>  gate_proj;   // [hidden, intermediate]
     std::unique_ptr<ILinearOp>  up_proj;     // [hidden, intermediate]
     std::unique_ptr<ILinearOp>  down_proj;   // [intermediate, hidden]

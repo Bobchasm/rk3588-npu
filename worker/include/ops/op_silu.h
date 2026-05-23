@@ -1,5 +1,4 @@
 #pragma once
-
 // ============================================================
 // op_silu: SiLU / Swish 激活（in-place）
 //   y = x * sigmoid(x) = x / (1 + exp(-x))

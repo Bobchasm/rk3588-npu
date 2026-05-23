@@ -21,6 +21,7 @@ include_directories(
 
 # ---------- 按层收集源文件 ----------
 set(OPS_SOURCES
+    src/ops/op_linear.cpp
     src/ops/op_rmsnorm.cpp
     src/ops/op_rope.cpp
     src/ops/op_softmax.cpp
@@ -33,7 +34,9 @@ set(OPS_SOURCES
 )
 
 set(BACKEND_SOURCES
+    src/backend/cpu_linear.cpp
     src/backend/npu_linear.cpp
+    src/backend/sharded_npu_linear.cpp
 )
 
 set(MODEL_SOURCES
