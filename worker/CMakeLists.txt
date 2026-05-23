@@ -37,6 +37,9 @@ set(BACKEND_SOURCES
 )
 
 set(MODEL_SOURCES
+    src/model/model_source.cpp
+    src/model/model_reader.cpp
+    src/model/http_range_reader.cpp
     src/model/weight_loader.cpp
     src/model/kv_cache.cpp
     src/model/qwen2_model.cpp

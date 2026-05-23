@@ -1,4 +1,5 @@
 #include "model/qwen2_model.h"
+#include "model/model_source.h"
 #include "model/weight_loader.h"
 
 #include "ops/op_rmsnorm.h"
@@ -32,6 +33,45 @@ static bool init_linear(std::unique_ptr<ILinearOp>& linear,
     return linear->init(K, N, w.data());
 }
 
+// ============================================================
+// 辅助：使用已经准备好的 [K, N] 形式权重初始化 Linear
+//
+// 设计目的：
+// 1. 避免某些场景下重复从 safetensors 远端读取同一个大张量。
+// 2. 当前主要用于 lm_head 复用 embed_tokens.weight。
+// ============================================================
+static bool init_linear_from_pretransposed_weight(std::unique_ptr<ILinearOp>& linear,
+                                                  LinearBackend backend,
+                                                  int K,
+                                                  int N,
+                                                  const std::vector<uint16_t>& weight_kn)
+{
+    linear = make_linear(backend);
+    return linear->init(K, N, weight_kn.data());
+}
+
+// ============================================================
+// 辅助：把二维 FP16 矩阵从 [rows, cols] 转成 [cols, rows]
+//
+// 当前用途：
+//   embed_tokens_ 以 [vocab, hidden] 形式保存在内存中；
+//   lm_head 需要 [hidden, vocab] 形式的权重，因此这里做一次内存内转置，
+//   避免再次从远端加载同一个大矩阵。
+// ============================================================
+static std::vector<uint16_t> transpose_f16_matrix(const std::vector<uint16_t>& src,
+                                                  int rows,
+                                                  int cols)
+{
+    std::vector<uint16_t> dst(static_cast<std::size_t>(rows) * cols);
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            dst[static_cast<std::size_t>(c) * rows + r] =
+                src[static_cast<std::size_t>(r) * cols + c];
+        }
+    }
+    return dst;
+}
+
 Qwen2Model::Qwen2Model()  = default;
 Qwen2Model::~Qwen2Model() { destroy(); }
 
@@ -49,7 +89,25 @@ void Qwen2Model::reset_kv_cache() {
 // load: 解析 safetensors、创建每层后端、填充 KV Cache
 // ============================================================
 bool Qwen2Model::load(const std::string& model_dir, LinearBackend backend) {
-    std::string sf_path = model_dir + "/model.safetensors";
+    std::string sf_path;
+    try {
+        model_source_ = resolve_model_source(model_dir);
+        sf_path = !model_source_.resolved_file_path.empty()
+            ? model_source_.resolved_file_path
+            : model_source_.remote_url;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "[load] 模型来源解析失败: %s\n", e.what());
+        return false;
+    }
+
+    std::printf("[load] 模型来源: %s\n", model_source_.original_locator.c_str());
+    if (!model_source_.resolved_file_path.empty()) {
+        std::printf("[load] 使用本地权重文件: %s\n", model_source_.resolved_file_path.c_str());
+    }
+    if (!model_source_.remote_url.empty()) {
+        std::printf("[load] 使用远端权重 URL: %s\n", model_source_.remote_url.c_str());
+    }
+
     std::printf("[load] 解析 safetensors 文件头...\n");
     TensorMap meta;
     try {
@@ -108,7 +166,8 @@ bool Qwen2Model::load(const std::string& model_dir, LinearBackend backend) {
 
     // ---- lm_head（tied weights，复用 embed_tokens 的转置 = [H, V]）----
     std::printf("[load] lm_head...\n");
-    if (!init_linear(lm_head_, backend, sf_path, meta, "model.embed_tokens.weight", H, V))
+    std::vector<uint16_t> lm_head_weight = transpose_f16_matrix(embed_tokens_, V, H);
+    if (!init_linear_from_pretransposed_weight(lm_head_, backend, H, V, lm_head_weight))
         return false;
 
     // ---- KV Cache ----

@@ -1,5 +1,6 @@
 #pragma once
 #include "core/model_config.h"
+#include "model/model_source.h"
 #include "model/transformer_layer.h"
 #include "model/kv_cache.h"
 #include "ops/op_linear.h"
@@ -45,6 +46,7 @@ public:
     const Qwen2Config& config() const { return config_; }
 
 private:
+    ResolvedModelSource model_source_;
     Qwen2Config config_;
 
     std::vector<uint16_t>                           embed_tokens_;  // [vocab, hidden]

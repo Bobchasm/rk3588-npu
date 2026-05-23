@@ -1,8 +1,10 @@
 #pragma once
+#include "model/model_reader.h"
+
 #include <cstdint>
 #include <string>
-#include <vector>
 #include <unordered_map>
+#include <vector>
 
 // ============================================================
 // safetensors 解析器（无第三方依赖）
@@ -23,16 +25,24 @@ struct TensorMeta {
 using TensorMap = std::unordered_map<std::string, TensorMeta>;
 
 // 只解析文件头，不读取张量数据
-TensorMap load_safetensors_meta(const std::string& path);
+TensorMap load_safetensors_meta(IModelReader& reader);
+TensorMap load_safetensors_meta(const std::string& locator);
 
 // 读取指定张量，统一转为 FP16 (uint16_t)
 // transpose=true 时：[rows, cols] 按 [cols, rows] 存储（用于把 PyTorch 权重转 K×N）
 std::vector<uint16_t> load_tensor_f16(
-    const std::string& path,
+    IModelReader&       reader,
+    const TensorMeta&  meta,
+    bool               transpose = false);
+std::vector<uint16_t> load_tensor_f16(
+    const std::string& locator,
     const TensorMeta&  meta,
     bool               transpose = false);
 
 // 读取指定张量为 FP32（用于 bias / norm weight）
 std::vector<float> load_tensor_f32(
-    const std::string& path,
+    IModelReader&      reader,
+    const TensorMeta&  meta);
+std::vector<float> load_tensor_f32(
+    const std::string& locator,
     const TensorMeta&  meta);
