@@ -5,6 +5,7 @@ models/qwen1.5b-instruct/Qwen2-1.5B-Instruct
 # Temp scripts
 dl_miniforge.py
 miniforge.sh
+transfer.sh
 
 # Build artifacts
 build/
