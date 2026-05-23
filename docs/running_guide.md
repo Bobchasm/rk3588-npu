@@ -99,7 +99,7 @@ cd /root/matmul/worker_test
 
 ### 可选：板子空间不足时，直接远端随机读取模型
 
-1.用 Docker 在本地PC上启动 Nginx (/models/qwen1.5b-instruct/Qwen2-1.5B-Instruct换成自己存权重的路径，wsl/win都可以)
+1.用 Docker 在本地PC上启动 Nginx (/models/qwen1.5b-instruct/Qwen2-1.5B-Instruct换成自己存权重的路径，wsl/win都可以,win上快一点)
 
 ```bash
 docker run -d \
@@ -117,32 +117,23 @@ ssh -N -R 9000:127.0.0.1:8585 root@172.28.9.59
 
 3.板子上推理
 ```bash
+export RKLLM_HTTP_CACHE_BLOCK_MB=16
+export RKLLM_HTTP_CACHE_MAX_BLOCKS=16
+
 ./qwen2_demo http://127.0.0.1:9000/model.safetensors 151644 8948 198 ...
 ./qwen2_chat http://127.0.0.1:9000/model.safetensors
 ```
 
 #### 远端随机读取相关说明
 
-- 这种方式缓解的是“板子磁盘空间不够”的问题，不会减少模型加载到内存/NPU 时的内存占用。
-- 当前实现会在内存中做小块缓存，不会把整个模型落盘到板子磁盘。
-- 如果程序运行在 `chroot` 环境中，宿主机里的 `curl/wget` 不一定对程序可见；当前实现已经支持：
-  - `curl/wget` 命令读取
-  - 明文 `http://` 的内建 socket fallback
-- 如果后续改回“板子本地目录”或“板子挂载的网络文件系统目录”，继续传原来的本地路径即可，不需要改上层接口。
 - 远端读取相关调试与缓存参数：
-
-```bash
-export RKLLM_HTTP_DEBUG=1
-export RKLLM_HTTP_CACHE_BLOCK_MB=1
-export RKLLM_HTTP_CACHE_MAX_BLOCKS=16
-```
 
 含义：
 - `RKLLM_HTTP_DEBUG=1`：打印远端读取调试信息
 - `RKLLM_HTTP_CACHE_BLOCK_MB`：每次远端读取的块大小，默认 `1MB`
 - `RKLLM_HTTP_CACHE_MAX_BLOCKS`：最多缓存多少个块，默认 `16`
 
-### 可选：使用逻辑模型名切换本地/远端来源
+#### 使用逻辑模型名切换本地/远端来源
 
 如果你不想每次都改命令行参数，可以把第一个参数固定写成逻辑模型名，例如 `Qwen1.5B`，
 然后通过环境变量切换模型来源。下面仍然以 `qwen2_demo / qwen2_chat` 为例：
