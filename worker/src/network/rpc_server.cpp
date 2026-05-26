@@ -20,7 +20,7 @@ WorkerRpcServer::~WorkerRpcServer() {
 
 bool WorkerRpcServer::start(const std::string& address,
                             int port,
-                            std::function<std::string(const std::string&)> handler) {
+                            std::function<std::string(const std::string&, const ClientEndpoint&)> handler) {
     if (running_) {
         std::cerr << "[WorkerRpcServer] already running" << std::endl;
         return false;
@@ -82,6 +82,16 @@ bool WorkerRpcServer::start(const std::string& address,
                 break;
             }
 
+            // 每个连接在 accept 时就提取出来源地址，后续业务层可以直接拿来打日志。
+            ClientEndpoint client;
+            char ip_buffer[INET_ADDRSTRLEN] = {0};
+            if (inet_ntop(AF_INET, &client_addr.sin_addr, ip_buffer, sizeof(ip_buffer)) != nullptr) {
+                client.ip = ip_buffer;
+            } else {
+                client.ip = "unknown";
+            }
+            client.port = ntohs(client_addr.sin_port);
+
             std::string request;
             char buffer[1024];
             while (true) {
@@ -95,7 +105,7 @@ bool WorkerRpcServer::start(const std::string& address,
                 }
             }
 
-            std::string response = handler(request);
+            std::string response = handler(request, client);
             response.push_back('\n');
             send(client_fd, response.data(), response.size(), 0);
             close(client_fd);

@@ -172,8 +172,20 @@ cd ~/worker
 ./worker_rpc_server Qwen1.5B 0.0.0.0:5001
 ```
 
-
 ## 3. 本地运行调度器
+
+### conda环境
+
+```
+# 方式一：直接用脚本
+./scripts/setup_python_deps.sh
+
+# 方式二：手动
+conda create -y -n rk3588 python=3.8
+conda activate rk3588
+pip install -r requirements.txt
+```
+
 
 ### 在本地 WSL 构建 scheduler
 
@@ -186,7 +198,15 @@ cmake --build . -- -j4
 
 ### 运行 scheduler CLI 指向板子 RPC 服务
 
+可能需要在win上开一个隧道，win的cmd输入以下命令后输入密码然后不动终端
+
+```bash
+ssh -N -g -L 0.0.0.0:5001:127.0.0.1:5001 root@172.28.9.59
+```
+
+然后运行，出现 `>` 后可以直接输入文本
+
 ```bash
 cd /scheduler/build
-./scheduler_cli /models/qwen1.5b-instruct/Qwen2-1.5B-Instruct <rk3588 ip>:5001
+./scheduler_cli ~/rk3588-npu/models/qwen1.5b-instruct/Qwen2-1.5B-Instruct 172.26.0.1:5001
 ```

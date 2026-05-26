@@ -2,7 +2,10 @@
 
 #include <api/generation_config.h>
 
+#include <chrono>
+#include <cstdio>
 #include <iostream>
+#include <sstream>
 #include <utility>
 #include <vector>
 
@@ -13,6 +16,41 @@ GenerationConfig make_generation_config(const distributed::GenerationParameters&
     cfg.max_new_tokens = params.max_new_tokens;
     cfg.repetition_window = params.repetition_window;
     return cfg;
+}
+
+const char* status_to_cstr(distributed::StatusCode status) {
+    switch (status) {
+    case distributed::StatusCode::kOk:
+        return "OK";
+    case distributed::StatusCode::kError:
+        return "ERROR";
+    case distributed::StatusCode::kUnsupported:
+        return "UNSUPPORTED";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+std::string make_request_brief(const distributed::GenerateTokensRequest& request) {
+    std::ostringstream oss;
+    oss << "input_tokens=" << request.input_token_ids.size()
+        << " max_new_tokens=" << request.generation.max_new_tokens
+        << " repetition_window=" << request.generation.repetition_window;
+    return oss.str();
+}
+
+std::string make_stage_brief(const distributed::StageForwardRequest& request) {
+    std::ostringstream oss;
+    oss << "dtype=" << static_cast<int>(request.input_tensor.dtype)
+        << " shape=[";
+    for (size_t i = 0; i < request.input_tensor.shape.size(); ++i) {
+        if (i != 0) {
+            oss << ",";
+        }
+        oss << request.input_tensor.shape[i];
+    }
+    oss << "] bytes=" << request.input_tensor.bytes.size();
+    return oss.str();
 }
 
 }  // namespace
@@ -32,8 +70,8 @@ bool WorkerService::register_service(const std::string& address,
         return false;
     }
     loaded_ = true;
-    return rpc_server_.start(address, port, [this](const std::string& request) {
-        return handle_request(request);
+    return rpc_server_.start(address, port, [this](const std::string& request, const ClientEndpoint& client) {
+        return handle_request(request, client);
     });
 }
 
@@ -77,34 +115,106 @@ distributed::StageForwardResponse WorkerService::handle_stage_forward(
     return response;
 }
 
-std::string WorkerService::handle_request(const std::string& request) {
+void WorkerService::log_request_summary(const ClientEndpoint& client,
+                                        const char* command_name,
+                                        const distributed::RequestContext& context,
+                                        distributed::StatusCode status,
+                                        double elapsed_ms,
+                                        const std::string& extra) const {
+    // 日志字段保持扁平，便于后续直接 grep 或接入更正式的日志采集。
+    std::fprintf(stderr,
+                 "[WorkerService] client=%s:%d command=%s session=%s request=%llu "
+                 "trace=%s stage=%d hop=%d status=%s elapsed_ms=%.2f %s\n",
+                 client.ip.empty() ? "unknown" : client.ip.c_str(),
+                 client.port,
+                 command_name,
+                 context.session_id.empty() ? "-" : context.session_id.c_str(),
+                 static_cast<unsigned long long>(context.request_id),
+                 context.trace_id.empty() ? "-" : context.trace_id.c_str(),
+                 context.route.stage_id,
+                 context.route.hop_index,
+                 status_to_cstr(status),
+                 elapsed_ms,
+                 extra.empty() ? "" : extra.c_str());
+}
+
+std::string WorkerService::handle_request(const std::string& request,
+                                          const ClientEndpoint& client) {
+    using Clock = std::chrono::steady_clock;
+    const auto start_time = Clock::now();
+
     if (!loaded_) {
         distributed::RequestContext context;
-        return distributed::serialize_error_response(
+        const std::string response = distributed::serialize_error_response(
             distributed::RpcCommand::kGenerateTokens,
             context,
             distributed::StatusCode::kError,
             "model-not-loaded");
+        log_request_summary(client,
+                            "GENERATE_TOKENS",
+                            context,
+                            distributed::StatusCode::kError,
+                            std::chrono::duration<double, std::milli>(Clock::now() - start_time).count(),
+                            "message=model-not-loaded");
+        return response;
     }
 
     if (distributed::is_ping_payload(request)) {
+        distributed::RequestContext context;
+        log_request_summary(client,
+                            "PING",
+                            context,
+                            distributed::StatusCode::kOk,
+                            std::chrono::duration<double, std::milli>(Clock::now() - start_time).count(),
+                            "message=pong");
         return "PONG";
     }
 
     distributed::GenerateTokensRequest generate_request;
     if (distributed::deserialize_generate_request(request, generate_request)) {
-        return distributed::serialize_generate_response(handle_generate_tokens(generate_request));
+        const auto response = handle_generate_tokens(generate_request);
+        std::ostringstream extra;
+        extra << make_request_brief(generate_request)
+              << " output_tokens=" << response.output_token_ids.size()
+              << " prefill_ms=" << response.prefill_ms
+              << " decode_ms=" << response.decode_ms
+              << " message=" << (response.message.empty() ? "-" : response.message);
+        log_request_summary(client,
+                            "GENERATE_TOKENS",
+                            response.context,
+                            response.status,
+                            std::chrono::duration<double, std::milli>(Clock::now() - start_time).count(),
+                            extra.str());
+        return distributed::serialize_generate_response(response);
     }
 
     distributed::StageForwardRequest stage_request;
     if (distributed::deserialize_stage_request(request, stage_request)) {
-        return distributed::serialize_stage_response(handle_stage_forward(stage_request));
+        const auto response = handle_stage_forward(stage_request);
+        std::ostringstream extra;
+        extra << make_stage_brief(stage_request)
+              << " output_bytes=" << response.output_tensor.bytes.size()
+              << " message=" << (response.message.empty() ? "-" : response.message);
+        log_request_summary(client,
+                            "FORWARD_STAGE",
+                            response.context,
+                            response.status,
+                            std::chrono::duration<double, std::milli>(Clock::now() - start_time).count(),
+                            extra.str());
+        return distributed::serialize_stage_response(response);
     }
 
     distributed::RequestContext context;
-    return distributed::serialize_error_response(
+    const std::string response = distributed::serialize_error_response(
         distributed::RpcCommand::kGenerateTokens,
         context,
         distributed::StatusCode::kError,
         "invalid-or-unsupported-request");
+    log_request_summary(client,
+                        "UNKNOWN",
+                        context,
+                        distributed::StatusCode::kError,
+                        std::chrono::duration<double, std::milli>(Clock::now() - start_time).count(),
+                        "message=invalid-or-unsupported-request");
+    return response;
 }
