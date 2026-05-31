@@ -1,4 +1,5 @@
 #include "backend/sharded_npu_linear.h"
+#include "backend/npu_linear_w8.h"
 
 #include <algorithm>
 #include <array>
@@ -14,15 +15,20 @@ int align_up(int v, int align) {
     return ((v + align - 1) / align) * align;
 }
 
+inline uint16_t f16_order_key(uint16_t v) {
+    return (v & 0x8000u) ? (uint16_t)~v : (uint16_t)(v ^ 0x8000u);
+}
+
 class ShardedNpuWorkerPool {
 public:
     static constexpr int kNumWorkers = 3;
 
     struct Task {
-        NpuLinear* shard = nullptr;
+        ILinearOp* shard = nullptr;
         const uint16_t* input = nullptr;
         int M = 0;
         uint16_t* output = nullptr;
+        bool argmax = false;
     };
 
     ShardedNpuWorkerPool() {
@@ -66,6 +72,32 @@ public:
         return true;
     }
 
+    bool run_argmax(const std::array<Task, kNumWorkers>& tasks,
+                    std::array<int, kNumWorkers>* argmax_ids,
+                    std::array<uint16_t, kNumWorkers>* argmax_values) {
+        std::unique_lock<std::mutex> run_lock(run_mu_);
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            tasks_ = tasks;
+            ok_.fill(false);
+            argmax_ids_.fill(0);
+            argmax_values_.fill(0);
+            done_count_ = 0;
+            ++generation_;
+        }
+        cv_task_.notify_all();
+
+        std::unique_lock<std::mutex> lock(mu_);
+        cv_done_.wait(lock, [this]() { return done_count_ == kNumWorkers; });
+
+        for (bool ok : ok_) {
+            if (!ok) return false;
+        }
+        *argmax_ids = argmax_ids_;
+        *argmax_values = argmax_values_;
+        return true;
+    }
+
 private:
     void worker_loop(int worker_id) {
         uint64_t seen_generation = 0;
@@ -81,12 +113,25 @@ private:
                 task = tasks_[worker_id];
             }
 
-            bool ok = task.shard &&
-                      task.shard->forward(task.input, task.M, task.output);
+            int local_id = 0;
+            uint16_t local_value = 0;
+            bool ok = false;
+            if (task.shard) {
+                if (task.argmax) {
+                    ok = task.shard->forward_argmax(task.input, task.M,
+                                                    &local_id, &local_value);
+                } else {
+                    ok = task.shard->forward(task.input, task.M, task.output);
+                }
+            }
 
             {
                 std::lock_guard<std::mutex> lock(mu_);
                 ok_[worker_id] = ok;
+                if (task.argmax && ok) {
+                    argmax_ids_[worker_id] = local_id;
+                    argmax_values_[worker_id] = local_value;
+                }
                 ++done_count_;
             }
             cv_done_.notify_one();
@@ -96,6 +141,8 @@ private:
     std::array<std::thread, kNumWorkers> workers_;
     std::array<Task, kNumWorkers> tasks_{};
     std::array<bool, kNumWorkers> ok_{};
+    std::array<int, kNumWorkers> argmax_ids_{};
+    std::array<uint16_t, kNumWorkers> argmax_values_{};
 
     std::mutex run_mu_;
     std::mutex mu_;
@@ -120,8 +167,10 @@ bool ShardedNpuLinear::init(int K, int N, const uint16_t* weight_kn) {
         std::fprintf(stderr, "[ShardedNpuLinear] invalid init args K=%d N=%d\n", K, N);
         return false;
     }
-    if (N % kNAlign != 0) {
-        std::fprintf(stderr, "[ShardedNpuLinear] N=%d is not aligned to %d\n", N, kNAlign);
+    const bool use_a8w8 = allow_a8w8_;
+    const int n_align = use_a8w8 ? 32 : kNAlign;
+    if (N % n_align != 0) {
+        std::fprintf(stderr, "[ShardedNpuLinear] N=%d is not aligned to %d\n", N, n_align);
         return false;
     }
 
@@ -145,10 +194,10 @@ bool ShardedNpuLinear::init(int K, int N, const uint16_t* weight_kn) {
             size = remaining;
         } else {
             int shards_left = kNumShards - i;
-            size = align_up(remaining / shards_left, kNAlign);
+            size = align_up(remaining / shards_left, n_align);
         }
 
-        if (size <= 0 || size % kNAlign != 0 || size > remaining) {
+        if (size <= 0 || size % n_align != 0 || size > remaining) {
             std::fprintf(stderr,
                          "[ShardedNpuLinear] bad shard split i=%d size=%d remaining=%d\n",
                          i, size, remaining);
@@ -168,8 +217,9 @@ bool ShardedNpuLinear::init(int K, int N, const uint16_t* weight_kn) {
     };
 
     std::fprintf(stderr,
-                 "[ShardedNpuLinear] init K=%d N=%d shards: %d/%d/%d\n",
-                 K_, N_, sizes_[0], sizes_[1], sizes_[2]);
+                 "[ShardedNpuLinear] init K=%d N=%d shards: %d/%d/%d%s\n",
+                 K_, N_, sizes_[0], sizes_[1], sizes_[2],
+                 use_a8w8 ? " a8w8" : "");
 
     for (int i = 0; i < kNumShards; ++i) {
         const int shard_n = sizes_[i];
@@ -182,9 +232,30 @@ bool ShardedNpuLinear::init(int K, int N, const uint16_t* weight_kn) {
             std::memcpy(dst, src, (size_t)shard_n * sizeof(uint16_t));
         }
 
-        std::unique_ptr<NpuLinear> shard(new NpuLinear());
-        shard->set_core_mask(core_masks[i]);
-        if (!shard->init(K_, shard_n, shard_weight.data())) {
+        std::unique_ptr<ILinearOp> shard;
+        if (use_a8w8) {
+            std::unique_ptr<NpuLinearW8> w8(new NpuLinearW8());
+            w8->set_core_mask(core_masks[i]);
+            shard = std::move(w8);
+        } else {
+            std::unique_ptr<NpuLinear> fp16(new NpuLinear());
+            fp16->set_core_mask(core_masks[i]);
+            shard = std::move(fp16);
+        }
+        bool shard_ok = shard->init(K_, shard_n, shard_weight.data());
+        if (!shard_ok) {
+            if (use_a8w8) {
+                std::fprintf(stderr,
+                             "[ShardedNpuLinear] W8 shard %d init failed, fallback FP16\n",
+                             i);
+                shard->destroy();
+                std::unique_ptr<NpuLinear> fp16(new NpuLinear());
+                fp16->set_core_mask(core_masks[i]);
+                shard = std::move(fp16);
+                shard_ok = shard->init(K_, shard_n, shard_weight.data());
+            }
+        }
+        if (!shard_ok) {
             std::fprintf(stderr, "[ShardedNpuLinear] shard %d init failed\n", i);
             destroy();
             return false;
@@ -230,6 +301,51 @@ bool ShardedNpuLinear::forward(const uint16_t* input_f16, int M, uint16_t* outpu
         }
     }
 
+    return true;
+}
+
+bool ShardedNpuLinear::supports_batch(int M) const {
+    return M == 1;
+}
+
+bool ShardedNpuLinear::forward_argmax(const uint16_t* input_f16, int M,
+                                      int* argmax_id, uint16_t* argmax_value) {
+    if (!argmax_id || !input_f16 || K_ <= 0 || N_ <= 0 || M != 1 ||
+        (int)shards_.size() != kNumShards) {
+        return false;
+    }
+
+    std::array<ShardedNpuWorkerPool::Task, kNumShards> tasks{};
+    for (int i = 0; i < kNumShards; ++i) {
+        tasks[i].shard = shards_[i].get();
+        tasks[i].input = input_f16;
+        tasks[i].M = 1;
+        tasks[i].argmax = true;
+    }
+
+    std::array<int, kNumShards> local_ids{};
+    std::array<uint16_t, kNumShards> local_values{};
+    if (!worker_pool().run_argmax(tasks, &local_ids, &local_values)) {
+        std::fprintf(stderr, "[ShardedNpuLinear] shard argmax forward failed\n");
+        return false;
+    }
+
+    int best = offsets_[0] + local_ids[0];
+    uint16_t best_value = local_values[0];
+    uint16_t best_key = f16_order_key(best_value);
+    for (int si = 0; si < kNumShards; ++si) {
+        const uint16_t key = f16_order_key(local_values[si]);
+        if (key > best_key) {
+            best_key = key;
+            best_value = local_values[si];
+            best = offsets_[si] + local_ids[si];
+        }
+    }
+
+    *argmax_id = best;
+    if (argmax_value) {
+        *argmax_value = best_value;
+    }
     return true;
 }
 

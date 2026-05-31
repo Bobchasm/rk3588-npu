@@ -23,19 +23,16 @@ include_directories(
 set(OPS_SOURCES
     src/ops/op_linear.cpp
     src/ops/op_rmsnorm.cpp
-    src/ops/op_rope.cpp
     src/ops/op_softmax.cpp
-    src/ops/op_silu.cpp
-    src/ops/op_elementwise.cpp
     src/ops/op_cast.cpp
     src/ops/op_embedding.cpp
     src/ops/op_attention.cpp
-    src/ops/op_sampling.cpp
 )
 
 set(BACKEND_SOURCES
     src/backend/cpu_linear.cpp
     src/backend/npu_linear.cpp
+    src/backend/npu_linear_w8.cpp
     src/backend/sharded_npu_linear.cpp
 )
 
@@ -64,6 +61,11 @@ target_include_directories(worker_core PUBLIC
 )
 target_link_directories(worker_core PUBLIC ${RKNN_LIB})
 target_link_libraries(worker_core PUBLIC rknnrt m pthread)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    target_compile_options(worker_core PRIVATE
+        -O3 -ffast-math -funroll-loops -march=armv8.2-a+fp16
+    )
+endif()
 
 # ---------- 入口 1：qwen2_demo（token id 命令行，保留旧用法）----------
 add_executable(qwen2_demo src/main.cpp)
@@ -73,10 +75,18 @@ target_link_libraries(qwen2_demo PRIVATE worker_core)
 add_executable(qwen2_chat src/chat_main.cpp)
 target_link_libraries(qwen2_chat PRIVATE worker_core)
 
+# ---------- 工具：验证 RKNN 低比特 matmul 支持 ----------
+add_executable(probe_matmul_w8 src/tools/probe_matmul_w8.cpp)
+target_link_libraries(probe_matmul_w8 PRIVATE worker_core)
+
 # ---------- install ----------
-install(TARGETS qwen2_demo qwen2_chat
+install(TARGETS qwen2_demo qwen2_chat probe_matmul_w8
         DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/install)
 install(FILES
     ${RKNN_LIB}/librknnrt.so
+    DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/install
+)
+install(PROGRAMS
+    rate_test.sh
     DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/install
 )

@@ -54,6 +54,7 @@ int main(int argc, char* argv[]) {
     std::vector<int> input_ids;
     for (int i = 2; i < argc; ++i) input_ids.push_back(std::atoi(argv[i]));
 
+    std::printf("[build] matmul-api A8W8(INT8xINT8->INT32) path available\n");
     std::printf("模型目录: %s\n", model_dir.c_str());
     std::printf("输入 token 数量: %d\n", (int)input_ids.size());
     for (int id : input_ids) std::printf("  %d\n", id);

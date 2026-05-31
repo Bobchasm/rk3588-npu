@@ -27,7 +27,12 @@ public:
 
     bool init(int K, int N, const uint16_t* weight_kn) override;
     bool forward(const uint16_t* input_f16, int M, uint16_t* output_f16) override;
+    bool supports_batch(int M) const override;
+    bool forward_argmax(const uint16_t* input_f16, int M,
+                        int* argmax_id, uint16_t* argmax_value = nullptr) override;
     void destroy() override;
+
+    void set_allow_a8w8(bool allow) { allow_a8w8_ = allow; }
 
 private:
     static constexpr int kNumShards = 3;
@@ -35,8 +40,9 @@ private:
 
     int K_ = 0;
     int N_ = 0;
+    bool allow_a8w8_ = false;
     std::vector<int> offsets_;
     std::vector<int> sizes_;
-    std::vector<std::unique_ptr<NpuLinear>> shards_;
+    std::vector<std::unique_ptr<ILinearOp>> shards_;
     std::array<std::vector<uint16_t>, kNumShards> shard_outputs_;
 };

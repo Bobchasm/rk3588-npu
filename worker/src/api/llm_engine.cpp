@@ -1,6 +1,5 @@
 #include "api/llm_engine.h"
 #include "model/qwen2_model.h"
-#include "ops/op_sampling.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -28,8 +27,8 @@ static bool detect_repetition(const std::vector<int>& ids, int window) {
     for (int p = 1; p <= window / 2; ++p) {
         bool rep = true;
         for (int i = n - 1; i >= n - window; --i) {
-            if (ids[i] != ids[i - p]) { rep = false; break; }
             if (i - p < 0) { rep = false; break; }
+            if (ids[i] != ids[i - p]) { rep = false; break; }
         }
         if (rep) return true;
     }
@@ -69,11 +68,11 @@ GenerationResult LLMEngine::generate(
     // ---- Prefill ----
     try {
         int64_t t0 = now_us();
-        auto logits = model_->forward(input_ids);
+        int next_id = model_->forward_next_token(input_ids);
         r.prefill_ms     = (now_us() - t0) / 1e3f;
         r.prefill_tokens = (int)input_ids.size();
 
-        int next_id = op_greedy_sample(logits);
+        std::vector<int> one_token(1);
 
         // ---- Decode ----
         int64_t t_decode_start = now_us();
@@ -82,7 +81,8 @@ GenerationResult LLMEngine::generate(
             if (is_stop(next_id)) { r.hit_stop = true; break; }
 
             int64_t ts = now_us();
-            r.output_ids.push_back(next_id);
+            const int emit_id = next_id;
+            r.output_ids.push_back(emit_id);
 
             // 2. 重复检测（在 push 之后立即判断，避免无效 forward）
             if (cfg.repetition_window > 0 &&
@@ -93,12 +93,16 @@ GenerationResult LLMEngine::generate(
                 break;
             }
 
-            logits = model_->forward({next_id});
+            if (step + 1 >= cfg.max_new_tokens) {
+                break;
+            }
+
+            one_token[0] = emit_id;
+            next_id = model_->forward_next_token(one_token);
             float elapsed_ms = (now_us() - ts) / 1e3f;
 
-            if (on_token) on_token(step, next_id, elapsed_ms);
+            if (on_token) on_token(step, emit_id, elapsed_ms);
 
-            next_id = op_greedy_sample(logits);
         }
 
         r.decode_ms     = (now_us() - t_decode_start) / 1e3f;

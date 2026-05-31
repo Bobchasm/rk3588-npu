@@ -24,3 +24,14 @@ void op_attention(
     int seq, int total_len,
     int n_heads, int n_kv_heads, int head_dim,
     int pos_base);
+
+// Decode 阶段专用快路径：seq 固定为 1，当前位置已经写入 KV cache，
+// 因而没有 future token 需要 causal mask。数学结果与
+// op_attention(..., seq=1, pos_base=total_len-1) 等价。
+void op_attention_decode(
+    const float*    q,
+    const uint16_t* k_cache,
+    const uint16_t* v_cache,
+    float*          out,
+    int total_len,
+    int n_heads, int n_kv_heads, int head_dim);

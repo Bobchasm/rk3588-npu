@@ -25,6 +25,7 @@ public:
 
     bool init(int K, int N, const uint16_t* weight_kn) override;
     bool forward(const uint16_t* input_f16, int M, uint16_t* output_f16) override;
+    bool supports_batch(int M) const override { return M > 0; }
     void destroy() override;
 
 private:

@@ -2,6 +2,7 @@
 #include "ops/op_linear.h"
 #include "rknn_matmul_api.h"
 #include <cstdint>
+#include <vector>
 
 // ============================================================
 // NpuLinear: 基于 rknn_matmul_api 的 Linear 实现
@@ -26,6 +27,11 @@ public:
 
     bool init(int K, int N, const uint16_t* weight_kn) override;
     bool forward(const uint16_t* input_f16, int M, uint16_t* output_f16) override;
+    bool forward_accumulate(const uint16_t* input_f16, int M, float* accum_f32) override;
+    bool forward_f32_accumulate(const float* input_f32, int M, float* accum_f32) override;
+    bool supports_batch(int M) const override;
+    bool forward_argmax(const uint16_t* input_f16, int M,
+                        int* argmax_id, uint16_t* argmax_value = nullptr) override;
     void destroy() override;
 
     // 可选：绑定单个 NPU core。必须在 init() 前调用。
@@ -35,6 +41,8 @@ private:
     bool ensure_ac(int M);
     bool rebuild_ac(int M);
     bool bind_ac(int M, bool quiet = false);
+    bool ac_sizes(int M, uint32_t* A_size, uint32_t* C_size) const;
+    int dynamic_index_for_m(int M) const;
     void release_ac();
 
     int K_ = 0, N_ = 0;
@@ -43,6 +51,10 @@ private:
 
     rknn_matmul_ctx     ctx_ = 0;
     rknn_matmul_io_attr io_attr_{};
+    std::vector<rknn_matmul_shape> dynamic_shapes_;
+    std::vector<rknn_matmul_io_attr> dynamic_io_attrs_;
+    bool dynamic_m_ = false;
+    int dynamic_max_m_ = 1;
 
     rknn_tensor_mem* A_mem_ = nullptr;
     rknn_tensor_mem* B_mem_ = nullptr;

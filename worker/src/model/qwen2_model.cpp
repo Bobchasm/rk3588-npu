@@ -2,21 +2,24 @@
 #include "model/weight_loader.h"
 
 #include "ops/op_rmsnorm.h"
-#include "ops/op_rope.h"
-#include "ops/op_silu.h"
-#include "ops/op_elementwise.h"
 #include "ops/op_cast.h"
 #include "ops/op_embedding.h"
 #include "ops/op_attention.h"
 
 #include "core/half.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <string>
 #include <sys/time.h>
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 // ============================================================
 // 辅助：创建并初始化一个 Linear（抽象后端）
@@ -28,10 +31,12 @@ static bool init_linear(std::unique_ptr<ILinearOp>& linear,
                         const std::string& sf_path,
                         const TensorMap&   meta,
                         const std::string& weight_name,
-                        int K, int N)
+                        int K, int N,
+                        int layer_idx = -1,
+                        const char* role = nullptr)
 {
     auto w = load_tensor_f16(sf_path, meta.at(weight_name), /*transpose=*/true);
-    linear = make_linear(backend);
+    linear = make_linear(backend, layer_idx, role);
     if (!linear || !linear->init(K, N, w.data())) {
         if (linear) linear->destroy();
         linear.reset();
@@ -47,7 +52,8 @@ static bool init_fused_qkv_linear(std::unique_ptr<ILinearOp>& linear,
                                   const std::string& q_weight_name,
                                   const std::string& k_weight_name,
                                   const std::string& v_weight_name,
-                                  int hidden, int kv_dim)
+                                  int hidden, int kv_dim,
+                                  int layer_idx)
 {
     auto q_w = load_tensor_f16(sf_path, meta.at(q_weight_name), /*transpose=*/true);
     auto k_w = load_tensor_f16(sf_path, meta.at(k_weight_name), /*transpose=*/true);
@@ -68,7 +74,7 @@ static bool init_fused_qkv_linear(std::unique_ptr<ILinearOp>& linear,
                     (size_t)kv_dim * sizeof(uint16_t));
     }
 
-    linear = make_linear(backend);
+    linear = make_linear(backend, layer_idx, "qkv");
     if (!linear || !linear->init(hidden, fused_N, fused_w.data())) {
         if (linear) linear->destroy();
         linear.reset();
@@ -83,7 +89,8 @@ static bool init_fused_gate_up_linear(std::unique_ptr<ILinearOp>& linear,
                                       const TensorMap&   meta,
                                       const std::string& gate_weight_name,
                                       const std::string& up_weight_name,
-                                      int K, int intermediate)
+                                      int K, int intermediate,
+                                      int layer_idx)
 {
     auto gate_w = load_tensor_f16(sf_path, meta.at(gate_weight_name), /*transpose=*/true);
     auto up_w   = load_tensor_f16(sf_path, meta.at(up_weight_name),   /*transpose=*/true);
@@ -100,7 +107,7 @@ static bool init_fused_gate_up_linear(std::unique_ptr<ILinearOp>& linear,
                     (size_t)intermediate * sizeof(uint16_t));
     }
 
-    linear = make_linear(backend);
+    linear = make_linear(backend, layer_idx, "gate_up");
     if (!linear || !linear->init(K, fused_N, fused_w.data())) {
         if (linear) linear->destroy();
         linear.reset();
@@ -117,6 +124,93 @@ static void run_linear_or_throw(const std::unique_ptr<ILinearOp>& linear,
 {
     if (!linear || !linear->forward(input_f16, M, output_f16)) {
         throw std::runtime_error(std::string("Linear forward failed: ") + name);
+    }
+}
+
+static int linear_batch_rows() {
+    constexpr int kDefaultBatchRows = 1;
+    static int cached = []() {
+        const char* v = std::getenv("RKLLM_LINEAR_BATCH");
+        if (!v || v[0] == '\0') {
+            return kDefaultBatchRows;
+        }
+
+        char* end = nullptr;
+        long parsed = std::strtol(v, &end, 10);
+        if (end == v || parsed <= 0) {
+            std::fprintf(stderr,
+                         "[Qwen2Model] invalid RKLLM_LINEAR_BATCH=%s, use %d\n",
+                         v, kDefaultBatchRows);
+            return kDefaultBatchRows;
+        }
+        return (int)parsed;
+    }();
+    return cached;
+}
+
+static void run_linear_batched_or_throw(const std::unique_ptr<ILinearOp>& linear,
+                                        const char* name,
+                                        const uint16_t* input_f16,
+                                        int rows,
+                                        int input_stride,
+                                        int output_stride,
+                                        uint16_t* output_f16)
+{
+    static bool batch_disabled_after_failure = false;
+    const int batch_rows = batch_disabled_after_failure ? 1 : std::max(1, linear_batch_rows());
+    for (int start = 0; start < rows; start += batch_rows) {
+        const int chunk = std::min(batch_rows, rows - start);
+        const uint16_t* in = input_f16 + (size_t)start * input_stride;
+        uint16_t* out = output_f16 + (size_t)start * output_stride;
+        if (chunk == 1) {
+            run_linear_or_throw(linear, name, in, 1, out);
+            continue;
+        }
+
+        const bool can_batch = linear && linear->supports_batch(batch_rows);
+        if (!can_batch) {
+            for (int r = 0; r < chunk; ++r) {
+                run_linear_or_throw(linear, name,
+                                    in + (size_t)r * input_stride,
+                                    1,
+                                    out + (size_t)r * output_stride);
+            }
+            continue;
+        }
+
+        if (chunk == batch_rows && linear->forward(in, chunk, out)) {
+            continue;
+        }
+
+        static thread_local std::vector<uint16_t> padded_input;
+        static thread_local std::vector<uint16_t> padded_output;
+        padded_input.assign((size_t)batch_rows * input_stride, 0);
+        padded_output.resize((size_t)batch_rows * output_stride);
+        for (int r = 0; r < chunk; ++r) {
+            std::memcpy(padded_input.data() + (size_t)r * input_stride,
+                        in + (size_t)r * input_stride,
+                        (size_t)input_stride * sizeof(uint16_t));
+        }
+        if (linear->forward(padded_input.data(), batch_rows,
+                            padded_output.data())) {
+            for (int r = 0; r < chunk; ++r) {
+                std::memcpy(out + (size_t)r * output_stride,
+                            padded_output.data() + (size_t)r * output_stride,
+                            (size_t)output_stride * sizeof(uint16_t));
+            }
+            continue;
+        }
+
+        std::fprintf(stderr,
+                     "[Qwen2Model] batched linear failed for %s M=%d; fallback to M=1\n",
+                     name, batch_rows);
+        batch_disabled_after_failure = true;
+        for (int r = 0; r < chunk; ++r) {
+            run_linear_or_throw(linear, name,
+                                in + (size_t)r * input_stride,
+                                1,
+                                out + (size_t)r * output_stride);
+        }
     }
 }
 
@@ -185,7 +279,6 @@ struct ForwardProfile {
     int64_t silu_mul_us = 0;
     int64_t down_proj_us = 0;
     int64_t lm_head_us = 0;
-    int64_t logits_cast_us = 0;
     int64_t total_us = 0;
 };
 
@@ -199,19 +292,166 @@ static void print_forward_profile(int seq, int pos, int total_len,
         "[profile] forward seq=%d pos=%d total_len=%d total=%.2f ms | "
         "embedding=%.2f rmsnorm=%.2f qkv=%.2f rope=%.2f kv_write=%.2f "
         "attention=%.2f o_proj=%.2f gate_up=%.2f silu_mul=%.2f "
-        "down=%.2f lm_head=%.2f logits_cast=%.2f other=%.2f\n",
+        "down=%.2f lm_head=%.2f other=%.2f\n",
         seq, pos, total_len, us_to_ms(p.total_us),
         us_to_ms(p.embedding_us), us_to_ms(p.rmsnorm_us),
         us_to_ms(p.qkv_proj_us), us_to_ms(p.rope_us),
         us_to_ms(p.kv_write_us), us_to_ms(p.attention_us),
         us_to_ms(p.o_proj_us), us_to_ms(p.gate_up_proj_us),
         us_to_ms(p.silu_mul_us), us_to_ms(p.down_proj_us),
-        us_to_ms(p.lm_head_us), us_to_ms(p.logits_cast_us),
+        us_to_ms(p.lm_head_us),
         us_to_ms(p.total_us - p.embedding_us - p.rmsnorm_us -
                  p.qkv_proj_us - p.rope_us - p.kv_write_us -
                  p.attention_us - p.o_proj_us - p.gate_up_proj_us -
-                 p.silu_mul_us - p.down_proj_us - p.lm_head_us -
-                 p.logits_cast_us));
+                 p.silu_mul_us - p.down_proj_us - p.lm_head_us));
+}
+
+static inline float silu_scalar(float x) {
+    return x / (1.0f + std::exp(-x));
+}
+
+static const std::vector<float>& silu_f16_lut() {
+    static const std::vector<float> lut = []() {
+        std::vector<float> table(65536);
+        for (int i = 0; i < 65536; ++i) {
+            table[(size_t)i] = silu_scalar(f16_to_f32((uint16_t)i));
+        }
+        return table;
+    }();
+    return lut;
+}
+
+static inline uint16_t fast_f32_to_f16(float x) {
+#if defined(__aarch64__)
+    __fp16 h = (__fp16)x;
+    uint16_t out;
+    std::memcpy(&out, &h, sizeof(out));
+    return out;
+#else
+    return f32_to_f16(x);
+#endif
+}
+
+static void swiglu_lut_to_f16(const uint16_t* gate, const uint16_t* up,
+                              uint16_t* out, int n, const float* silu_lut) {
+    int i = 0;
+#if defined(__aarch64__)
+    alignas(16) float gate_vals[4];
+    for (; i + 4 <= n; i += 4) {
+        gate_vals[0] = silu_lut[gate[i + 0]];
+        gate_vals[1] = silu_lut[gate[i + 1]];
+        gate_vals[2] = silu_lut[gate[i + 2]];
+        gate_vals[3] = silu_lut[gate[i + 3]];
+
+        float32x4_t gv = vld1q_f32(gate_vals);
+        float16x4_t uh = vld1_f16(reinterpret_cast<const float16_t*>(up + i));
+        float32x4_t uv = vcvt_f32_f16(uh);
+        float16x4_t oh = vcvt_f16_f32(vmulq_f32(gv, uv));
+        vst1_f16(reinterpret_cast<float16_t*>(out + i), oh);
+    }
+#endif
+    for (; i < n; ++i) {
+        out[i] = fast_f32_to_f16(silu_lut[gate[i]] * f16_to_f32(up[i]));
+    }
+}
+
+static void f16_to_f32_add_bias(const uint16_t* src, const float* bias,
+                                float* dst, int n) {
+    int i = 0;
+#if defined(__aarch64__)
+    for (; i + 4 <= n; i += 4) {
+        float16x4_t h = vld1_f16(reinterpret_cast<const float16_t*>(src + i));
+        float32x4_t v = vcvt_f32_f16(h);
+        float32x4_t b = vld1q_f32(bias + i);
+        vst1q_f32(dst + i, vaddq_f32(v, b));
+    }
+#endif
+    for (; i < n; ++i) {
+        dst[i] = f16_to_f32(src[i]) + bias[i];
+    }
+}
+
+static void add_f16_to_f32_inplace(float* dst, const uint16_t* src, int n) {
+    int i = 0;
+#if defined(__aarch64__)
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t d = vld1q_f32(dst + i);
+        float16x4_t h = vld1_f16(reinterpret_cast<const float16_t*>(src + i));
+        float32x4_t v = vcvt_f32_f16(h);
+        vst1q_f32(dst + i, vaddq_f32(d, v));
+    }
+#endif
+    for (; i < n; ++i) {
+        dst[i] += f16_to_f32(src[i]);
+    }
+}
+
+static void run_linear_accumulate_or_throw(const std::unique_ptr<ILinearOp>& linear,
+                                           const char* name,
+                                           const uint16_t* input_f16,
+                                           int rows,
+                                           int input_stride,
+                                           int output_stride,
+                                           std::vector<uint16_t>& fallback_output,
+                                           float* accum_f32)
+{
+    if (linear && linear->forward_accumulate(input_f16, rows, accum_f32)) {
+        return;
+    }
+
+    fallback_output.resize((size_t)rows * output_stride);
+    run_linear_batched_or_throw(linear, name,
+                                input_f16, rows, input_stride, output_stride,
+                                fallback_output.data());
+    add_f16_to_f32_inplace(accum_f32, fallback_output.data(), rows * output_stride);
+}
+
+static void run_linear_f32_accumulate_or_throw(const std::unique_ptr<ILinearOp>& linear,
+                                               const char* name,
+                                               const float* input_f32,
+                                               int rows,
+                                               int input_stride,
+                                               int output_stride,
+                                               std::vector<uint16_t>& fallback_input,
+                                               std::vector<uint16_t>& fallback_output,
+                                               float* accum_f32)
+{
+    if (linear && linear->forward_f32_accumulate(input_f32, rows, accum_f32)) {
+        return;
+    }
+
+    fallback_input.resize((size_t)rows * input_stride);
+    fallback_output.resize((size_t)rows * output_stride);
+    op_f32_to_f16(input_f32, fallback_input.data(), rows * input_stride);
+    run_linear_batched_or_throw(linear, name,
+                                fallback_input.data(), rows, input_stride, output_stride,
+                                fallback_output.data());
+    add_f16_to_f32_inplace(accum_f32, fallback_output.data(), rows * output_stride);
+}
+
+static void apply_rope_cached_one(float* v, int head_dim,
+                                  const float* cos_row,
+                                  const float* sin_row) {
+    const int half = head_dim / 2;
+    for (int i = 0; i < half; ++i) {
+        const float cos_a = cos_row[i];
+        const float sin_a = sin_row[i];
+        const float v0 = v[i];
+        const float v1 = v[i + half];
+        v[i]        = v0 * cos_a - v1 * sin_a;
+        v[i + half] = v0 * sin_a + v1 * cos_a;
+    }
+}
+
+static void apply_rope_cached(float* q, float* k,
+                              int n_heads, int n_kv_heads, int head_dim,
+                              const float* cos_row, const float* sin_row) {
+    for (int h = 0; h < n_heads; ++h) {
+        apply_rope_cached_one(q + h * head_dim, head_dim, cos_row, sin_row);
+    }
+    for (int h = 0; h < n_kv_heads; ++h) {
+        apply_rope_cached_one(k + h * head_dim, head_dim, cos_row, sin_row);
+    }
 }
 
 Qwen2Model::Qwen2Model()  = default;
@@ -224,10 +464,53 @@ void Qwen2Model::destroy() {
     std::vector<uint16_t>().swap(embed_tokens_);
     std::vector<float>().swap(norm_weight_);
     kv_cache_ = KVCache();
+    scratch_ = ForwardScratch();
+    std::vector<float>().swap(rope_cos_);
+    std::vector<float>().swap(rope_sin_);
+    rope_cached_positions_ = 0;
+    rope_cached_head_dim_ = 0;
+    rope_cached_theta_ = 0.0f;
 }
 
 void Qwen2Model::reset_kv_cache() {
     kv_cache_.reset();
+}
+
+void Qwen2Model::ensure_rope_cache(int required_positions) {
+    const int head_dim = config_.head_dim;
+    const int half = head_dim / 2;
+    const float theta = config_.rope_theta;
+
+    if (required_positions <= 0) return;
+    if (rope_cached_head_dim_ != head_dim || rope_cached_theta_ != theta) {
+        rope_cos_.clear();
+        rope_sin_.clear();
+        rope_cached_positions_ = 0;
+        rope_cached_head_dim_ = head_dim;
+        rope_cached_theta_ = theta;
+    }
+    if (rope_cached_positions_ >= required_positions) return;
+
+    int new_positions = std::max(required_positions, std::max(64, rope_cached_positions_ * 2));
+    new_positions = std::min(new_positions, config_.max_position);
+    if (new_positions < required_positions) {
+        throw std::runtime_error("RoPE cache capacity exceeded");
+    }
+
+    const int old_positions = rope_cached_positions_;
+    rope_cos_.resize((size_t)new_positions * half);
+    rope_sin_.resize((size_t)new_positions * half);
+    for (int pos = old_positions; pos < new_positions; ++pos) {
+        float* cos_row = rope_cos_.data() + (size_t)pos * half;
+        float* sin_row = rope_sin_.data() + (size_t)pos * half;
+        for (int i = 0; i < half; ++i) {
+            const float freq = 1.0f / std::pow(theta, (float)(2 * i) / (float)head_dim);
+            const float angle = (float)pos * freq;
+            cos_row[i] = std::cos(angle);
+            sin_row[i] = std::sin(angle);
+        }
+    }
+    rope_cached_positions_ = new_positions;
 }
 
 // ============================================================
@@ -275,17 +558,18 @@ bool Qwen2Model::load(const std::string& model_dir, LinearBackend backend) {
                                            pfx + "self_attn.q_proj.weight",
                                            pfx + "self_attn.k_proj.weight",
                                            pfx + "self_attn.v_proj.weight",
-                                           H, kvd)) return fail();
+                                           H, kvd,
+                                           i)) return fail();
             } else {
-                if (!init_linear(L->q_proj, backend, sf_path, meta, pfx + "self_attn.q_proj.weight", H, H)) return fail();
-                if (!init_linear(L->k_proj, backend, sf_path, meta, pfx + "self_attn.k_proj.weight", H, kvd)) return fail();
-                if (!init_linear(L->v_proj, backend, sf_path, meta, pfx + "self_attn.v_proj.weight", H, kvd)) return fail();
+                if (!init_linear(L->q_proj, backend, sf_path, meta, pfx + "self_attn.q_proj.weight", H, H, i, "q_proj")) return fail();
+                if (!init_linear(L->k_proj, backend, sf_path, meta, pfx + "self_attn.k_proj.weight", H, kvd, i, "k_proj")) return fail();
+                if (!init_linear(L->v_proj, backend, sf_path, meta, pfx + "self_attn.v_proj.weight", H, kvd, i, "v_proj")) return fail();
             }
             L->q_bias = load_tensor_f32(sf_path, meta.at(pfx + "self_attn.q_proj.bias"));
             L->k_bias = load_tensor_f32(sf_path, meta.at(pfx + "self_attn.k_proj.bias"));
             L->v_bias = load_tensor_f32(sf_path, meta.at(pfx + "self_attn.v_proj.bias"));
 
-            if (!init_linear(L->o_proj, backend, sf_path, meta, pfx + "self_attn.o_proj.weight", H, H)) return fail();
+            if (!init_linear(L->o_proj, backend, sf_path, meta, pfx + "self_attn.o_proj.weight", H, H, i, "o_proj")) return fail();
 
             L->post_attention_layernorm = load_tensor_f32(sf_path, meta.at(pfx + "post_attention_layernorm.weight"));
 
@@ -294,12 +578,13 @@ bool Qwen2Model::load(const std::string& model_dir, LinearBackend backend) {
                                                sf_path, meta,
                                                pfx + "mlp.gate_proj.weight",
                                                pfx + "mlp.up_proj.weight",
-                                               H, IS)) return fail();
+                                               H, IS,
+                                               i)) return fail();
             } else {
-                if (!init_linear(L->gate_proj, backend, sf_path, meta, pfx + "mlp.gate_proj.weight", H,  IS)) return fail();
-                if (!init_linear(L->up_proj,   backend, sf_path, meta, pfx + "mlp.up_proj.weight",   H,  IS)) return fail();
+                if (!init_linear(L->gate_proj, backend, sf_path, meta, pfx + "mlp.gate_proj.weight", H,  IS, i, "gate")) return fail();
+                if (!init_linear(L->up_proj,   backend, sf_path, meta, pfx + "mlp.up_proj.weight",   H,  IS, i, "up")) return fail();
             }
-            if (!init_linear(L->down_proj, backend, sf_path, meta, pfx + "mlp.down_proj.weight", IS, H )) return fail();
+            if (!init_linear(L->down_proj, backend, sf_path, meta, pfx + "mlp.down_proj.weight", IS, H, i, "down")) return fail();
 
             layers_[i] = std::move(L);
         }
@@ -311,11 +596,12 @@ bool Qwen2Model::load(const std::string& model_dir, LinearBackend backend) {
         // ---- lm_head（tied weights，复用 embed_tokens 的转置 = [H, V]）----
         LinearBackend lm_head_backend = select_lm_head_backend();
         std::printf("[load] lm_head (%s)...\n", linear_backend_name(lm_head_backend));
-        if (!init_linear(lm_head_, lm_head_backend, sf_path, meta, "model.embed_tokens.weight", H, V))
+        if (!init_linear(lm_head_, lm_head_backend, sf_path, meta, "model.embed_tokens.weight", H, V, -1, "lm_head"))
             return fail();
 
         // ---- KV Cache ----
         kv_cache_.init(IL, c.max_position, kvd);
+        silu_f16_lut();
 
         std::printf("[load] 加载完成\n");
         return true;
@@ -326,19 +612,23 @@ bool Qwen2Model::load(const std::string& model_dir, LinearBackend backend) {
     }
 }
 
+int Qwen2Model::forward_next_token(const std::vector<int>& tokens) {
+    return forward_internal(tokens);
+}
+
 // ============================================================
 // forward: 28 层 Transformer Block + final norm + lm_head
 //
 // 输入：tokens（本次要处理的 token id 序列）
-// 输出：最后一个位置的 logits
+// 输出：最后一个位置的 greedy token
 //
 // KV Cache 约定：
 //   - 进入时：kv_cache_.cur_pos() 是历史已写入的位置数
 //   - 返回时：kv_cache_.cur_pos() += tokens.size()
 // ============================================================
-std::vector<float> Qwen2Model::forward(const std::vector<int>& tokens) {
+int Qwen2Model::forward_internal(const std::vector<int>& tokens) {
     if (tokens.empty()) {
-        throw std::runtime_error("Qwen2Model::forward received empty token list");
+        throw std::runtime_error("Qwen2Model::forward_next_token received empty token list");
     }
 
     const auto& c = config_;
@@ -372,71 +662,84 @@ std::vector<float> Qwen2Model::forward(const std::vector<int>& tokens) {
         }
     };
 
+    auto& S = scratch_;
+
     // ---------- embedding ----------
-    std::vector<float> hidden((size_t)seq * H);
+    S.hidden.resize((size_t)seq * H);
     profile_block(prof.embedding_us, [&]() {
-        op_embedding_lookup(embed_tokens_.data(), tokens, hidden.data(), H);
+        op_embedding_lookup(embed_tokens_.data(), tokens, S.hidden.data(), H);
     });
 
-    std::vector<float>    buf((size_t)seq * H);   // norm 输出 & NPU 前的 FP32 缓冲
-    std::vector<uint16_t> npu_in(IS);             // 单 token FP16 输入（最大 IS）
-    std::vector<uint16_t> npu_out;
+    S.npu_in.resize((size_t)seq * std::max(H, IS));
 
     for (int li = 0; li < c.num_hidden_layers; ++li) {
         TransformerLayer& L = *layers_[li];
 
-        // ---- 1. Input LayerNorm (CPU) ----
+        // ---- 1. Input LayerNorm (CPU, direct FP16 for NPU input) ----
         profile_block(prof.rmsnorm_us, [&]() {
-            op_rmsnorm(hidden.data(), L.input_layernorm.data(), buf.data(),
-                       seq, H, c.rms_norm_eps);
+            op_rmsnorm_to_f16(S.hidden.data(), L.input_layernorm.data(),
+                              S.npu_in.data(), seq, H, c.rms_norm_eps);
         });
 
-        // ---- 2. Q / K / V proj (NPU, M=1 per token) ----
-        std::vector<float> q((size_t)seq * H);
-        std::vector<float> k((size_t)seq * kv_dim);
-        std::vector<float> v((size_t)seq * kv_dim);
+        // ---- 2. Q / K / V proj (NPU, batched by prompt rows) ----
+        S.q.resize((size_t)seq * H);
+        S.k.resize((size_t)seq * kv_dim);
+        S.v.resize((size_t)seq * kv_dim);
         profile_block(prof.qkv_proj_us, [&]() {
             if (L.qkv_proj) {
                 const int qkv_dim = H + kv_dim * 2;
-                std::vector<uint16_t> qkv_f16((size_t)seq * qkv_dim);
-                for (int s = 0; s < seq; ++s) {
-                    op_f32_to_f16(buf.data() + s * H, npu_in.data(), H);
-                    run_linear_or_throw(L.qkv_proj, "qkv_proj",
-                                        npu_in.data(), 1,
-                                        qkv_f16.data() + (size_t)s * qkv_dim);
-                }
-                for (int s = 0; s < seq; ++s) {
-                    const uint16_t* row = qkv_f16.data() + (size_t)s * qkv_dim;
-                    op_f16_to_f32(row,                q.data() + (size_t)s * H,      H);
-                    op_f16_to_f32(row + H,            k.data() + (size_t)s * kv_dim, kv_dim);
-                    op_f16_to_f32(row + H + kv_dim,   v.data() + (size_t)s * kv_dim, kv_dim);
+                S.qkv_f16.resize((size_t)seq * qkv_dim);
+                run_linear_batched_or_throw(L.qkv_proj, "qkv_proj",
+                                            S.npu_in.data(), seq, H, qkv_dim,
+                                            S.qkv_f16.data());
+                for (int sidx = 0; sidx < seq; ++sidx) {
+                    const uint16_t* row = S.qkv_f16.data() + (size_t)sidx * qkv_dim;
+                    float* qrow = S.q.data() + (size_t)sidx * H;
+                    float* krow = S.k.data() + (size_t)sidx * kv_dim;
+                    float* vrow = S.v.data() + (size_t)sidx * kv_dim;
+                    f16_to_f32_add_bias(row, L.q_bias.data(), qrow, H);
+                    f16_to_f32_add_bias(row + H, L.k_bias.data(), krow, kv_dim);
+                    f16_to_f32_add_bias(row + H + kv_dim, L.v_bias.data(), vrow, kv_dim);
                 }
             } else {
-                std::vector<uint16_t> q_f16((size_t)seq * H);
-                std::vector<uint16_t> k_f16((size_t)seq * kv_dim);
-                std::vector<uint16_t> v_f16((size_t)seq * kv_dim);
-                for (int s = 0; s < seq; ++s) {
-                    op_f32_to_f16(buf.data() + s * H, npu_in.data(), H);
-                    run_linear_or_throw(L.q_proj, "q_proj", npu_in.data(), 1, q_f16.data() + s * H);
-                    run_linear_or_throw(L.k_proj, "k_proj", npu_in.data(), 1, k_f16.data() + s * kv_dim);
-                    run_linear_or_throw(L.v_proj, "v_proj", npu_in.data(), 1, v_f16.data() + s * kv_dim);
+                S.q_f16.resize((size_t)seq * H);
+                S.k_f16.resize((size_t)seq * kv_dim);
+                S.v_f16.resize((size_t)seq * kv_dim);
+                run_linear_batched_or_throw(L.q_proj, "q_proj",
+                                            S.npu_in.data(), seq, H, H,
+                                            S.q_f16.data());
+                run_linear_batched_or_throw(L.k_proj, "k_proj",
+                                            S.npu_in.data(), seq, H, kv_dim,
+                                            S.k_f16.data());
+                run_linear_batched_or_throw(L.v_proj, "v_proj",
+                                            S.npu_in.data(), seq, H, kv_dim,
+                                            S.v_f16.data());
+                for (int sidx = 0; sidx < seq; ++sidx) {
+                    float* qrow = S.q.data() + (size_t)sidx * H;
+                    float* krow = S.k.data() + (size_t)sidx * kv_dim;
+                    float* vrow = S.v.data() + (size_t)sidx * kv_dim;
+                    const uint16_t* qsrc = S.q_f16.data() + (size_t)sidx * H;
+                    const uint16_t* ksrc = S.k_f16.data() + (size_t)sidx * kv_dim;
+                    const uint16_t* vsrc = S.v_f16.data() + (size_t)sidx * kv_dim;
+                    f16_to_f32_add_bias(qsrc, L.q_bias.data(), qrow, H);
+                    f16_to_f32_add_bias(ksrc, L.k_bias.data(), krow, kv_dim);
+                    f16_to_f32_add_bias(vsrc, L.v_bias.data(), vrow, kv_dim);
                 }
-                op_f16_to_f32(q_f16.data(), q.data(), seq * H);
-                op_f16_to_f32(k_f16.data(), k.data(), seq * kv_dim);
-                op_f16_to_f32(v_f16.data(), v.data(), seq * kv_dim);
             }
-            op_vec_add_bias(q.data(), L.q_bias.data(), seq, H);
-            op_vec_add_bias(k.data(), L.k_bias.data(), seq, kv_dim);
-            op_vec_add_bias(v.data(), L.v_bias.data(), seq, kv_dim);
         });
 
         // ---- 3. RoPE (CPU) ----
+        ensure_rope_cache(total_len);
         profile_block(prof.rope_us, [&]() {
-            for (int s = 0; s < seq; ++s) {
-                op_rope(q.data() + s * H,
-                        k.data() + s * kv_dim,
-                        n_heads, n_kv_heads, head_dim,
-                        pos + s, c.rope_theta);
+            const int half = head_dim / 2;
+            for (int sidx = 0; sidx < seq; ++sidx) {
+                const int abs_pos = pos + sidx;
+                const float* cos_row = rope_cos_.data() + (size_t)abs_pos * half;
+                const float* sin_row = rope_sin_.data() + (size_t)abs_pos * half;
+                apply_rope_cached(S.q.data() + sidx * H,
+                                  S.k.data() + sidx * kv_dim,
+                                  n_heads, n_kv_heads, head_dim,
+                                  cos_row, sin_row);
             }
         });
 
@@ -444,126 +747,111 @@ std::vector<float> Qwen2Model::forward(const std::vector<int>& tokens) {
         uint16_t* kc = kv_cache_.k_ptr(li);
         uint16_t* vc = kv_cache_.v_ptr(li);
         profile_block(prof.kv_write_us, [&]() {
-            for (int s = 0; s < seq; ++s) {
-                const float* ksrc = k.data() + s * kv_dim;
-                const float* vsrc = v.data() + s * kv_dim;
-                uint16_t* kdst = kc + (pos + s) * kv_dim;
-                uint16_t* vdst = vc + (pos + s) * kv_dim;
-                for (int d = 0; d < kv_dim; ++d) {
-                    kdst[d] = f32_to_f16(ksrc[d]);
-                    vdst[d] = f32_to_f16(vsrc[d]);
-                }
+            for (int sidx = 0; sidx < seq; ++sidx) {
+                const float* ksrc = S.k.data() + sidx * kv_dim;
+                const float* vsrc = S.v.data() + sidx * kv_dim;
+                uint16_t* kdst = kc + (pos + sidx) * kv_dim;
+                uint16_t* vdst = vc + (pos + sidx) * kv_dim;
+                op_f32_to_f16(ksrc, kdst, kv_dim);
+                op_f32_to_f16(vsrc, vdst, kv_dim);
             }
         });
 
         // ---- 5. Attention (CPU) ----
-        std::vector<float> attn_out((size_t)seq * H);
+        S.attn_out.resize((size_t)seq * H);
         profile_block(prof.attention_us, [&]() {
-            op_attention(q.data(), kc, vc, attn_out.data(),
-                         seq, total_len, n_heads, n_kv_heads, head_dim,
-                         /*pos_base=*/pos);
-        });
-
-        // ---- 6. O proj (NPU, M=1 per token) ----
-        npu_out.resize((size_t)seq * H);
-        profile_block(prof.o_proj_us, [&]() {
-            for (int s = 0; s < seq; ++s) {
-                op_f32_to_f16(attn_out.data() + s * H, npu_in.data(), H);
-                run_linear_or_throw(L.o_proj, "o_proj", npu_in.data(), 1, npu_out.data() + s * H);
-            }
-            op_f16_to_f32(npu_out.data(), attn_out.data(), seq * H);
-        });
-
-        // ---- 7. Residual ----
-        op_vec_add(hidden.data(), attn_out.data(), seq * H);
-
-        // ---- 8. Post-Attention LayerNorm ----
-        profile_block(prof.rmsnorm_us, [&]() {
-            op_rmsnorm(hidden.data(), L.post_attention_layernorm.data(), buf.data(),
-                       seq, H, c.rms_norm_eps);
-        });
-
-        // ---- 9. FFN: gate & up proj (NPU, M=1 per token) ----
-        std::vector<uint16_t> gate_f16((size_t)seq * IS);
-        std::vector<uint16_t> up_f16((size_t)seq * IS);
-        std::vector<float> gate((size_t)seq * IS);
-        std::vector<float> up  ((size_t)seq * IS);
-        profile_block(prof.gate_up_proj_us, [&]() {
-            if (L.gate_up_proj) {
-                std::vector<uint16_t> gate_up_f16((size_t)seq * IS * 2);
-                for (int s = 0; s < seq; ++s) {
-                    op_f32_to_f16(buf.data() + s * H, npu_in.data(), H);
-                    run_linear_or_throw(L.gate_up_proj, "gate_up_proj",
-                                        npu_in.data(), 1,
-                                        gate_up_f16.data() + (size_t)s * IS * 2);
-                }
-
-                for (int s = 0; s < seq; ++s) {
-                    const uint16_t* row = gate_up_f16.data() + (size_t)s * IS * 2;
-                    op_f16_to_f32(row,      gate.data() + (size_t)s * IS, IS);
-                    op_f16_to_f32(row + IS, up.data()   + (size_t)s * IS, IS);
-                }
+            if (seq == 1) {
+                op_attention_decode(S.q.data(), kc, vc, S.attn_out.data(),
+                                    total_len, n_heads, n_kv_heads, head_dim);
             } else {
-                for (int s = 0; s < seq; ++s) {
-                    op_f32_to_f16(buf.data() + s * H, npu_in.data(), H);
-                    run_linear_or_throw(L.gate_proj, "gate_proj", npu_in.data(), 1, gate_f16.data() + s * IS);
-                    run_linear_or_throw(L.up_proj,   "up_proj",   npu_in.data(), 1, up_f16.data()   + s * IS);
-                }
-                op_f16_to_f32(gate_f16.data(), gate.data(), seq * IS);
-                op_f16_to_f32(up_f16.data(),   up.data(),   seq * IS);
+                op_attention(S.q.data(), kc, vc, S.attn_out.data(),
+                             seq, total_len, n_heads, n_kv_heads, head_dim,
+                             /*pos_base=*/pos);
+            }
+        });
+
+        // ---- 6. O proj (NPU, batched by prompt rows) ----
+        profile_block(prof.o_proj_us, [&]() {
+            run_linear_f32_accumulate_or_throw(L.o_proj, "o_proj",
+                                               S.attn_out.data(), seq, H, H,
+                                               S.npu_in, S.npu_out,
+                                               S.hidden.data());
+        });
+
+        // ---- 8. Post-Attention LayerNorm (CPU, direct FP16 for NPU input) ----
+        profile_block(prof.rmsnorm_us, [&]() {
+            op_rmsnorm_to_f16(S.hidden.data(), L.post_attention_layernorm.data(),
+                              S.npu_in.data(), seq, H, c.rms_norm_eps);
+        });
+
+        // ---- 9. FFN: gate & up proj (NPU, batched by prompt rows) ----
+        bool fused_gate_up = (bool)L.gate_up_proj;
+        S.ffn_in_f16.resize((size_t)seq * IS);
+        profile_block(prof.gate_up_proj_us, [&]() {
+            if (fused_gate_up) {
+                S.gate_up_f16.resize((size_t)seq * IS * 2);
+                run_linear_batched_or_throw(L.gate_up_proj, "gate_up_proj",
+                                            S.npu_in.data(), seq, H, IS * 2,
+                                            S.gate_up_f16.data());
+            } else {
+                S.gate_f16.resize((size_t)seq * IS);
+                S.up_f16.resize((size_t)seq * IS);
+                run_linear_batched_or_throw(L.gate_proj, "gate_proj",
+                                            S.npu_in.data(), seq, H, IS,
+                                            S.gate_f16.data());
+                run_linear_batched_or_throw(L.up_proj, "up_proj",
+                                            S.npu_in.data(), seq, H, IS,
+                                            S.up_f16.data());
             }
         });
 
         // SiLU(gate) * up
         profile_block(prof.silu_mul_us, [&]() {
-            op_silu(gate.data(), seq * IS);
-            for (int i = 0; i < seq * IS; ++i) gate[i] *= up[i];
-        });
-
-        // ---- 10. down proj (NPU, M=1 per token) ----
-        std::vector<uint16_t> ffn_in_f16(IS);
-        std::vector<uint16_t> ffn_out_f16((size_t)seq * H);
-        std::vector<float> ffn_out((size_t)seq * H);
-        profile_block(prof.down_proj_us, [&]() {
-            for (int s = 0; s < seq; ++s) {
-                op_f32_to_f16(gate.data() + s * IS, ffn_in_f16.data(), IS);
-                run_linear_or_throw(L.down_proj, "down_proj", ffn_in_f16.data(), 1, ffn_out_f16.data() + s * H);
+            const float* silu_lut = silu_f16_lut().data();
+            if (fused_gate_up) {
+                for (int sidx = 0; sidx < seq; ++sidx) {
+                    const uint16_t* row = S.gate_up_f16.data() + (size_t)sidx * IS * 2;
+                    uint16_t* out = S.ffn_in_f16.data() + (size_t)sidx * IS;
+                    swiglu_lut_to_f16(row, row + IS, out, IS, silu_lut);
+                }
+            } else {
+                swiglu_lut_to_f16(S.gate_f16.data(), S.up_f16.data(),
+                                  S.ffn_in_f16.data(), seq * IS, silu_lut);
             }
-            op_f16_to_f32(ffn_out_f16.data(), ffn_out.data(), seq * H);
         });
 
-        // ---- 11. Residual ----
-        op_vec_add(hidden.data(), ffn_out.data(), seq * H);
+        // ---- 10. down proj (NPU, batched by prompt rows) ----
+        profile_block(prof.down_proj_us, [&]() {
+            run_linear_accumulate_or_throw(L.down_proj, "down_proj",
+                                           S.ffn_in_f16.data(), seq, IS, H,
+                                           S.ffn_out_f16, S.hidden.data());
+        });
     }
 
-    // ---- Final LayerNorm（仅取最后一个 token，因为只需要下一个 token 的 logits）----
-    std::vector<float> last(H);
+    // ---- Final LayerNorm（仅取最后一个 token，因为只需要下一个 token）----
+    S.last.resize(H);
     profile_block(prof.rmsnorm_us, [&]() {
-        op_rmsnorm(hidden.data() + (seq - 1) * H, norm_weight_.data(), last.data(),
+        op_rmsnorm(S.hidden.data() + (seq - 1) * H, norm_weight_.data(), S.last.data(),
                    1, H, c.rms_norm_eps);
     });
 
     // ---- lm_head ----
-    std::vector<uint16_t> lm_in(H);
-    std::vector<uint16_t> lm_out(c.vocab_size);
+    S.lm_in.resize(H);
+    int next_token = 0;
     profile_block(prof.lm_head_us, [&]() {
-        op_f32_to_f16(last.data(), lm_in.data(), H);
-        run_linear_or_throw(lm_head_, "lm_head", lm_in.data(), 1, lm_out.data());
+        op_f32_to_f16(S.last.data(), S.lm_in.data(), H);
+        if (!lm_head_ || !lm_head_->forward_argmax(S.lm_in.data(), 1, &next_token)) {
+            throw std::runtime_error("Linear argmax forward failed: lm_head");
+        }
     });
 
     // 更新 KV Cache 位置
     kv_cache_.set_cur_pos(total_len);
-
-    // FP16 logits -> FP32
-    std::vector<float> logits(c.vocab_size);
-    profile_block(prof.logits_cast_us, [&]() {
-        op_f16_to_f32(lm_out.data(), logits.data(), c.vocab_size);
-    });
 
     if (profile) {
         prof.total_us = qwen2_now_us() - total_t0;
         print_forward_profile(seq, pos, total_len, prof);
     }
 
-    return logits;
+    return next_token;
 }
