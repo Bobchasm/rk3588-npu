@@ -29,13 +29,21 @@ public:
     bool forward(const uint16_t* input_f16, int M, uint16_t* output_f16) override;
     bool forward_accumulate(const uint16_t* input_f16, int M, float* accum_f32) override;
     bool forward_f32_accumulate(const float* input_f32, int M, float* accum_f32) override;
+    uint16_t* prepare_input_f16(int M) override;
+    bool forward_prepared(uint16_t* output_f16) override;
+    const uint16_t* forward_prepared_output_f16() override;
+    bool forward_prepared_accumulate(float* accum_f32) override;
     bool supports_batch(int M) const override;
     bool forward_argmax(const uint16_t* input_f16, int M,
                         int* argmax_id, uint16_t* argmax_value = nullptr) override;
+    bool forward_prepared_argmax(int* argmax_id, uint16_t* argmax_value = nullptr) override;
     void destroy() override;
 
     // 可选：绑定单个 NPU core。必须在 init() 前调用。
     void set_core_mask(rknn_core_mask mask);
+
+    const rknn_tensor_mem* prepared_input_mem() const;
+    bool bind_external_input_f16(int M, const rknn_tensor_mem* external_mem);
 
 private:
     bool ensure_ac(int M);
@@ -59,6 +67,10 @@ private:
     rknn_tensor_mem* A_mem_ = nullptr;
     rknn_tensor_mem* B_mem_ = nullptr;
     rknn_tensor_mem* C_mem_ = nullptr;
+    bool A_mem_external_ = false;
+    int external_A_fd_ = -1;
+    void* external_A_virt_addr_ = nullptr;
+    int external_A_offset_ = 0;
 
     int cur_M_ = 0;
     int alloc_M_ = 0;

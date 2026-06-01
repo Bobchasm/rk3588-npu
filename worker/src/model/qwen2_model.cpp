@@ -675,10 +675,18 @@ int Qwen2Model::forward_internal(const std::vector<int>& tokens) {
     for (int li = 0; li < c.num_hidden_layers; ++li) {
         TransformerLayer& L = *layers_[li];
 
+        uint16_t* qkv_input_f16 = nullptr;
+        bool qkv_input_prepared = false;
+
         // ---- 1. Input LayerNorm (CPU, direct FP16 for NPU input) ----
         profile_block(prof.rmsnorm_us, [&]() {
+            qkv_input_f16 = L.qkv_proj ? L.qkv_proj->prepare_input_f16(seq) : nullptr;
+            qkv_input_prepared = (qkv_input_f16 != nullptr);
+            if (!qkv_input_f16) {
+                qkv_input_f16 = S.npu_in.data();
+            }
             op_rmsnorm_to_f16(S.hidden.data(), L.input_layernorm.data(),
-                              S.npu_in.data(), seq, H, c.rms_norm_eps);
+                              qkv_input_f16, seq, H, c.rms_norm_eps);
         });
 
         // ---- 2. Q / K / V proj (NPU, batched by prompt rows) ----
@@ -688,12 +696,21 @@ int Qwen2Model::forward_internal(const std::vector<int>& tokens) {
         profile_block(prof.qkv_proj_us, [&]() {
             if (L.qkv_proj) {
                 const int qkv_dim = H + kv_dim * 2;
-                S.qkv_f16.resize((size_t)seq * qkv_dim);
-                run_linear_batched_or_throw(L.qkv_proj, "qkv_proj",
-                                            S.npu_in.data(), seq, H, qkv_dim,
-                                            S.qkv_f16.data());
+                const uint16_t* qkv_out = nullptr;
+                if (qkv_input_prepared) {
+                    qkv_out = L.qkv_proj->forward_prepared_output_f16();
+                    if (!qkv_out) {
+                        throw std::runtime_error("Linear prepared output failed: qkv_proj");
+                    }
+                } else {
+                    S.qkv_f16.resize((size_t)seq * qkv_dim);
+                    run_linear_batched_or_throw(L.qkv_proj, "qkv_proj",
+                                                qkv_input_f16, seq, H, qkv_dim,
+                                                S.qkv_f16.data());
+                    qkv_out = S.qkv_f16.data();
+                }
                 for (int sidx = 0; sidx < seq; ++sidx) {
-                    const uint16_t* row = S.qkv_f16.data() + (size_t)sidx * qkv_dim;
+                    const uint16_t* row = qkv_out + (size_t)sidx * qkv_dim;
                     float* qrow = S.q.data() + (size_t)sidx * H;
                     float* krow = S.k.data() + (size_t)sidx * kv_dim;
                     float* vrow = S.v.data() + (size_t)sidx * kv_dim;
@@ -706,13 +723,13 @@ int Qwen2Model::forward_internal(const std::vector<int>& tokens) {
                 S.k_f16.resize((size_t)seq * kv_dim);
                 S.v_f16.resize((size_t)seq * kv_dim);
                 run_linear_batched_or_throw(L.q_proj, "q_proj",
-                                            S.npu_in.data(), seq, H, H,
+                                            qkv_input_f16, seq, H, H,
                                             S.q_f16.data());
                 run_linear_batched_or_throw(L.k_proj, "k_proj",
-                                            S.npu_in.data(), seq, H, kv_dim,
+                                            qkv_input_f16, seq, H, kv_dim,
                                             S.k_f16.data());
                 run_linear_batched_or_throw(L.v_proj, "v_proj",
-                                            S.npu_in.data(), seq, H, kv_dim,
+                                            qkv_input_f16, seq, H, kv_dim,
                                             S.v_f16.data());
                 for (int sidx = 0; sidx < seq; ++sidx) {
                     float* qrow = S.q.data() + (size_t)sidx * H;
@@ -779,69 +796,115 @@ int Qwen2Model::forward_internal(const std::vector<int>& tokens) {
         });
 
         // ---- 8. Post-Attention LayerNorm (CPU, direct FP16 for NPU input) ----
+        bool fused_gate_up = (bool)L.gate_up_proj;
+        uint16_t* gate_up_input_f16 = nullptr;
+        bool gate_up_input_prepared = false;
         profile_block(prof.rmsnorm_us, [&]() {
+            gate_up_input_f16 = fused_gate_up
+                ? L.gate_up_proj->prepare_input_f16(seq)
+                : nullptr;
+            gate_up_input_prepared = (gate_up_input_f16 != nullptr);
+            if (!gate_up_input_f16) {
+                gate_up_input_f16 = S.npu_in.data();
+            }
             op_rmsnorm_to_f16(S.hidden.data(), L.post_attention_layernorm.data(),
-                              S.npu_in.data(), seq, H, c.rms_norm_eps);
+                              gate_up_input_f16, seq, H, c.rms_norm_eps);
         });
 
         // ---- 9. FFN: gate & up proj (NPU, batched by prompt rows) ----
-        bool fused_gate_up = (bool)L.gate_up_proj;
-        S.ffn_in_f16.resize((size_t)seq * IS);
+        const uint16_t* gate_up_output_f16 = nullptr;
         profile_block(prof.gate_up_proj_us, [&]() {
             if (fused_gate_up) {
-                S.gate_up_f16.resize((size_t)seq * IS * 2);
-                run_linear_batched_or_throw(L.gate_up_proj, "gate_up_proj",
-                                            S.npu_in.data(), seq, H, IS * 2,
-                                            S.gate_up_f16.data());
+                if (gate_up_input_prepared) {
+                    gate_up_output_f16 = L.gate_up_proj->forward_prepared_output_f16();
+                    if (!gate_up_output_f16) {
+                        throw std::runtime_error("Linear prepared output failed: gate_up_proj");
+                    }
+                } else {
+                    S.gate_up_f16.resize((size_t)seq * IS * 2);
+                    run_linear_batched_or_throw(L.gate_up_proj, "gate_up_proj",
+                                                gate_up_input_f16, seq, H, IS * 2,
+                                                S.gate_up_f16.data());
+                    gate_up_output_f16 = S.gate_up_f16.data();
+                }
             } else {
                 S.gate_f16.resize((size_t)seq * IS);
                 S.up_f16.resize((size_t)seq * IS);
                 run_linear_batched_or_throw(L.gate_proj, "gate_proj",
-                                            S.npu_in.data(), seq, H, IS,
+                                            gate_up_input_f16, seq, H, IS,
                                             S.gate_f16.data());
                 run_linear_batched_or_throw(L.up_proj, "up_proj",
-                                            S.npu_in.data(), seq, H, IS,
+                                            gate_up_input_f16, seq, H, IS,
                                             S.up_f16.data());
             }
         });
 
+        uint16_t* ffn_down_input = nullptr;
+        bool ffn_down_input_prepared = false;
+
         // SiLU(gate) * up
         profile_block(prof.silu_mul_us, [&]() {
             const float* silu_lut = silu_f16_lut().data();
+            ffn_down_input = L.down_proj ? L.down_proj->prepare_input_f16(seq) : nullptr;
+            ffn_down_input_prepared = (ffn_down_input != nullptr);
+            if (!ffn_down_input) {
+                S.ffn_in_f16.resize((size_t)seq * IS);
+                ffn_down_input = S.ffn_in_f16.data();
+            }
+
             if (fused_gate_up) {
                 for (int sidx = 0; sidx < seq; ++sidx) {
-                    const uint16_t* row = S.gate_up_f16.data() + (size_t)sidx * IS * 2;
-                    uint16_t* out = S.ffn_in_f16.data() + (size_t)sidx * IS;
+                    const uint16_t* row = gate_up_output_f16 + (size_t)sidx * IS * 2;
+                    uint16_t* out = ffn_down_input + (size_t)sidx * IS;
                     swiglu_lut_to_f16(row, row + IS, out, IS, silu_lut);
                 }
             } else {
                 swiglu_lut_to_f16(S.gate_f16.data(), S.up_f16.data(),
-                                  S.ffn_in_f16.data(), seq * IS, silu_lut);
+                                  ffn_down_input, seq * IS, silu_lut);
             }
         });
 
         // ---- 10. down proj (NPU, batched by prompt rows) ----
         profile_block(prof.down_proj_us, [&]() {
-            run_linear_accumulate_or_throw(L.down_proj, "down_proj",
-                                           S.ffn_in_f16.data(), seq, IS, H,
-                                           S.ffn_out_f16, S.hidden.data());
+            if (ffn_down_input_prepared) {
+                if (!L.down_proj || !L.down_proj->forward_prepared_accumulate(S.hidden.data())) {
+                    throw std::runtime_error("Linear prepared accumulate failed: down_proj");
+                }
+            } else {
+                run_linear_accumulate_or_throw(L.down_proj, "down_proj",
+                                               S.ffn_in_f16.data(), seq, IS, H,
+                                               S.ffn_out_f16, S.hidden.data());
+            }
         });
     }
 
     // ---- Final LayerNorm（仅取最后一个 token，因为只需要下一个 token）----
-    S.last.resize(H);
+    uint16_t* lm_input_f16 = lm_head_ ? lm_head_->prepare_input_f16(1) : nullptr;
+    const bool lm_input_prepared = (lm_input_f16 != nullptr);
     profile_block(prof.rmsnorm_us, [&]() {
-        op_rmsnorm(S.hidden.data() + (seq - 1) * H, norm_weight_.data(), S.last.data(),
-                   1, H, c.rms_norm_eps);
+        if (lm_input_prepared) {
+            op_rmsnorm_to_f16(S.hidden.data() + (seq - 1) * H, norm_weight_.data(),
+                              lm_input_f16, 1, H, c.rms_norm_eps);
+        } else {
+            S.last.resize(H);
+            op_rmsnorm(S.hidden.data() + (seq - 1) * H, norm_weight_.data(), S.last.data(),
+                       1, H, c.rms_norm_eps);
+        }
     });
 
     // ---- lm_head ----
-    S.lm_in.resize(H);
     int next_token = 0;
     profile_block(prof.lm_head_us, [&]() {
-        op_f32_to_f16(S.last.data(), S.lm_in.data(), H);
-        if (!lm_head_ || !lm_head_->forward_argmax(S.lm_in.data(), 1, &next_token)) {
-            throw std::runtime_error("Linear argmax forward failed: lm_head");
+        if (lm_input_prepared) {
+            if (!lm_head_ || !lm_head_->forward_prepared_argmax(&next_token)) {
+                throw std::runtime_error("Linear prepared argmax failed: lm_head");
+            }
+        } else {
+            S.lm_in.resize(H);
+            op_f32_to_f16(S.last.data(), S.lm_in.data(), H);
+            if (!lm_head_ || !lm_head_->forward_argmax(S.lm_in.data(), 1, &next_token)) {
+                throw std::runtime_error("Linear argmax forward failed: lm_head");
+            }
         }
     });
 

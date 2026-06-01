@@ -45,6 +45,27 @@ public:
         return false;
     }
 
+    // 可选零拷贝快路径：调用方直接写入后端输入 buffer，再调用 forward_prepared_*。
+    // 默认不支持，调用方应 fallback 到普通 forward/forward_accumulate。
+    virtual uint16_t* prepare_input_f16(int M) {
+        (void)M;
+        return nullptr;
+    }
+
+    virtual bool forward_prepared(uint16_t* output_f16) {
+        (void)output_f16;
+        return false;
+    }
+
+    virtual const uint16_t* forward_prepared_output_f16() {
+        return nullptr;
+    }
+
+    virtual bool forward_prepared_accumulate(float* accum_f32) {
+        (void)accum_f32;
+        return false;
+    }
+
     virtual bool supports_batch(int M) const {
         return M == 1;
     }
@@ -54,6 +75,12 @@ public:
                                 int* argmax_id, uint16_t* argmax_value = nullptr) {
         (void)input_f16;
         (void)M;
+        (void)argmax_id;
+        (void)argmax_value;
+        return false;
+    }
+
+    virtual bool forward_prepared_argmax(int* argmax_id, uint16_t* argmax_value = nullptr) {
         (void)argmax_id;
         (void)argmax_value;
         return false;

@@ -416,8 +416,20 @@ public:
         }
         if (!impl_ || !impl_->init(K, N, weight_kn)) {
             if (impl_) impl_->destroy();
-            if (selected_ == LinearBackend::NPU_SINGLE &&
-                npu_int8_for_context(K, N, layer_idx_, role)) {
+
+            if (selected_ == LinearBackend::NPU_SHARDED) {
+                std::fprintf(stderr,
+                             "[LinearPlanner] sharded init failed K=%d N=%d, fallback single NPU\n",
+                             K, N);
+                selected_ = LinearBackend::NPU_SINGLE;
+                impl_ = make_single_npu_impl(K, N, layer_idx_, role);
+                if (impl_ && impl_->init(K, N, weight_kn)) {
+                    return true;
+                }
+                if (impl_) impl_->destroy();
+            }
+
+            if (npu_int8_for_context(K, N, layer_idx_, role)) {
                 std::fprintf(stderr,
                              "[LinearPlanner] W8 init failed K=%d N=%d, fallback FP16\n",
                              K, N);
@@ -445,6 +457,22 @@ public:
         return impl_ && impl_->forward_f32_accumulate(input_f32, M, accum_f32);
     }
 
+    uint16_t* prepare_input_f16(int M) override {
+        return impl_ ? impl_->prepare_input_f16(M) : nullptr;
+    }
+
+    bool forward_prepared(uint16_t* output_f16) override {
+        return impl_ && impl_->forward_prepared(output_f16);
+    }
+
+    const uint16_t* forward_prepared_output_f16() override {
+        return impl_ ? impl_->forward_prepared_output_f16() : nullptr;
+    }
+
+    bool forward_prepared_accumulate(float* accum_f32) override {
+        return impl_ && impl_->forward_prepared_accumulate(accum_f32);
+    }
+
     bool supports_batch(int M) const override {
         return impl_ && impl_->supports_batch(M);
     }
@@ -452,6 +480,10 @@ public:
     bool forward_argmax(const uint16_t* input_f16, int M,
                         int* argmax_id, uint16_t* argmax_value = nullptr) override {
         return impl_ && impl_->forward_argmax(input_f16, M, argmax_id, argmax_value);
+    }
+
+    bool forward_prepared_argmax(int* argmax_id, uint16_t* argmax_value = nullptr) override {
+        return impl_ && impl_->forward_prepared_argmax(argmax_id, argmax_value);
     }
 
     void destroy() override {

@@ -65,6 +65,30 @@ static inline uint16_t f16_order_key(uint16_t v) {
     return (v & 0x8000u) ? (uint16_t)~v : (uint16_t)(v ^ 0x8000u);
 }
 
+static bool argmax_f16_row(const uint16_t* out, int N,
+                           int* argmax_id, uint16_t* argmax_value) {
+    if (!out || N <= 0 || !argmax_id) {
+        return false;
+    }
+
+    int best = 0;
+    uint16_t best_val = out[0];
+    uint16_t best_key = f16_order_key(out[0]);
+    for (int i = 1; i < N; ++i) {
+        const uint16_t key = f16_order_key(out[i]);
+        if (key > best_key) {
+            best_key = key;
+            best_val = out[i];
+            best = i;
+        }
+    }
+    *argmax_id = best;
+    if (argmax_value) {
+        *argmax_value = best_val;
+    }
+    return true;
+}
+
 bool NpuLinear::init(int K, int N, const uint16_t* weight_kn) {
     destroy();
 
@@ -177,6 +201,7 @@ bool NpuLinear::rebuild_ac(int M) {
     auto cleanup_ac = [this]() {
         if (A_mem_) { rknn_destroy_mem(ctx_, A_mem_); A_mem_ = nullptr; }
         if (C_mem_) { rknn_destroy_mem(ctx_, C_mem_); C_mem_ = nullptr; }
+        A_mem_external_ = false;
         cur_M_ = 0;
         alloc_M_ = 0;
     };
@@ -187,6 +212,7 @@ bool NpuLinear::rebuild_ac(int M) {
     }
 
     alloc_M_ = M;
+    A_mem_external_ = false;
 
     if (!bind_ac(M)) {
         cleanup_ac();
@@ -297,6 +323,10 @@ bool NpuLinear::ensure_ac(int M) {
 void NpuLinear::release_ac() {
     if (A_mem_) { rknn_destroy_mem(ctx_, A_mem_); A_mem_ = nullptr; }
     if (C_mem_) { rknn_destroy_mem(ctx_, C_mem_); C_mem_ = nullptr; }
+    A_mem_external_ = false;
+    external_A_fd_ = -1;
+    external_A_virt_addr_ = nullptr;
+    external_A_offset_ = 0;
     cur_M_ = 0;
     alloc_M_ = 0;
 }
@@ -307,62 +337,146 @@ bool NpuLinear::forward(const uint16_t* input_f16, int M, uint16_t* output_f16) 
         return false;
     }
 
-    if (!ensure_ac(M)) {
+    uint16_t* prepared = prepare_input_f16(M);
+    if (!prepared) {
         return false;
     }
 
-    std::memcpy(A_mem_->virt_addr, input_f16, (size_t)M * K_ * 2);
-
-    int ret = rknn_matmul_run(ctx_);
-    if (ret < 0) {
-        std::fprintf(stderr, "[NpuLinear] rknn_matmul_run failed: %d\n", ret);
-        release_ac();
-        return false;
-    }
-
-    std::memcpy(output_f16, C_mem_->virt_addr, (size_t)M * N_ * 2);
-    return true;
+    std::memcpy(prepared, input_f16, (size_t)M * K_ * sizeof(uint16_t));
+    return forward_prepared(output_f16);
 }
 
 bool NpuLinear::forward_accumulate(const uint16_t* input_f16, int M, float* accum_f32) {
     if (!ctx_ || !input_f16 || !accum_f32 || K_ <= 0 || N_ <= 0 || M <= 0) {
         return false;
     }
-    if (!ensure_ac(M)) {
+
+    uint16_t* prepared = prepare_input_f16(M);
+    if (!prepared) {
         return false;
     }
 
-    std::memcpy(A_mem_->virt_addr, input_f16, (size_t)M * K_ * sizeof(uint16_t));
-    int ret = rknn_matmul_run(ctx_);
-    if (ret < 0) {
-        std::fprintf(stderr, "[NpuLinear] rknn_matmul_run failed: %d\n", ret);
-        release_ac();
-        return false;
-    }
-
-    op_add_f16_to_f32_inplace(
-        accum_f32, reinterpret_cast<const uint16_t*>(C_mem_->virt_addr), M * N_);
-    return true;
+    std::memcpy(prepared, input_f16, (size_t)M * K_ * sizeof(uint16_t));
+    return forward_prepared_accumulate(accum_f32);
 }
 
 bool NpuLinear::forward_f32_accumulate(const float* input_f32, int M, float* accum_f32) {
     if (!ctx_ || !input_f32 || !accum_f32 || K_ <= 0 || N_ <= 0 || M <= 0) {
         return false;
     }
-    if (!ensure_ac(M)) {
+
+    uint16_t* prepared = prepare_input_f16(M);
+    if (!prepared) {
         return false;
     }
 
-    op_f32_to_f16(input_f32, reinterpret_cast<uint16_t*>(A_mem_->virt_addr), M * K_);
+    op_f32_to_f16(input_f32, prepared, M * K_);
+    return forward_prepared_accumulate(accum_f32);
+}
+
+uint16_t* NpuLinear::prepare_input_f16(int M) {
+    if (!ctx_ || K_ <= 0 || N_ <= 0 || M <= 0) {
+        return nullptr;
+    }
+    if (A_mem_external_) {
+        release_ac();
+    }
+    if (!ensure_ac(M)) {
+        return nullptr;
+    }
+    return reinterpret_cast<uint16_t*>(A_mem_->virt_addr);
+}
+
+const rknn_tensor_mem* NpuLinear::prepared_input_mem() const {
+    return A_mem_;
+}
+
+bool NpuLinear::bind_external_input_f16(int M, const rknn_tensor_mem* external_mem) {
+    if (!ctx_ || !external_mem || external_mem->fd < 0 ||
+        !external_mem->virt_addr || K_ <= 0 || N_ <= 0 || M <= 0) {
+        return false;
+    }
+
+    uint32_t A_size = 0;
+    uint32_t C_size = 0;
+    if (!ac_sizes(M, &A_size, &C_size) || external_mem->size < A_size) {
+        return false;
+    }
+
+    if (!A_mem_external_ || !A_mem_ || !C_mem_ || cur_M_ != M ||
+        external_A_fd_ != external_mem->fd ||
+        external_A_virt_addr_ != external_mem->virt_addr ||
+        external_A_offset_ != external_mem->offset) {
+        release_ac();
+
+        A_mem_ = rknn_create_mem_from_fd(ctx_, external_mem->fd,
+                                         external_mem->virt_addr,
+                                         A_size, external_mem->offset);
+        C_mem_ = rknn_create_mem(ctx_, C_size);
+        if (!A_mem_ || !C_mem_) {
+            std::fprintf(stderr,
+                         "[NpuLinear] shared rknn_create_mem(A/C) failed M=%d\n",
+                         M);
+            release_ac();
+            return false;
+        }
+
+        A_mem_external_ = true;
+        external_A_fd_ = external_mem->fd;
+        external_A_virt_addr_ = external_mem->virt_addr;
+        external_A_offset_ = external_mem->offset;
+        alloc_M_ = M;
+        if (!bind_ac(M)) {
+            release_ac();
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool NpuLinear::forward_prepared(uint16_t* output_f16) {
+    if (!ctx_ || !A_mem_ || !C_mem_ || !output_f16 ||
+        K_ <= 0 || N_ <= 0 || cur_M_ <= 0) {
+        return false;
+    }
+
+    const uint16_t* out = forward_prepared_output_f16();
+    if (!out) {
+        return false;
+    }
+
+    std::memcpy(output_f16, out, (size_t)cur_M_ * N_ * sizeof(uint16_t));
+    return true;
+}
+
+const uint16_t* NpuLinear::forward_prepared_output_f16() {
+    if (!ctx_ || !A_mem_ || !C_mem_ || K_ <= 0 || N_ <= 0 || cur_M_ <= 0) {
+        return nullptr;
+    }
+
     int ret = rknn_matmul_run(ctx_);
     if (ret < 0) {
         std::fprintf(stderr, "[NpuLinear] rknn_matmul_run failed: %d\n", ret);
         release_ac();
+        return nullptr;
+    }
+
+    return reinterpret_cast<const uint16_t*>(C_mem_->virt_addr);
+}
+
+bool NpuLinear::forward_prepared_accumulate(float* accum_f32) {
+    if (!ctx_ || !A_mem_ || !C_mem_ || !accum_f32 ||
+        K_ <= 0 || N_ <= 0 || cur_M_ <= 0) {
         return false;
     }
 
-    op_add_f16_to_f32_inplace(
-        accum_f32, reinterpret_cast<const uint16_t*>(C_mem_->virt_addr), M * N_);
+    const uint16_t* out = forward_prepared_output_f16();
+    if (!out) {
+        return false;
+    }
+
+    op_add_f16_to_f32_inplace(accum_f32, out, cur_M_ * N_);
     return true;
 }
 
@@ -375,36 +489,27 @@ bool NpuLinear::forward_argmax(const uint16_t* input_f16, int M,
     if (!argmax_id || M != 1 || !ctx_ || !input_f16 || K_ <= 0 || N_ <= 0) {
         return false;
     }
-    if (!ensure_ac(M)) {
+    uint16_t* prepared = prepare_input_f16(M);
+    if (!prepared) {
         return false;
     }
 
-    std::memcpy(A_mem_->virt_addr, input_f16, (size_t)K_ * 2);
+    std::memcpy(prepared, input_f16, (size_t)K_ * sizeof(uint16_t));
+    return forward_prepared_argmax(argmax_id, argmax_value);
+}
 
-    int ret = rknn_matmul_run(ctx_);
-    if (ret < 0) {
-        std::fprintf(stderr, "[NpuLinear] rknn_matmul_run failed: %d\n", ret);
-        release_ac();
+bool NpuLinear::forward_prepared_argmax(int* argmax_id, uint16_t* argmax_value) {
+    if (!argmax_id || !ctx_ || !A_mem_ || !C_mem_ ||
+        K_ <= 0 || N_ <= 0 || cur_M_ != 1) {
         return false;
     }
 
-    const uint16_t* out = reinterpret_cast<const uint16_t*>(C_mem_->virt_addr);
-    int best = 0;
-    uint16_t best_val = out[0];
-    uint16_t best_key = f16_order_key(out[0]);
-    for (int i = 1; i < N_; ++i) {
-        const uint16_t key = f16_order_key(out[i]);
-        if (key > best_key) {
-            best_key = key;
-            best_val = out[i];
-            best = i;
-        }
+    const uint16_t* out = forward_prepared_output_f16();
+    if (!out) {
+        return false;
     }
-    *argmax_id = best;
-    if (argmax_value) {
-        *argmax_value = best_val;
-    }
-    return true;
+
+    return argmax_f16_row(out, N_, argmax_id, argmax_value);
 }
 
 void NpuLinear::destroy() {

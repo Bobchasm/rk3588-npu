@@ -1,5 +1,6 @@
 #include "backend/sharded_npu_linear.h"
 #include "backend/npu_linear_w8.h"
+#include "ops/op_cast.h"
 
 #include <algorithm>
 #include <array>
@@ -29,6 +30,7 @@ public:
         int M = 0;
         uint16_t* output = nullptr;
         bool argmax = false;
+        bool prepared = false;
     };
 
     ShardedNpuWorkerPool() {
@@ -118,8 +120,14 @@ private:
             bool ok = false;
             if (task.shard) {
                 if (task.argmax) {
-                    ok = task.shard->forward_argmax(task.input, task.M,
-                                                    &local_id, &local_value);
+                    if (task.prepared) {
+                        ok = task.shard->forward_prepared_argmax(&local_id, &local_value);
+                    } else {
+                        ok = task.shard->forward_argmax(task.input, task.M,
+                                                        &local_id, &local_value);
+                    }
+                } else if (task.prepared) {
+                    ok = task.shard->forward_prepared(task.output);
                 } else {
                     ok = task.shard->forward(task.input, task.M, task.output);
                 }
@@ -275,16 +283,22 @@ bool ShardedNpuLinear::forward(const uint16_t* input_f16, int M, uint16_t* outpu
         return false;
     }
 
-    for (int i = 0; i < kNumShards; ++i) {
-        shard_outputs_[i].resize((size_t)M * sizes_[i]);
-    }
-
     std::array<ShardedNpuWorkerPool::Task, kNumShards> tasks{};
-    for (int i = 0; i < kNumShards; ++i) {
-        tasks[i].shard = shards_[i].get();
-        tasks[i].input = input_f16;
-        tasks[i].M = M;
-        tasks[i].output = shard_outputs_[i].data();
+    if (M == 1) {
+        for (int i = 0; i < kNumShards; ++i) {
+            tasks[i].shard = shards_[i].get();
+            tasks[i].input = input_f16;
+            tasks[i].M = M;
+            tasks[i].output = output_f16 + offsets_[i];
+        }
+    } else {
+        for (int i = 0; i < kNumShards; ++i) {
+            shard_outputs_[i].resize((size_t)M * sizes_[i]);
+            tasks[i].shard = shards_[i].get();
+            tasks[i].input = input_f16;
+            tasks[i].M = M;
+            tasks[i].output = shard_outputs_[i].data();
+        }
     }
 
     if (!worker_pool().run(tasks)) {
@@ -292,15 +306,168 @@ bool ShardedNpuLinear::forward(const uint16_t* input_f16, int M, uint16_t* outpu
         return false;
     }
 
-    for (int m = 0; m < M; ++m) {
-        uint16_t* out_row = output_f16 + (size_t)m * N_;
-        for (int i = 0; i < kNumShards; ++i) {
-            const uint16_t* src = shard_outputs_[i].data() + (size_t)m * sizes_[i];
-            uint16_t* dst = out_row + offsets_[i];
-            std::memcpy(dst, src, (size_t)sizes_[i] * sizeof(uint16_t));
+    if (M != 1) {
+        for (int m = 0; m < M; ++m) {
+            uint16_t* out_row = output_f16 + (size_t)m * N_;
+            for (int i = 0; i < kNumShards; ++i) {
+                const uint16_t* src = shard_outputs_[i].data() + (size_t)m * sizes_[i];
+                uint16_t* dst = out_row + offsets_[i];
+                std::memcpy(dst, src, (size_t)sizes_[i] * sizeof(uint16_t));
+            }
         }
     }
 
+    return true;
+}
+
+uint16_t* ShardedNpuLinear::prepare_input_f16(int M) {
+    prepared_input_ = nullptr;
+    prepared_M_ = 0;
+    if (M != 1 || K_ <= 0 || N_ <= 0 || (int)shards_.size() != kNumShards) {
+        return nullptr;
+    }
+
+    uint16_t* input = shards_[0] ? shards_[0]->prepare_input_f16(M) : nullptr;
+    if (!input) {
+        return nullptr;
+    }
+
+    prepared_input_ = input;
+    prepared_M_ = M;
+    return prepared_input_;
+}
+
+bool ShardedNpuLinear::bind_shared_prepared_inputs() {
+    NpuLinear* owner = dynamic_cast<NpuLinear*>(shards_[0].get());
+    const rknn_tensor_mem* shared_input = owner ? owner->prepared_input_mem() : nullptr;
+    if (!shared_input) {
+        return false;
+    }
+
+    for (int i = 1; i < kNumShards; ++i) {
+        NpuLinear* shard = dynamic_cast<NpuLinear*>(shards_[i].get());
+        if (!shard || !shard->bind_external_input_f16(prepared_M_, shared_input)) {
+            return false;
+        }
+    }
+
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        std::fprintf(stderr, "[ShardedNpuLinear] shared prepared A buffer enabled\n");
+    }
+    return true;
+}
+
+bool ShardedNpuLinear::forward_prepared_accumulate(float* accum_f32) {
+    if (!accum_f32 || !prepared_input_ || prepared_M_ != 1 ||
+        K_ <= 0 || N_ <= 0 || (int)shards_.size() != kNumShards) {
+        return false;
+    }
+
+    const uint16_t* out = forward_prepared_output_f16();
+    if (!out) {
+        return false;
+    }
+
+    op_add_f16_to_f32_inplace(accum_f32, out, N_);
+    return true;
+}
+
+const uint16_t* ShardedNpuLinear::forward_prepared_output_f16() {
+    if (!prepared_input_ || prepared_M_ != 1 ||
+        K_ <= 0 || N_ <= 0 || (int)shards_.size() != kNumShards) {
+        return nullptr;
+    }
+
+    if (!bind_shared_prepared_inputs()) {
+        for (int i = 1; i < kNumShards; ++i) {
+            uint16_t* shard_input = shards_[i] ? shards_[i]->prepare_input_f16(prepared_M_) : nullptr;
+            if (!shard_input) {
+                prepared_input_ = nullptr;
+                prepared_M_ = 0;
+                return nullptr;
+            }
+            if (shard_input != prepared_input_) {
+                std::memcpy(shard_input, prepared_input_, (size_t)K_ * sizeof(uint16_t));
+            }
+        }
+    }
+
+    prepared_output_.resize((size_t)N_);
+    std::array<ShardedNpuWorkerPool::Task, kNumShards> tasks{};
+    for (int i = 0; i < kNumShards; ++i) {
+        tasks[i].shard = shards_[i].get();
+        tasks[i].M = prepared_M_;
+        tasks[i].output = prepared_output_.data() + offsets_[i];
+        tasks[i].prepared = true;
+    }
+
+    const bool ok = worker_pool().run(tasks);
+    prepared_input_ = nullptr;
+    prepared_M_ = 0;
+    if (!ok) {
+        std::fprintf(stderr, "[ShardedNpuLinear] prepared shard forward failed\n");
+        return nullptr;
+    }
+
+    return prepared_output_.data();
+}
+
+bool ShardedNpuLinear::forward_prepared_argmax(int* argmax_id, uint16_t* argmax_value) {
+    if (!argmax_id || !prepared_input_ || prepared_M_ != 1 ||
+        K_ <= 0 || N_ <= 0 || (int)shards_.size() != kNumShards) {
+        return false;
+    }
+
+    if (!bind_shared_prepared_inputs()) {
+        for (int i = 1; i < kNumShards; ++i) {
+            uint16_t* shard_input = shards_[i] ? shards_[i]->prepare_input_f16(prepared_M_) : nullptr;
+            if (!shard_input) {
+                prepared_input_ = nullptr;
+                prepared_M_ = 0;
+                return false;
+            }
+            if (shard_input != prepared_input_) {
+                std::memcpy(shard_input, prepared_input_, (size_t)K_ * sizeof(uint16_t));
+            }
+        }
+    }
+
+    std::array<ShardedNpuWorkerPool::Task, kNumShards> tasks{};
+    for (int i = 0; i < kNumShards; ++i) {
+        tasks[i].shard = shards_[i].get();
+        tasks[i].M = prepared_M_;
+        tasks[i].argmax = true;
+        tasks[i].prepared = true;
+    }
+
+    std::array<int, kNumShards> local_ids{};
+    std::array<uint16_t, kNumShards> local_values{};
+    const bool ok = worker_pool().run_argmax(tasks, &local_ids, &local_values);
+    prepared_input_ = nullptr;
+    prepared_M_ = 0;
+    if (!ok) {
+        std::fprintf(stderr, "[ShardedNpuLinear] prepared shard argmax failed\n");
+        return false;
+    }
+
+    int best = offsets_[0] + local_ids[0];
+    uint16_t best_value = local_values[0];
+    uint16_t best_key = f16_order_key(best_value);
+    for (int si = 0; si < kNumShards; ++si) {
+        const uint16_t key = f16_order_key(local_values[si]);
+        if (key > best_key) {
+            best_key = key;
+            best_value = local_values[si];
+            best = offsets_[si] + local_ids[si];
+        }
+    }
+
+    *argmax_id = best;
+    if (argmax_value) {
+        *argmax_value = best_value;
+    }
     return true;
 }
 
@@ -350,8 +517,8 @@ bool ShardedNpuLinear::forward_argmax(const uint16_t* input_f16, int M,
 }
 
 void ShardedNpuLinear::destroy() {
-    for (auto& shard : shards_) {
-        if (shard) shard->destroy();
+    for (auto it = shards_.rbegin(); it != shards_.rend(); ++it) {
+        if (*it) (*it)->destroy();
     }
     shards_.clear();
     offsets_.clear();
@@ -359,6 +526,9 @@ void ShardedNpuLinear::destroy() {
     for (auto& out : shard_outputs_) {
         std::vector<uint16_t>().swap(out);
     }
+    std::vector<uint16_t>().swap(prepared_output_);
+    prepared_input_ = nullptr;
+    prepared_M_ = 0;
     K_ = 0;
     N_ = 0;
 }

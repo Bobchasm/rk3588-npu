@@ -27,9 +27,13 @@ public:
 
     bool init(int K, int N, const uint16_t* weight_kn) override;
     bool forward(const uint16_t* input_f16, int M, uint16_t* output_f16) override;
+    uint16_t* prepare_input_f16(int M) override;
+    const uint16_t* forward_prepared_output_f16() override;
+    bool forward_prepared_accumulate(float* accum_f32) override;
     bool supports_batch(int M) const override;
     bool forward_argmax(const uint16_t* input_f16, int M,
                         int* argmax_id, uint16_t* argmax_value = nullptr) override;
+    bool forward_prepared_argmax(int* argmax_id, uint16_t* argmax_value = nullptr) override;
     void destroy() override;
 
     void set_allow_a8w8(bool allow) { allow_a8w8_ = allow; }
@@ -45,4 +49,9 @@ private:
     std::vector<int> sizes_;
     std::vector<std::unique_ptr<ILinearOp>> shards_;
     std::array<std::vector<uint16_t>, kNumShards> shard_outputs_;
+    std::vector<uint16_t> prepared_output_;
+    uint16_t* prepared_input_ = nullptr;
+    int prepared_M_ = 0;
+
+    bool bind_shared_prepared_inputs();
 };
