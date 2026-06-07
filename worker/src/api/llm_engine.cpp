@@ -1,9 +1,9 @@
 #include "api/llm_engine.h"
 #include "model/qwen2_model.h"
-#include "ops/op_sampling.h"
 
 #include <algorithm>
 #include <cstdio>
+#include <exception>
 #include <sys/time.h>
 #include <vector>
 
@@ -27,8 +27,8 @@ static bool detect_repetition(const std::vector<int>& ids, int window) {
     for (int p = 1; p <= window / 2; ++p) {
         bool rep = true;
         for (int i = n - 1; i >= n - window; --i) {
-            if (ids[i] != ids[i - p]) { rep = false; break; }
             if (i - p < 0) { rep = false; break; }
+            if (ids[i] != ids[i - p]) { rep = false; break; }
         }
         if (rep) return true;
     }
@@ -39,7 +39,9 @@ LLMEngine::LLMEngine()  : model_(new Qwen2Model()) {}
 LLMEngine::~LLMEngine() { destroy(); }
 
 bool LLMEngine::load(const std::string& model_dir, LinearBackend backend) {
-    return model_->load(model_dir, backend);
+    bool ok = model_->load(model_dir, backend);
+    if (!ok) model_->destroy();
+    return ok;
 }
 
 void LLMEngine::destroy() {
@@ -64,41 +66,50 @@ GenerationResult LLMEngine::generate(
     };
 
     // ---- Prefill ----
-    int64_t t0 = now_us();
-    auto logits = model_->forward(input_ids);
-    r.prefill_ms     = (now_us() - t0) / 1e3f;
-    r.prefill_tokens = (int)input_ids.size();
+    try {
+        int64_t t0 = now_us();
+        int next_id = model_->forward_next_token(input_ids);
+        r.prefill_ms     = (now_us() - t0) / 1e3f;
+        r.prefill_tokens = (int)input_ids.size();
 
-    int next_id = op_greedy_sample(logits);
+        std::vector<int> one_token(1);
 
-    // ---- Decode ----
-    int64_t t_decode_start = now_us();
-    for (int step = 0; step < cfg.max_new_tokens; ++step) {
-        // 1. stop token 检测
-        if (is_stop(next_id)) { r.hit_stop = true; break; }
+        // ---- Decode ----
+        int64_t t_decode_start = now_us();
+        for (int step = 0; step < cfg.max_new_tokens; ++step) {
+            // 1. stop token 检测
+            if (is_stop(next_id)) { r.hit_stop = true; break; }
 
-        int64_t ts = now_us();
-        r.output_ids.push_back(next_id);
+            int64_t ts = now_us();
+            const int emit_id = next_id;
+            r.output_ids.push_back(emit_id);
 
-        // 2. 重复检测（在 push 之后立即判断，避免无效 forward）
-        if (cfg.repetition_window > 0 &&
-            detect_repetition(r.output_ids, cfg.repetition_window))
-        {
-            std::fprintf(stderr, "[LLMEngine] 检测到重复序列，提前停止 (step=%d)\n", step);
-            r.hit_repetition = true;
-            break;
+            // 2. 重复检测（在 push 之后立即判断，避免无效 forward）
+            if (cfg.repetition_window > 0 &&
+                detect_repetition(r.output_ids, cfg.repetition_window))
+            {
+                std::fprintf(stderr, "[LLMEngine] 检测到重复序列，提前停止 (step=%d)\n", step);
+                r.hit_repetition = true;
+                break;
+            }
+
+            if (step + 1 >= cfg.max_new_tokens) {
+                break;
+            }
+
+            one_token[0] = emit_id;
+            next_id = model_->forward_next_token(one_token);
+            float elapsed_ms = (now_us() - ts) / 1e3f;
+
+            if (on_token) on_token(step, emit_id, elapsed_ms);
+
         }
 
-        logits = model_->forward({next_id});
-        float elapsed_ms = (now_us() - ts) / 1e3f;
-
-        if (on_token) on_token(step, next_id, elapsed_ms);
-
-        next_id = op_greedy_sample(logits);
+        r.decode_ms     = (now_us() - t_decode_start) / 1e3f;
+        r.decode_tokens = (int)r.output_ids.size();
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "[LLMEngine] generate failed: %s\n", e.what());
+        model_->reset_kv_cache();
     }
-
-    r.decode_ms     = (now_us() - t_decode_start) / 1e3f;
-    r.decode_tokens = (int)r.output_ids.size();
     return r;
 }
-

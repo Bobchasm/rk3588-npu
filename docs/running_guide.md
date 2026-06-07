@@ -52,6 +52,15 @@ Token IDs: [151644, 8948, 198, 2610, 525, 264, 10950, 17847, 13, 151645, 151644,
 
 ## 3. 在 RK3588 板子上测试推理
 
+### 当前默认后端
+
+当前 worker 仍然只接收 token id，不做 tokenizer 和文本解码。默认计算路径如下：
+
+- NPU：qkv fused projection、o_proj、gate/up fused projection、down_proj、lm_head
+- CPU：Embedding、RMSNorm、RoPE、Attention/Softmax、SiLU、残差、采样、格式转换
+- 多核 NPU：默认使用自动分块器，超过规模阈值且 N 维满足对齐的矩阵乘会按 N 维切成 3 片，分别绑定 3 个 NPU core 并行执行
+- RKNN matmul 仍按 `M=1` 逐 token 调用；不要直接改成 `M=seq` 批量输入，否则可能得到错误 logits
+
 ### 编译和部署
 
 1. 在本地交叉编译：
@@ -74,11 +83,11 @@ Token IDs: [151644, 8948, 198, 2610, 525, 264, 10950, 17847, 13, 151645, 151644,
 使用 `qwen2_demo` 进行单次推理测试：
 
 ```bash
-# /root/matmul/worker_test
+cd /root/matmul/worker_test
 # 一次性的
-./qwen2_demo Qwen-1.5B 151644 8948 198 2610 525 264 10950 17847 13 151645 151644 872 198 108386 101055 107748 104968 151645 151644 77091 198
+./qwen2_demo Qwen1.5B 151644 8948 198 2610 525 264 10950 17847 13 151645 151644 872 198 108386 101055 107748 104968 151645 151644 77091 198
 # 加载好后可以多次输入token ids
-./qwen2_chat Qwen-1.5B
+./qwen2_chat Qwen1.5B
 # 然后可以输：151644 8948 198 2610 525 264 10950 17847 13 151645 151644 872 198 108386 101055 107748 104968 151645 151644 77091 198
 ```
 
@@ -87,6 +96,76 @@ Token IDs: [151644, 8948, 198, 2610, 525, 264, 10950, 17847, 13, 151645, 151644,
 - 后续参数：输入 token id 列表 (步骤2生成)
 
 程序会输出生成的 token id 序列。
+
+### 性能 profile
+
+开启 `RKLLM_PROFILE=1` 可以打印每次 forward 的阶段耗时：
+
+```bash
+cd /root/matmul/worker_test
+RKLLM_PROFILE=1 ./qwen2_demo Qwen1.5B 151644 8948 198 2610 525 264 10950 17847 13 151645 151644 872 198 108386 101055 107748 104968 151645 151644 77091 198
+```
+
+重点关注字段：
+- `qkv`：融合后的 q/k/v projection
+- `gate_up`：融合后的 gate/up projection
+- `down`：MLP down projection
+- `lm_head`：输出词表 projection
+- `attention`、`silu_mul`：当前仍在 CPU 上执行
+
+当前优化后的参考结果会随板子负载波动。以 27 个输入 token、生成 10 个 token 为例，decode 通常在 `4 tok/s` 以上；若输出 token ids 与基准不一致，优先检查是否误用了 `M=seq` 批量 matmul 路径。
+
+自动分块器可以通过环境变量临时调整：
+
+```bash
+# 关闭自动分片，默认 NPU 后端退回单核
+RKLLM_NPU_AUTO_SHARD=0 ./qwen2_demo Qwen1.5B ...
+
+# 调整触发三核分片的 K*N 阈值，默认 3000000
+RKLLM_NPU_SHARD_MIN_OPS=3000000 ./qwen2_demo Qwen1.5B ...
+```
+
+### lm_head 后端选择
+
+默认 `lm_head` 使用 NPU 自动后端。由于 `lm_head` 矩阵很大，自动分块器会选择三核 NPU 分片：
+
+```bash
+./qwen2_demo Qwen1.5B ...
+```
+
+如果板子出现 NPU/CMA 内存分配失败，可以临时切到 CPU fallback，速度会明显下降，但有助于验证稳定性：
+
+```bash
+RKLLM_LM_HEAD_BACKEND=CPU ./qwen2_demo Qwen1.5B ...
+```
+
+可选值：
+- `NPU`：自动规划，默认
+- `NPU_SHARDED`：强制三核 NPU 分片
+- `NPU_SINGLE`：单 NPU matmul，上板排查时使用
+- `CPU`：CPU fallback，主要用于避开 lm_head 大块 NPU 内存分配失败
+
+### 常见问题
+
+如果加载或运行时报下面这类错误：
+
+```text
+failed to allocate handle
+[NpuLinear] rknn_create_mem(B) failed
+failed to convert handle to fd
+Too many open files
+```
+
+可以先在板子当前 shell 检查并提高 fd 限制后再运行。注意：`ulimit` 单独执行显示的是文件大小限制，不是 open files；这里必须看 `ulimit -n`。
+
+```bash
+ulimit -n
+ulimit -n 4096
+export LD_LIBRARY_PATH=/root/matmul/worker_test:$LD_LIBRARY_PATH
+RKLLM_PROFILE=1 ./qwen2_demo Qwen1.5B ...
+```
+
+如果仍然失败，先重启板子释放 NPU handle/CMA，再用 `RKLLM_LM_HEAD_BACKEND=CPU` 判断是否是 `lm_head` 大权重分配问题。
 
 ## 4. 将板子输出解码回文字
 

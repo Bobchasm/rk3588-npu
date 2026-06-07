@@ -1,5 +1,5 @@
 #include "model/kv_cache.h"
-#include <algorithm>
+#include <cstddef>
 
 void KVCache::init(int num_layers, int capacity, int kv_dim) {
     capacity_ = capacity;
@@ -10,7 +10,7 @@ void KVCache::init(int num_layers, int capacity, int kv_dim) {
 }
 
 void KVCache::reset() {
-    for (auto& v : k_cache_) std::fill(v.begin(), v.end(), 0);
-    for (auto& v : v_cache_) std::fill(v.begin(), v.end(), 0);
+    // cur_pos controls the readable prefix. Old entries past cur_pos are ignored,
+    // so reset must not memset the full 32K KV cache on every new request.
     cur_pos_ = 0;
 }
