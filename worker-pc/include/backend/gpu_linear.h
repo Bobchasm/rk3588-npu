@@ -2,15 +2,16 @@
 
 #include "backend/cpu_linear.h"
 
+struct cublasContext;
+using cublasHandle_t = cublasContext*;
+
 // ============================================================
-// GpuLinear: GPU 后端占位实现
+// GpuLinear: worker-pc 的 CUDA 线性层实现
 //
-// 当前版本主要解决“架构解耦”问题：
-// - 模型层可以请求 GPU 设备
-// - 设备选择逻辑与 CPU 路径分离
-// - 若未来接入 CUDA / Vulkan / ROCm，只需要替换本类实现
-//
-// 现阶段若未提供真正 GPU 内核，则退回 CPU 计算并打印提示。
+// 设计目标：
+// - 上层模型仍然只依赖 ILinearOp
+// - 若本机存在可用 CUDA 设备，则线性层用 cuBLAS 跑 FP16 GEMM
+// - 若 CUDA 环境不可用，则平滑退回 CPULinear，保持功能可用
 // ============================================================
 
 class GpuLinear : public ILinearOp {
@@ -27,7 +28,19 @@ public:
     void destroy() override;
 
 private:
+    bool init_cuda();
+    bool reserve_workspace(int M);
+    bool forward_cuda(const uint16_t* input_f16, int M, uint16_t* output_f16);
+    void destroy_cuda();
+
+    int K_ = 0;
+    int N_ = 0;
+    int workspace_rows_ = 0;
+    bool using_cuda_ = false;
     CpuLinear cpu_fallback_;
     bool warned_once_ = false;
+    cublasHandle_t cublas_ = nullptr;
+    void* d_weight_ = nullptr;
+    void* d_input_ = nullptr;
+    void* d_output_ = nullptr;
 };
-

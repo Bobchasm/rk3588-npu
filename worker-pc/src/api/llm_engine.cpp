@@ -45,9 +45,16 @@ LLMEngine::LLMEngine() : model_(new Qwen2Model()) {}
 LLMEngine::~LLMEngine() { destroy(); }
 
 bool LLMEngine::load(const std::string& model_dir, ComputeDevice device) {
-    device_cfg_.requested = device;
-    device_cfg_.resolved = device == ComputeDevice::kAuto ? ComputeDevice::kCpu : device;
-    device_cfg_.used_fallback = (device == ComputeDevice::kAuto);
+    device_cfg_ = resolve_device_config(device);
+
+    if (device_cfg_.requested == ComputeDevice::kAuto) {
+        std::fprintf(stderr, "[worker-pc/LLMEngine] auto device resolved to %s\n",
+                     compute_device_name(device_cfg_.resolved));
+    } else if (device_cfg_.used_fallback) {
+        std::fprintf(stderr, "[worker-pc/LLMEngine] requested device=%s unavailable, fallback to %s\n",
+                     compute_device_name(device_cfg_.requested),
+                     compute_device_name(device_cfg_.resolved));
+    }
 
     const bool ok = model_->load(model_dir, device_cfg_.resolved);
     if (!ok) {
@@ -125,4 +132,3 @@ GenerationResult LLMEngine::generate(
 
     return result;
 }
-

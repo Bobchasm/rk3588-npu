@@ -50,6 +50,14 @@ int argmax_f16(const std::vector<uint16_t>& values) {
     return best_id;
 }
 
+bool debug_layer_progress() {
+    static int enabled = []() {
+        const char* v = std::getenv("RKLLM_DEBUG_LAYER_PROGRESS");
+        return (v && v[0] != '\0' && v[0] != '0') ? 1 : 0;
+    }();
+    return enabled != 0;
+}
+
 }  // namespace
 
 Qwen2Model::Qwen2Model() = default;
@@ -76,6 +84,7 @@ void Qwen2Model::destroy() {
     std::vector<uint16_t>().swap(embed_tokens_);
     std::vector<float>().swap(norm_weight_);
     kv_cache_ = KVCache();
+    gpu_kv_cache_.destroy();
     scratch_ = ForwardScratch{};
 }
 
@@ -123,6 +132,11 @@ bool Qwen2Model::load(const std::string& model_dir, ComputeDevice device) {
         if (!init_linear(lm_head_, device_, sf_path, meta, "model.embed_tokens.weight", H, V)) return false;
 
         kv_cache_.init(IL, c.max_position, kvd);
+        if (device_ == ComputeDevice::kGpu) {
+            if (!gpu_kv_cache_.init(IL, c.max_position, kvd)) {
+                std::fprintf(stderr, "[worker-pc/Qwen2Model] gpu kv cache init failed, keep cpu-only kv\n");
+            }
+        }
         return true;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[worker-pc/Qwen2Model] load failed: %s\n", e.what());
@@ -133,6 +147,7 @@ bool Qwen2Model::load(const std::string& model_dir, ComputeDevice device) {
 
 void Qwen2Model::reset_kv_cache() {
     kv_cache_.reset();
+    gpu_kv_cache_.reset();
 }
 
 void Qwen2Model::ensure_scratch(int seq) {
@@ -233,6 +248,9 @@ int Qwen2Model::forward_next_token(const std::vector<int>& tokens) {
     op_embedding_lookup(embed_tokens_.data(), tokens, scratch_.hidden.data(), H);
 
     for (int li = 0; li < c.num_hidden_layers; ++li) {
+        if (debug_layer_progress()) {
+            std::fprintf(stderr, "[worker-pc/Qwen2Model] seq=%d layer=%d begin\n", seq, li);
+        }
         TransformerLayer& layer = *layers_[li];
 
         op_rmsnorm(scratch_.hidden.data(),
@@ -277,9 +295,42 @@ int Qwen2Model::forward_next_token(const std::vector<int>& tokens) {
                 vdst[d] = f32_to_f16(vsrc[d]);
             }
         }
+        if (gpu_kv_cache_.ready()) {
+            const uint16_t* ksrc = kc + static_cast<size_t>(pos) * kvd;
+            const uint16_t* vsrc = vc + static_cast<size_t>(pos) * kvd;
+            if (!gpu_kv_cache_.copy_layer_slice_from_host(li, pos, ksrc, vsrc, seq)) {
+                throw std::runtime_error("worker-pc gpu kv cache update failed");
+            }
+        }
 
         std::fill(scratch_.attn_out.begin(), scratch_.attn_out.end(), 0.0f);
-        if (seq == 1) {
+        if (seq == 1 && gpu_kv_cache_.ready()) {
+            if (!op_attention_decode_cuda(
+                    scratch_.q.data(),
+                    gpu_kv_cache_.k_ptr(li),
+                    gpu_kv_cache_.v_ptr(li),
+                    scratch_.attn_out.data(),
+                    total_len,
+                    c.num_attention_heads,
+                    c.num_kv_heads,
+                    c.head_dim)) {
+                throw std::runtime_error("worker-pc gpu attention decode failed");
+            }
+        } else if (seq > 1 && gpu_kv_cache_.ready()) {
+            if (!op_attention_cuda(
+                    scratch_.q.data(),
+                    gpu_kv_cache_.k_ptr(li),
+                    gpu_kv_cache_.v_ptr(li),
+                    scratch_.attn_out.data(),
+                    seq,
+                    total_len,
+                    c.num_attention_heads,
+                    c.num_kv_heads,
+                    c.head_dim,
+                    pos)) {
+                throw std::runtime_error("worker-pc gpu attention prefill failed");
+            }
+        } else if (seq == 1) {
             op_attention_decode(
                 scratch_.q.data(),
                 kc,
@@ -340,6 +391,9 @@ int Qwen2Model::forward_next_token(const std::vector<int>& tokens) {
             scratch_.ffn_out[i] = f16_to_f32(scratch_.ffn_out_f16[static_cast<size_t>(i)]);
         }
         add_residual(scratch_.hidden.data(), scratch_.ffn_out.data(), seq * H);
+        if (debug_layer_progress()) {
+            std::fprintf(stderr, "[worker-pc/Qwen2Model] seq=%d layer=%d end\n", seq, li);
+        }
     }
 
     op_rmsnorm(scratch_.hidden.data() + static_cast<size_t>(seq - 1) * H,
@@ -354,4 +408,3 @@ int Qwen2Model::forward_next_token(const std::vector<int>& tokens) {
     kv_cache_.set_cur_pos(total_len);
     return argmax_f16(scratch_.lm_out);
 }
-

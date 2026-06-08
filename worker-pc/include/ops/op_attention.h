@@ -35,3 +35,24 @@ void op_attention_decode(
     float*          out,
     int total_len,
     int n_heads, int n_kv_heads, int head_dim);
+
+// CUDA decode fast path. k/v cache pointers must point to device memory.
+// Returns false if CUDA path is unavailable or execution failed.
+bool op_attention_decode_cuda(
+    const float*    q_host,
+    const uint16_t* k_cache_dev,
+    const uint16_t* v_cache_dev,
+    float*          out_host,
+    int total_len,
+    int n_heads, int n_kv_heads, int head_dim);
+
+// CUDA prefill path for seq > 1. k/v cache pointers must point to device memory.
+// Applies causal mask with pos_base semantics identical to CPU op_attention.
+bool op_attention_cuda(
+    const float*    q_host,
+    const uint16_t* k_cache_dev,
+    const uint16_t* v_cache_dev,
+    float*          out_host,
+    int seq, int total_len,
+    int n_heads, int n_kv_heads, int head_dim,
+    int pos_base);

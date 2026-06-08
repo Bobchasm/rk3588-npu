@@ -1,6 +1,7 @@
 #pragma once
 
 #include "backend/device_type.h"
+#include "backend/gpu_kv_cache.h"
 #include "core/model_config.h"
 #include "model/kv_cache.h"
 #include "model/transformer_layer.h"
@@ -74,6 +75,6 @@ private:
     std::vector<float> norm_weight_;
     std::unique_ptr<ILinearOp> lm_head_;
     KVCache kv_cache_;
+    GpuKvCache gpu_kv_cache_;
     ForwardScratch scratch_;
 };
-

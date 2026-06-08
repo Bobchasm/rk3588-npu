@@ -25,4 +25,5 @@ struct DeviceConfig {
 
 ComputeDevice parse_compute_device(const std::string& text);
 const char* compute_device_name(ComputeDevice device);
-
+bool is_gpu_available();
+DeviceConfig resolve_device_config(ComputeDevice requested);
