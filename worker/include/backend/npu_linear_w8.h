@@ -40,7 +40,7 @@ private:
     bool create_context_and_b();
     rknn_matmul_tensor_attr current_b_attr() const;
     bool bind_b_mem();
-    uint32_t cache_flags() const;
+    uint32_t cache_flags(bool dynamic_m) const;
     bool ac_sizes(int M, uint32_t* A_size, uint32_t* C_size) const;
     bool ensure_ac(int M);
     bool rebuild_ac(int M);
@@ -49,6 +49,8 @@ private:
     void release_ac();
     void scale_output_f16(const int32_t* raw, const float* input_scales,
                           int M, uint16_t* out) const;
+    void accumulate_output_f32(const int32_t* raw, const float* input_scales,
+                               int M, float* accum_f32) const;
     float quantize_current_input(const uint16_t* input_f16, int8_t* input_i8);
     bool run_prepared_raw(std::vector<float>* input_scales);
 

@@ -598,9 +598,10 @@ public:
                 if (impl_) impl_->destroy();
             }
 
-            if (npu_int8_for_context(K, N, layer_idx_, role)) {
+            if (npu_int8_for_context(K, N, layer_idx_, role) ||
+                npu_int4_for_context(K, N, layer_idx_, role)) {
                 std::fprintf(stderr,
-                             "[LinearPlanner] W8 init failed K=%d N=%d, fallback FP16\n",
+                             "[LinearPlanner] quantized init failed K=%d N=%d, fallback FP16\n",
                              K, N);
                 impl_.reset(new NpuLinear());
                 impl_->set_cache_key(cache_key_);

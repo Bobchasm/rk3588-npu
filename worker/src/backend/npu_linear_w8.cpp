@@ -58,6 +58,16 @@ bool a8w8_hadamard_enabled() {
     return env_flag_enabled(std::getenv("RKLLM_A8W8_HADAMARD"));
 }
 
+bool shard_dynamic_m_enabled_w8() {
+    const char* v = std::getenv("RKLLM_SHARD_DYNAMIC_M");
+    return v && v[0] != '\0' &&
+           std::strcmp(v, "0") != 0 &&
+           std::strcmp(v, "false") != 0 &&
+           std::strcmp(v, "FALSE") != 0 &&
+           std::strcmp(v, "off") != 0 &&
+           std::strcmp(v, "OFF") != 0;
+}
+
 int linear_batch_limit_w8() {
     constexpr int kDefaultBatchRows = 1;
     const char* batch = std::getenv("RKLLM_LINEAR_BATCH");
@@ -193,7 +203,8 @@ bool NpuLinearW8::create_context_and_b() {
     info.AC_quant_type = 0;
 
     int ret = 0;
-    dynamic_max_m_ = linear_batch_limit_w8();
+    const bool allow_dynamic_m = !has_core_mask_ || shard_dynamic_m_enabled_w8();
+    dynamic_max_m_ = allow_dynamic_m ? linear_batch_limit_w8() : 1;
     if (dynamic_max_m_ > 1) {
         dynamic_shapes_.resize(2);
         dynamic_io_attrs_.resize(2);
@@ -261,9 +272,13 @@ bool NpuLinearW8::bind_b_mem() {
     return true;
 }
 
-uint32_t NpuLinearW8::cache_flags() const {
+uint32_t NpuLinearW8::cache_flags(bool dynamic_m) const {
     uint32_t flags = use_hadamard_ ? 1u : 0u;
     flags |= ((uint32_t)(hadamard_block_ & 0xffff)) << 8;
+    if (dynamic_m) {
+        const uint32_t capped_m = (uint32_t)std::min(std::max(dynamic_max_m_, 1), 255);
+        flags |= 0x2u | (capped_m << 24);
+    }
     return flags;
 }
 
@@ -362,7 +377,7 @@ bool NpuLinearW8::init(int K, int N, const uint16_t* weight_kn) {
         spec.K = K_;
         spec.N = N_;
         spec.K_matmul = K_matmul_;
-        spec.flags = cache_flags();
+        spec.flags = cache_flags(dynamic_m_);
         const rknn_matmul_tensor_attr B_attr = current_b_attr();
         spec.packed_bytes = B_attr.size;
         spec.aux_bytes = scales_.size() * sizeof(float);
@@ -404,7 +419,11 @@ bool NpuLinearW8::init_from_cache(int K, int N) {
     spec.K = K_;
     spec.N = N_;
     spec.K_matmul = K_matmul_;
-    spec.flags = cache_flags();
+    const bool predicted_dynamic_m =
+        linear_batch_limit_w8() > 1 &&
+        (!has_core_mask_ || shard_dynamic_m_enabled_w8());
+    dynamic_max_m_ = predicted_dynamic_m ? linear_batch_limit_w8() : 1;
+    spec.flags = cache_flags(predicted_dynamic_m);
     // 和 FP16 一样，先轻量探测缓存文件，避免 cold miss 时创建 RKNN context。
     if (!npu_weight_cache::exists(spec)) {
         destroy();
@@ -417,6 +436,11 @@ bool NpuLinearW8::init_from_cache(int K, int N) {
     }
     // context 创建后才知道 RKNN native B 的真实字节数，用它校验 header。
     const rknn_matmul_tensor_attr B_attr = current_b_attr();
+    const uint32_t actual_flags = cache_flags(dynamic_m_);
+    if (actual_flags != spec.flags) {
+        destroy();
+        return false;
+    }
     spec.packed_bytes = B_attr.size;
     spec.aux_bytes = scales_.size() * sizeof(float);
 
@@ -689,6 +713,32 @@ void NpuLinearW8::scale_output_f16(const int32_t* raw, const float* input_scales
     }
 }
 
+void NpuLinearW8::accumulate_output_f32(const int32_t* raw, const float* input_scales,
+                                        int M, float* accum_f32) const {
+    if (!raw || !input_scales || !accum_f32) {
+        return;
+    }
+    const float divisor = use_hadamard_ ? (float)hadamard_block_ : 1.0f;
+    for (int m = 0; m < M; ++m) {
+        const int32_t* src = raw + (size_t)m * N_;
+        float* dst = accum_f32 + (size_t)m * N_;
+        int n = 0;
+#if defined(__aarch64__)
+        const float* scales = scales_.data();
+        const float32x4_t input_scale_v = vdupq_n_f32(input_scales[m] / divisor);
+        for (; n + 4 <= N_; n += 4) {
+            float32x4_t v = vcvtq_f32_s32(vld1q_s32(src + n));
+            v = vmulq_f32(v, vld1q_f32(scales + n));
+            v = vmulq_f32(v, input_scale_v);
+            vst1q_f32(dst + n, vaddq_f32(vld1q_f32(dst + n), v));
+        }
+#endif
+        for (; n < N_; ++n) {
+            dst[n] += (float)src[n] * input_scales[m] * scales_[n] / divisor;
+        }
+    }
+}
+
 bool NpuLinearW8::run_prepared_raw(std::vector<float>* input_scales) {
     if (!ctx_ || !A_mem_ || !C_mem_ || !input_scales ||
         K_ <= 0 || K_matmul_ <= 0 || N_ <= 0 || prepared_M_ <= 0 ||
@@ -779,11 +829,11 @@ bool NpuLinearW8::forward_prepared_accumulate(float* accum_f32) {
     if (!accum_f32) {
         return false;
     }
-    const uint16_t* out = forward_prepared_output_f16();
-    if (!out) {
+    if (!run_prepared_raw(&prepared_input_scales_)) {
         return false;
     }
-    op_add_f16_to_f32_inplace(accum_f32, out, prepared_M_ * N_);
+    accumulate_output_f32(reinterpret_cast<const int32_t*>(C_mem_->virt_addr),
+                          prepared_input_scales_.data(), prepared_M_, accum_f32);
     return true;
 }
 

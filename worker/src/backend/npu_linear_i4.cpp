@@ -46,6 +46,10 @@ inline int8_t clamp_i4(int v) {
     return (int8_t)std::max(-7, std::min(7, v));
 }
 
+inline int8_t clamp_i8(int v) {
+    return (int8_t)std::max(-127, std::min(127, v));
+}
+
 inline void set_i4(uint8_t* data, size_t idx, int8_t value) {
     uint8_t& byte = data[idx / 2];
     const uint8_t packed = (uint8_t)value & 0x0f;
@@ -75,6 +79,16 @@ int linear_batch_limit_i4() {
     return std::min<long>(parsed, 512);
 }
 
+bool shard_dynamic_m_enabled_i4() {
+    const char* v = std::getenv("RKLLM_SHARD_DYNAMIC_M");
+    return v && v[0] != '\0' &&
+           std::strcmp(v, "0") != 0 &&
+           std::strcmp(v, "false") != 0 &&
+           std::strcmp(v, "FALSE") != 0 &&
+           std::strcmp(v, "off") != 0 &&
+           std::strcmp(v, "OFF") != 0;
+}
+
 }  // namespace
 
 bool NpuLinearI4::configure_shape(int K, int N) {
@@ -98,14 +112,15 @@ bool NpuLinearI4::create_context_and_b() {
     info.M = 1;
     info.K = K_matmul_;
     info.N = N_;
-    info.type = RKNN_INT4_MM_INT4_TO_INT16;
+    info.type = RKNN_INT8_MM_INT4_TO_INT32;
     info.B_layout = 1;
     info.AC_layout = 0;
     info.B_quant_type = 0;
     info.AC_quant_type = 0;
 
     int ret = 0;
-    dynamic_max_m_ = linear_batch_limit_i4();
+    const bool allow_dynamic_m = !has_core_mask_ || shard_dynamic_m_enabled_i4();
+    dynamic_max_m_ = allow_dynamic_m ? linear_batch_limit_i4() : 1;
     if (dynamic_max_m_ > 1) {
         dynamic_shapes_.resize(2);
         dynamic_io_attrs_.resize(2);
@@ -173,8 +188,16 @@ bool NpuLinearI4::bind_b_mem() {
     return true;
 }
 
-uint32_t NpuLinearI4::cache_flags() const {
-    return 0;
+uint32_t NpuLinearI4::cache_flags(bool dynamic_m) const {
+    // Version bit 0x1 distinguishes this path from the previous
+    // INT4xINT4->INT16 implementation. Reusing old native B cache would keep
+    // the old accumulator semantics and can look like severe quantization loss.
+    uint32_t flags = 0x1u;
+    if (dynamic_m) {
+        const uint32_t capped_m = (uint32_t)std::min(std::max(dynamic_max_m_, 1), 255);
+        flags |= 0x2u | (capped_m << 24);
+    }
+    return flags;
 }
 
 bool NpuLinearI4::init(int K, int N, const uint16_t* weight_kn) {
@@ -214,7 +237,7 @@ bool NpuLinearI4::init(int K, int N, const uint16_t* weight_kn) {
     info.M = 1;
     info.K = K_matmul_;
     info.N = N_;
-    info.type = RKNN_INT4_MM_INT4_TO_INT16;
+    info.type = RKNN_INT8_MM_INT4_TO_INT32;
     info.B_layout = 1;
     info.AC_layout = 0;
     info.B_quant_type = 0;
@@ -237,7 +260,7 @@ bool NpuLinearI4::init(int K, int N, const uint16_t* weight_kn) {
         spec.K = K_;
         spec.N = N_;
         spec.K_matmul = K_matmul_;
-        spec.flags = cache_flags();
+        spec.flags = cache_flags(dynamic_m_);
         const rknn_matmul_tensor_attr B_attr = current_b_attr();
         spec.packed_bytes = B_attr.size;
         spec.aux_bytes = scales_.size() * sizeof(float);
@@ -275,7 +298,11 @@ bool NpuLinearI4::init_from_cache(int K, int N) {
     spec.K = K_;
     spec.N = N_;
     spec.K_matmul = K_matmul_;
-    spec.flags = cache_flags();
+    const bool predicted_dynamic_m =
+        linear_batch_limit_i4() > 1 &&
+        (!has_core_mask_ || shard_dynamic_m_enabled_i4());
+    dynamic_max_m_ = predicted_dynamic_m ? linear_batch_limit_i4() : 1;
+    spec.flags = cache_flags(predicted_dynamic_m);
     if (!npu_weight_cache::exists(spec)) {
         destroy();
         return false;
@@ -286,6 +313,11 @@ bool NpuLinearI4::init_from_cache(int K, int N) {
         return false;
     }
     const rknn_matmul_tensor_attr B_attr = current_b_attr();
+    const uint32_t actual_flags = cache_flags(dynamic_m_);
+    if (actual_flags != spec.flags) {
+        destroy();
+        return false;
+    }
     spec.packed_bytes = B_attr.size;
     spec.aux_bytes = scales_.size() * sizeof(float);
     if (!npu_weight_cache::read(spec,
@@ -437,17 +469,17 @@ uint16_t* NpuLinearI4::prepare_input_f16(int M) {
     return prepared_input_f16_.data();
 }
 
-float NpuLinearI4::quantize_current_input(const uint16_t* input_f16, uint8_t* input_i4) {
-    std::memset(input_i4, 0, ((size_t)K_matmul_ + 1) / 2);
+float NpuLinearI4::quantize_current_input(const uint16_t* input_f16, int8_t* input_i8) {
+    std::memset(input_i8, 0, (size_t)K_matmul_);
     float max_abs = 0.0f;
     for (int k = 0; k < K_; ++k) {
         max_abs = std::max(max_abs, std::fabs(f16_to_f32(input_f16[k])));
     }
-    const float scale = max_abs > 0.0f ? max_abs / 7.0f : 1.0f;
+    const float scale = max_abs > 0.0f ? max_abs / 127.0f : 1.0f;
     const float inv = 1.0f / scale;
     for (int k = 0; k < K_; ++k) {
         int q = (int)std::lrint(f16_to_f32(input_f16[k]) * inv);
-        set_i4(input_i4, (size_t)k, clamp_i4(q));
+        input_i8[k] = clamp_i8(q);
     }
     return scale;
 }
@@ -460,12 +492,11 @@ bool NpuLinearI4::run_prepared_raw(std::vector<float>* input_scales) {
     }
 
     input_scales->resize((size_t)prepared_M_);
-    const size_t packed_row_bytes = ((size_t)K_matmul_ + 1) / 2;
-    uint8_t* a = reinterpret_cast<uint8_t*>(A_mem_->virt_addr);
+    int8_t* a = reinterpret_cast<int8_t*>(A_mem_->virt_addr);
     for (int m = 0; m < prepared_M_; ++m) {
         (*input_scales)[(size_t)m] = quantize_current_input(
             prepared_input_f16_.data() + (size_t)m * K_,
-            a + (size_t)m * packed_row_bytes);
+            a + (size_t)m * K_matmul_);
     }
     const int ret = rknn_matmul_run(ctx_);
     if (ret < 0) {
@@ -476,13 +507,13 @@ bool NpuLinearI4::run_prepared_raw(std::vector<float>* input_scales) {
     return true;
 }
 
-void NpuLinearI4::scale_output_f16(const int16_t* raw, const float* input_scales,
+void NpuLinearI4::scale_output_f16(const int32_t* raw, const float* input_scales,
                                    int M, uint16_t* out) const {
     if (!input_scales) {
         return;
     }
     for (int m = 0; m < M; ++m) {
-        const int16_t* src = raw + (size_t)m * N_;
+        const int32_t* src = raw + (size_t)m * N_;
         uint16_t* dst = out + (size_t)m * N_;
         for (int n = 0; n < N_; ++n) {
             dst[n] = f32_to_f16((float)src[n] * input_scales[m] * scales_[n]);
@@ -547,7 +578,7 @@ const uint16_t* NpuLinearI4::forward_prepared_output_f16() {
     }
 
     prepared_output_f16_.resize((size_t)prepared_M_ * N_);
-    scale_output_f16(reinterpret_cast<const int16_t*>(C_mem_->virt_addr),
+    scale_output_f16(reinterpret_cast<const int32_t*>(C_mem_->virt_addr),
                      prepared_input_scales_.data(), prepared_M_,
                      prepared_output_f16_.data());
     return prepared_output_f16_.data();
@@ -560,9 +591,9 @@ bool NpuLinearI4::forward_prepared_accumulate(float* accum_f32) {
     if (!run_prepared_raw(&prepared_input_scales_)) {
         return false;
     }
-    const int16_t* raw = reinterpret_cast<const int16_t*>(C_mem_->virt_addr);
+    const int32_t* raw = reinterpret_cast<const int32_t*>(C_mem_->virt_addr);
     for (int m = 0; m < prepared_M_; ++m) {
-        const int16_t* src = raw + (size_t)m * N_;
+        const int32_t* src = raw + (size_t)m * N_;
         float* dst = accum_f32 + (size_t)m * N_;
         for (int n = 0; n < N_; ++n) {
             dst[n] += (float)src[n] * prepared_input_scales_[(size_t)m] * scales_[n];

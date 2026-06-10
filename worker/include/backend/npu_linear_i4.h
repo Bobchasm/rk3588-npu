@@ -37,16 +37,16 @@ private:
     bool create_context_and_b();
     rknn_matmul_tensor_attr current_b_attr() const;
     bool bind_b_mem();
-    uint32_t cache_flags() const;
+    uint32_t cache_flags(bool dynamic_m) const;
     bool ac_sizes(int M, uint32_t* A_size, uint32_t* C_size) const;
     bool ensure_ac(int M);
     bool rebuild_ac(int M);
     bool bind_ac(int M, bool quiet = false);
     int dynamic_index_for_m(int M) const;
     void release_ac();
-    float quantize_current_input(const uint16_t* input_f16, uint8_t* input_i4);
+    float quantize_current_input(const uint16_t* input_f16, int8_t* input_i8);
     bool run_prepared_raw(std::vector<float>* input_scales);
-    void scale_output_f16(const int16_t* raw, const float* input_scales,
+    void scale_output_f16(const int32_t* raw, const float* input_scales,
                           int M, uint16_t* out) const;
 
     int K_ = 0;

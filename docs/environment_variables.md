@@ -238,8 +238,9 @@ RKLLM_PROFILE=1 RKLLM_LINEAR_BATCH=23 RKLLM_SHARD_DYNAMIC_M=1 RKLLM_NPU_ATTENTIO
 - 不支持值：`w8a16`、`W8A16`。RK3588 当前 matmul runtime 不支持 FP16 x INT8，所以代码会打印警告并使用 FP16。
 - 注意：
   - A8W8 使用 `RKNN_INT8_MM_INT8_TO_INT32`，输出再按 scale 反量化。
-  - A4W4 使用 `RKNN_INT4_MM_INT4_TO_INT16`，要求 `N` 64 对齐。
-  - 这是速度上限实验路径，可能导致生成 token 与 FP16 基准不一致。
+  - A4W4 不再使用 `RKNN_INT4_MM_INT4_TO_INT16`，该路径在长 `K` 下会因为 int16 累加饱和导致严重精度损失。
+  - A4W4 会尝试更安全的 `RKNN_INT8_MM_INT4_TO_INT32`；当前 RK3588 runtime 若返回 unsupported，会自动 fallback FP16。
+  - 这是速度上限实验路径，A8W8 全层开启时可能因为量化误差累积导致生成 token 与 FP16 基准不一致。
 
 ### `RKLLM_NPU_INT8_SCOPE`
 
@@ -260,6 +261,7 @@ RKLLM_PROFILE=1 RKLLM_LINEAR_BATCH=23 RKLLM_SHARD_DYNAMIC_M=1 RKLLM_NPU_ATTENTIO
 - 作用：启用 A4W4 时，限制哪些 linear 使用 int4。
 - 可选值同 `RKLLM_NPU_INT8_SCOPE`。
 - 注意：A4W4 的对齐约束更强，部分 shard 可能因为 `N` 不满足 64 对齐而 fallback FP16。
+- 当前 RK3588 runtime 不支持 `RKNN_INT8_MM_INT4_TO_INT32` 时，int4 请求会整体 fallback FP16；日志会出现 `I4 shard ... fallback FP16`。
 
 ### `RKLLM_NPU_INT8_LAYERS`
 
