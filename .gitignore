@@ -56,3 +56,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Local agent-only docs
+docs/agent_autodev_guide.md
