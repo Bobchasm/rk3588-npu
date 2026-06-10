@@ -149,6 +149,18 @@ static void fill_b(ElemKind kind, std::vector<uint8_t>& data, int K, int N) {
     }
 }
 
+static void unpack_i4_to_i8_bytes(const std::vector<uint8_t>& compact,
+                                  std::vector<uint8_t>* unpacked,
+                                  int K, int N) {
+    unpacked->assign((size_t)K * N, 0);
+    for (int k = 0; k < K; ++k) {
+        for (int n = 0; n < N; ++n) {
+            const size_t idx = (size_t)k * N + n;
+            (*unpacked)[idx] = (uint8_t)get_i4(compact, idx);
+        }
+    }
+}
+
 static bool probe_one(const ProbeSpec& spec) {
     constexpr int M = 1;
     constexpr int K = 64;
@@ -196,7 +208,13 @@ static bool probe_one(const ProbeSpec& spec) {
 
     std::memset(A_mem->virt_addr, 0, attr.A.size);
     std::memcpy(A_mem->virt_addr, A.data(), A.size());
-    ret = rknn_B_normal_layout_to_native_layout(B.data(), B_mem->virt_addr, K, N, &info);
+    std::vector<uint8_t> B_unpacked;
+    void* b_normal = B.data();
+    if (spec.b_kind == ElemKind::I4) {
+        unpack_i4_to_i8_bytes(B, &B_unpacked, K, N);
+        b_normal = B_unpacked.data();
+    }
+    ret = rknn_B_normal_layout_to_native_layout(b_normal, B_mem->virt_addr, K, N, &info);
     if (ret < 0) {
         std::printf("FAIL %-36s B_layout ret=%d\n", spec.name, ret);
         cleanup();
@@ -212,9 +230,22 @@ static bool probe_one(const ProbeSpec& spec) {
         return false;
     }
 
+    ret = rknn_mem_sync(ctx, A_mem, RKNN_MEMORY_SYNC_TO_DEVICE);
+    if (ret >= 0) ret = rknn_mem_sync(ctx, B_mem, RKNN_MEMORY_SYNC_TO_DEVICE);
+    if (ret < 0) {
+        std::printf("FAIL %-36s mem_sync TO_DEVICE ret=%d\n", spec.name, ret);
+        cleanup();
+        return false;
+    }
     ret = rknn_matmul_run(ctx);
     if (ret < 0) {
         std::printf("FAIL %-36s run ret=%d\n", spec.name, ret);
+        cleanup();
+        return false;
+    }
+    ret = rknn_mem_sync(ctx, C_mem, RKNN_MEMORY_SYNC_FROM_DEVICE);
+    if (ret < 0) {
+        std::printf("FAIL %-36s mem_sync FROM_DEVICE ret=%d\n", spec.name, ret);
         cleanup();
         return false;
     }

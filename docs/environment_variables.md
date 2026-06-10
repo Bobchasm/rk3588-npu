@@ -238,9 +238,9 @@ RKLLM_PROFILE=1 RKLLM_LINEAR_BATCH=23 RKLLM_SHARD_DYNAMIC_M=1 RKLLM_NPU_ATTENTIO
 - 不支持值：`w8a16`、`W8A16`。RK3588 当前 matmul runtime 不支持 FP16 x INT8，所以代码会打印警告并使用 FP16。
 - 注意：
   - A8W8 使用 `RKNN_INT8_MM_INT8_TO_INT32`，输出再按 scale 反量化。
-  - A4W4 不再使用 `RKNN_INT4_MM_INT4_TO_INT16`，该路径在长 `K` 下会因为 int16 累加饱和导致严重精度损失。
-  - A4W4 会尝试更安全的 `RKNN_INT8_MM_INT4_TO_INT32`；当前 RK3588 runtime 若返回 unsupported，会自动 fallback FP16。
-  - 这是速度上限实验路径，A8W8 全层开启时可能因为量化误差累积导致生成 token 与 FP16 基准不一致。
+  - 默认 A4W4 会尝试 `RKNN_INT8_MM_INT4_TO_INT32`；当前 RK3588 runtime 若返回 unsupported，会自动 fallback FP16。
+  - 可用 `RKLLM_INT4_KSPLIT=1` 走真实 `RKNN_INT4_MM_INT4_TO_INT16` 分块实验路径，见下文。
+  - 这是速度上限实验路径，A8W8/A4W4 开启时可能因为量化误差累积导致生成 token 与 FP16 基准不一致。
 
 ### `RKLLM_NPU_INT8_SCOPE`
 
@@ -261,7 +261,30 @@ RKLLM_PROFILE=1 RKLLM_LINEAR_BATCH=23 RKLLM_SHARD_DYNAMIC_M=1 RKLLM_NPU_ATTENTIO
 - 作用：启用 A4W4 时，限制哪些 linear 使用 int4。
 - 可选值同 `RKLLM_NPU_INT8_SCOPE`。
 - 注意：A4W4 的对齐约束更强，部分 shard 可能因为 `N` 不满足 64 对齐而 fallback FP16。
-- 当前 RK3588 runtime 不支持 `RKNN_INT8_MM_INT4_TO_INT32` 时，int4 请求会整体 fallback FP16；日志会出现 `I4 shard ... fallback FP16`。
+- 默认路径下，当前 RK3588 runtime 不支持 `RKNN_INT8_MM_INT4_TO_INT32` 时，int4 请求会整体 fallback FP16；日志会出现 `I4 shard ... fallback FP16`。
+
+### `RKLLM_INT4_KSPLIT`
+
+- 默认：关闭。
+- 作用：启用真实 A4W4 K 维分块实验路径。
+- 开启值：`1`、`true`、`TRUE`、`on`、`ON`。
+- 实现：
+  - 每个 K chunk 使用 `RKNN_INT4_MM_INT4_TO_INT16`。
+  - 每个 chunk 的 int16 输出按输入 scale 和权重 scale 反量化后累加到 FP32。
+  - 权重传给 `rknn_B_normal_layout_to_native_layout` 时使用 RKNN 期望的一字节一个 int4 元素 normal layout，再由 RKNN 转成 native layout。
+- 注意：
+  - 该路径是实验性能路径，不是默认正确性路径。
+  - 当前只在 `gate_up` 范围做过小样本验证：真实 INT4 无 fallback，16 条样例 exact `2/16`、首 token `10/16`，平均 decode 约 `6.21 tok/s`；同批 FP16 约 `5.22 tok/s`。
+  - 精度仍明显低于 FP16/A8W8，适合继续调量化策略，不适合作为默认生产路径。
+
+### `RKLLM_INT4_KSPLIT_K`
+
+- 默认：`512`。
+- 作用：设置 `RKLLM_INT4_KSPLIT=1` 时每个 K chunk 的大小。
+- 约束：
+  - 会按 32 对齐。
+  - 最大限制为 `640`，避免 `640 * 7 * 7` 超过 int16 安全累加范围。
+  - 无效值会打印警告并回到默认值。
 
 ### `RKLLM_NPU_INT8_LAYERS`
 

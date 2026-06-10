@@ -33,6 +33,24 @@ public:
     void set_core_mask(rknn_core_mask mask);
 
 private:
+    struct KSplitChunk {
+        int offset = 0;
+        int K = 0;
+        int K_matmul = 0;
+        rknn_matmul_ctx ctx = 0;
+        rknn_matmul_io_attr io_attr{};
+        std::vector<rknn_matmul_shape> dynamic_shapes;
+        std::vector<rknn_matmul_io_attr> dynamic_io_attrs;
+        bool dynamic_m = false;
+        int dynamic_max_m = 1;
+        rknn_tensor_mem* A_mem = nullptr;
+        rknn_tensor_mem* B_mem = nullptr;
+        rknn_tensor_mem* C_mem = nullptr;
+        int cur_M = 0;
+        int alloc_M = 0;
+        std::vector<float> scales;
+    };
+
     bool configure_shape(int K, int N);
     bool create_context_and_b();
     rknn_matmul_tensor_attr current_b_attr() const;
@@ -48,6 +66,21 @@ private:
     bool run_prepared_raw(std::vector<float>* input_scales);
     void scale_output_f16(const int32_t* raw, const float* input_scales,
                           int M, uint16_t* out) const;
+    bool init_ksplit(const uint16_t* weight_kn);
+    bool create_ksplit_context_and_b(KSplitChunk* chunk);
+    bool bind_ksplit_b_mem(KSplitChunk* chunk);
+    bool ksplit_ac_sizes(const KSplitChunk& chunk, int M,
+                         uint32_t* A_size, uint32_t* C_size) const;
+    int ksplit_dynamic_index_for_m(const KSplitChunk& chunk, int M) const;
+    bool bind_ksplit_ac(KSplitChunk* chunk, int M, bool quiet = false);
+    bool rebuild_ksplit_ac(KSplitChunk* chunk, int M);
+    bool ensure_ksplit_ac(int M);
+    void release_ksplit_ac(KSplitChunk* chunk);
+    void destroy_ksplit();
+    float quantize_ksplit_input_chunk(const uint16_t* input_f16,
+                                      const KSplitChunk& chunk,
+                                      uint8_t* input_i4) const;
+    bool run_ksplit_accumulate(std::vector<float>* output_f32);
 
     int K_ = 0;
     int K_matmul_ = 0;
@@ -69,6 +102,10 @@ private:
     int cur_M_ = 0;
     int alloc_M_ = 0;
     int prepared_M_ = 0;
+    bool ksplit_ = false;
+    int ksplit_chunk_k_ = 0;
+    std::vector<KSplitChunk> ksplit_chunks_;
+    std::vector<float> ksplit_output_f32_;
     std::vector<float> scales_;
     std::vector<float> prepared_input_scales_;
     std::vector<uint16_t> prepared_input_f16_;
