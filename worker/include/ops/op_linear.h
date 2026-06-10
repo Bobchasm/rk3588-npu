@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <memory>
+#include <string>
 
 // ============================================================
 // op_linear: Linear 算子抽象接口
@@ -24,6 +25,18 @@ public:
 
     // 用权重初始化后端（K, N 与权重数据）
     virtual bool init(int K, int N, const uint16_t* weight_kn) = 0;
+
+    // 可选加载快路径：模型层先设置稳定 cache key，再尝试只按形状从
+    // native-layout 权重缓存初始化。默认不支持，调用方应读取原始权重后 init()。
+    virtual void set_cache_key(const std::string& key) {
+        (void)key;
+    }
+
+    virtual bool init_from_cache(int K, int N) {
+        (void)K;
+        (void)N;
+        return false;
+    }
 
     // 前向：input[M*K] FP16 -> output[M*N] FP16
     virtual bool forward(const uint16_t* input_f16, int M, uint16_t* output_f16) = 0;
@@ -59,6 +72,29 @@ public:
 
     virtual const uint16_t* forward_prepared_output_f16() {
         return nullptr;
+    }
+
+    virtual const float* forward_prepared_output_f32() {
+        return nullptr;
+    }
+
+    // 可选快路径：prepared forward 后不拼接输出，直接返回多个 shard 的 C buffer。
+    // outputs[i] 是第 i 个 shard 的本地输出；offsets/sizes 描述它对应的逻辑输出片段。
+    virtual bool forward_prepared_output_shards_f16(const uint16_t** outputs,
+                                                    int* offsets,
+                                                    int* sizes,
+                                                    int max_shards,
+                                                    int* num_shards) {
+        (void)outputs;
+        (void)offsets;
+        (void)sizes;
+        (void)max_shards;
+        (void)num_shards;
+        return false;
+    }
+
+    virtual bool prepared_output_shards_are_gate_up_pairs() const {
+        return false;
     }
 
     virtual bool forward_prepared_accumulate(float* accum_f32) {

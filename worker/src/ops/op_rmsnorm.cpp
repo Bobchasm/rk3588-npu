@@ -47,6 +47,8 @@ void op_rmsnorm(const float* x, const float* weight, float* y,
 void op_rmsnorm_to_f16(const float* x, const float* weight, uint16_t* y,
                        int seq, int hidden, float eps)
 {
+    // NPU Linear 的 A 输入是 FP16。这个版本把 RMSNorm 结果直接写成 FP16，
+    // 省掉 “FP32 临时输出 -> FP16 NPU 输入” 的一次额外遍历。
     for (int s = 0; s < seq; ++s) {
         const float* xrow = x + s * hidden;
         uint16_t*    yrow = y + s * hidden;

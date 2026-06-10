@@ -1,10 +1,15 @@
 #include "backend/npu_linear.h"
+#include "backend/npu_weight_cache.h"
 #include "ops/op_cast.h"
 #include <algorithm>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <sys/resource.h>
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 namespace {
 
@@ -59,6 +64,48 @@ int dynamic_m_limit() {
     return std::min<long>(parsed, 512);
 }
 
+bool shard_dynamic_m_enabled() {
+    const char* v = std::getenv("RKLLM_SHARD_DYNAMIC_M");
+    return v && v[0] != '\0' &&
+           std::strcmp(v, "0") != 0 &&
+           std::strcmp(v, "false") != 0 &&
+           std::strcmp(v, "FALSE") != 0 &&
+           std::strcmp(v, "off") != 0 &&
+           std::strcmp(v, "OFF") != 0;
+}
+
+uint32_t fp16_cache_flags_for_dynamic_m(bool dynamic_m, int max_m, bool output_f32 = false) {
+    uint32_t flags = output_f32 ? 0x2u : 0;
+    if (!dynamic_m) {
+        return flags;
+    }
+    const uint32_t capped_m = (uint32_t)std::min(std::max(max_m, 1), 0xffff);
+    flags |= 0x1u | (capped_m << 8);
+    return flags;
+}
+
+uint32_t predicted_fp16_cache_flags(bool has_core_mask, int N, bool output_f32 = false) {
+    const int max_m = dynamic_m_limit();
+    const bool dynamic_m = max_m > 1 &&
+        (!has_core_mask || shard_dynamic_m_enabled()) &&
+        N <= 32768;
+    return fp16_cache_flags_for_dynamic_m(dynamic_m, max_m, output_f32);
+}
+
+void add_f32_inplace(float* dst, const float* src, int n) {
+    int i = 0;
+#if defined(__aarch64__)
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t d = vld1q_f32(dst + i);
+        float32x4_t s = vld1q_f32(src + i);
+        vst1q_f32(dst + i, vaddq_f32(d, s));
+    }
+#endif
+    for (; i < n; ++i) {
+        dst[i] += src[i];
+    }
+}
+
 }  // namespace
 
 static inline uint16_t f16_order_key(uint16_t v) {
@@ -90,26 +137,128 @@ static bool argmax_f16_row(const uint16_t* out, int N,
 }
 
 bool NpuLinear::init(int K, int N, const uint16_t* weight_kn) {
-    destroy();
+    if (!weight_kn) {
+        std::fprintf(stderr, "[NpuLinear] invalid init args K=%d N=%d\n", K, N);
+        return false;
+    }
 
+    rknn_matmul_info info{};
+    if (!create_context_and_b(K, N, &info)) {
+        return false;
+    }
+    const rknn_matmul_tensor_attr B_attr = current_b_attr();
+
+    // 冷加载路径：weight_kn 是普通 [K, N] row-major FP16。RKNN native B
+    // 是设备偏好的内部布局，不能直接用 memcpy 得到，必须调用转换 API。
+    int ret = rknn_B_normal_layout_to_native_layout(
+        (void*)weight_kn, B_mem_->virt_addr, K_, N_, &info);
+    if (ret < 0) {
+        std::fprintf(stderr,
+                     "[NpuLinear] rknn_B_normal_layout_to_native_layout failed: %d\n",
+                     ret);
+        destroy();
+        return false;
+    }
+
+    if (!cache_key_.empty()) {
+        // 转换完成后把 B_mem_ 里的 native layout 原样写入缓存。下次加载
+        // 可以直接读回 B_mem_，不再读取/转置/转换原始权重。
+        npu_weight_cache::CacheSpec spec;
+        spec.key = cache_key_;
+        spec.kind = npu_weight_cache::CACHE_KIND_FP16_NATIVE;
+        spec.K = K_;
+        spec.N = N_;
+        spec.K_matmul = K_;
+        spec.flags = fp16_cache_flags_for_dynamic_m(dynamic_m_, dynamic_max_m_, output_f32_);
+        spec.packed_bytes = B_attr.size;
+        npu_weight_cache::write(spec, B_mem_->virt_addr, B_attr.size);
+    }
+
+    if (!bind_b_mem(B_attr)) {
+        return false;
+    }
+
+    // A/C are activation buffers. Do not allocate them during load:
+    // hundreds of Linear contexts would otherwise keep hundreds of dmabuf fds
+    // open before inference even starts. forward() allocates lazily and reuses.
+    return true;
+}
+
+bool NpuLinear::init_from_cache(int K, int N) {
+    if (cache_key_.empty() || !npu_weight_cache::enabled()) {
+        return false;
+    }
+
+    npu_weight_cache::CacheSpec spec;
+    spec.key = cache_key_;
+    spec.kind = npu_weight_cache::CACHE_KIND_FP16_NATIVE;
+    spec.K = K;
+    spec.N = N;
+    spec.K_matmul = K;
+    spec.flags = predicted_fp16_cache_flags(has_core_mask_, N, output_f32_);
+    // 先只根据文件名探测，避免 cold miss 时创建 RKNN context/B buffer。
+    if (!npu_weight_cache::exists(spec)) {
+        return false;
+    }
+
+    // 确认缓存存在后才创建 context，并用实际 B_attr.size 完成 header 校验。
+    rknn_matmul_info info{};
+    if (!create_context_and_b(K, N, &info)) {
+        return false;
+    }
+    const rknn_matmul_tensor_attr B_attr = current_b_attr();
+    spec.K = K_;
+    spec.N = N_;
+    spec.K_matmul = K_;
+    const uint32_t actual_flags =
+        fp16_cache_flags_for_dynamic_m(dynamic_m_, dynamic_max_m_, output_f32_);
+    if (actual_flags != spec.flags) {
+        destroy();
+        return false;
+    }
+    spec.packed_bytes = B_attr.size;
+
+    if (!npu_weight_cache::read(spec, B_mem_->virt_addr, B_attr.size)) {
+        destroy();
+        return false;
+    }
+    if (!bind_b_mem(B_attr)) {
+        return false;
+    }
+    return true;
+}
+
+bool NpuLinear::create_context_and_b(int K, int N, rknn_matmul_info* info_out) {
+    destroy();
     ensure_nofile_limit();
 
-    K_ = K; N_ = N;
+    if (K <= 0 || N <= 0 || !info_out) {
+        std::fprintf(stderr, "[NpuLinear] invalid init args K=%d N=%d\n", K, N);
+        return false;
+    }
+
+    K_ = K;
+    N_ = N;
 
     // 创建 matmul 上下文。M>1 必须使用 RKNN dynamic shape；
     // 在静态 M=1 context 上只改 tensor attr 会 silent wrong output。
+    // B_layout=1 表示 B 使用 native layout；A/C 仍是 normal layout，
+    // 因为运行时激活需要 CPU 直接读写。
     rknn_matmul_info info{};
     info.M             = 1;
     info.K             = K_;
     info.N             = N_;
-    info.type          = RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT16;
+    info.type          = output_f32_
+        ? RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32
+        : RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT16;
     info.B_layout      = 1;  // native layout（性能更好）
     info.AC_layout     = 0;  // normal layout
     info.B_quant_type  = 0;
     info.AC_quant_type = 0;
 
     int ret = 0;
-    dynamic_max_m_ = (has_core_mask_ || N_ > 32768) ? 1 : dynamic_m_limit();
+    const bool allow_dynamic_m = (!has_core_mask_ || shard_dynamic_m_enabled()) && N_ <= 32768;
+    dynamic_max_m_ = allow_dynamic_m ? dynamic_m_limit() : 1;
     if (dynamic_max_m_ > 1) {
         dynamic_shapes_.resize(2);
         dynamic_io_attrs_.resize(2);
@@ -136,54 +285,75 @@ bool NpuLinear::init(int K, int N, const uint16_t* weight_kn) {
     if (!ctx_) {
         ret = rknn_matmul_create(&ctx_, &info, &io_attr_);
         if (ret < 0) {
-            std::fprintf(stderr, "[NpuLinear] rknn_matmul_create failed: %d (K=%d N=%d)\n", ret, K_, N_);
+            std::fprintf(stderr,
+                         "[NpuLinear] rknn_matmul_create failed: %d (K=%d N=%d)\n",
+                         ret, K_, N_);
             K_ = 0;
             N_ = 0;
             return false;
         }
     }
 
-    auto fail = [this](const char* msg, int code) {
-        if (code < 0) {
-            std::fprintf(stderr, "[NpuLinear] %s failed: %d\n", msg, code);
-        } else {
-            std::fprintf(stderr, "[NpuLinear] %s failed\n", msg);
-        }
-        destroy();
-        return false;
-    };
-
     if (has_core_mask_) {
         ret = rknn_matmul_set_core_mask(ctx_, core_mask_);
         if (ret < 0) {
-            return fail("rknn_matmul_set_core_mask", ret);
+            if (dynamic_m_) {
+                std::fprintf(stderr,
+                             "[NpuLinear] dynamic shape set_core_mask failed: %d "
+                             "(K=%d N=%d maxM=%d), fallback static M=1\n",
+                             ret, K_, N_, dynamic_max_m_);
+                rknn_matmul_destroy(ctx_);
+                ctx_ = 0;
+                io_attr_ = {};
+                dynamic_shapes_.clear();
+                dynamic_io_attrs_.clear();
+                dynamic_m_ = false;
+                dynamic_max_m_ = 1;
+
+                ret = rknn_matmul_create(&ctx_, &info, &io_attr_);
+                if (ret < 0) {
+                    std::fprintf(stderr,
+                                 "[NpuLinear] fallback rknn_matmul_create failed: %d "
+                                 "(K=%d N=%d)\n",
+                                 ret, K_, N_);
+                    K_ = 0;
+                    N_ = 0;
+                    return false;
+                }
+                ret = rknn_matmul_set_core_mask(ctx_, core_mask_);
+            }
+            if (ret < 0) {
+                std::fprintf(stderr, "[NpuLinear] rknn_matmul_set_core_mask failed: %d\n", ret);
+                destroy();
+                return false;
+            }
         }
     }
 
-    // 分配 B 内存
-    const rknn_matmul_tensor_attr& B_attr = dynamic_m_
-        ? dynamic_io_attrs_[0].B
-        : io_attr_.B;
+    const rknn_matmul_tensor_attr B_attr = current_b_attr();
     B_mem_ = rknn_create_mem(ctx_, B_attr.size);
     if (!B_mem_) {
-        return fail("rknn_create_mem(B)", 0);
+        std::fprintf(stderr, "[NpuLinear] rknn_create_mem(B) failed\n");
+        destroy();
+        return false;
     }
 
-    // normal layout 权重 -> native layout
-    ret = rknn_B_normal_layout_to_native_layout(
-        (void*)weight_kn, B_mem_->virt_addr, K_, N_, &info);
+    *info_out = info;
+    return true;
+}
+
+rknn_matmul_tensor_attr NpuLinear::current_b_attr() const {
+    return dynamic_m_ ? dynamic_io_attrs_[0].B : io_attr_.B;
+}
+
+bool NpuLinear::bind_b_mem(const rknn_matmul_tensor_attr& B_attr) {
+    int ret = rknn_matmul_set_io_mem(
+        ctx_, B_mem_, const_cast<rknn_matmul_tensor_attr*>(&B_attr));
     if (ret < 0) {
-        return fail("rknn_B_normal_layout_to_native_layout", ret);
+        std::fprintf(stderr, "[NpuLinear] rknn_matmul_set_io_mem(B) failed: %d\n", ret);
+        destroy();
+        return false;
     }
-
-    ret = rknn_matmul_set_io_mem(ctx_, B_mem_, const_cast<rknn_matmul_tensor_attr*>(&B_attr));
-    if (ret < 0) {
-        return fail("rknn_matmul_set_io_mem(B)", ret);
-    }
-
-    // A/C are activation buffers. Do not allocate them during load:
-    // hundreds of Linear contexts would otherwise keep hundreds of dmabuf fds
-    // open before inference even starts. forward() allocates lazily and reuses.
     return true;
 }
 
@@ -451,7 +621,8 @@ bool NpuLinear::forward_prepared(uint16_t* output_f16) {
 }
 
 const uint16_t* NpuLinear::forward_prepared_output_f16() {
-    if (!ctx_ || !A_mem_ || !C_mem_ || K_ <= 0 || N_ <= 0 || cur_M_ <= 0) {
+    if (output_f32_ || !ctx_ || !A_mem_ || !C_mem_ ||
+        K_ <= 0 || N_ <= 0 || cur_M_ <= 0) {
         return nullptr;
     }
 
@@ -465,10 +636,30 @@ const uint16_t* NpuLinear::forward_prepared_output_f16() {
     return reinterpret_cast<const uint16_t*>(C_mem_->virt_addr);
 }
 
+const float* NpuLinear::forward_prepared_output_f32() {
+    if (!output_f32_ || !ctx_ || !A_mem_ || !C_mem_ ||
+        K_ <= 0 || N_ <= 0 || cur_M_ <= 0) {
+        return nullptr;
+    }
+
+    int ret = rknn_matmul_run(ctx_);
+    if (ret < 0) {
+        std::fprintf(stderr, "[NpuLinear] rknn_matmul_run f32 failed: %d\n", ret);
+        release_ac();
+        return nullptr;
+    }
+
+    return reinterpret_cast<const float*>(C_mem_->virt_addr);
+}
+
 bool NpuLinear::forward_prepared_accumulate(float* accum_f32) {
     if (!ctx_ || !A_mem_ || !C_mem_ || !accum_f32 ||
         K_ <= 0 || N_ <= 0 || cur_M_ <= 0) {
         return false;
+    }
+
+    if (output_f32_) {
+        return forward_prepared_f32_accumulate(accum_f32);
     }
 
     const uint16_t* out = forward_prepared_output_f16();
@@ -477,6 +668,21 @@ bool NpuLinear::forward_prepared_accumulate(float* accum_f32) {
     }
 
     op_add_f16_to_f32_inplace(accum_f32, out, cur_M_ * N_);
+    return true;
+}
+
+bool NpuLinear::forward_prepared_f32_accumulate(float* accum_f32) {
+    if (!ctx_ || !A_mem_ || !C_mem_ || !accum_f32 ||
+        K_ <= 0 || N_ <= 0 || cur_M_ <= 0) {
+        return false;
+    }
+
+    const float* out = forward_prepared_output_f32();
+    if (!out) {
+        return false;
+    }
+
+    add_f32_inplace(accum_f32, out, cur_M_ * N_);
     return true;
 }
 
@@ -499,7 +705,7 @@ bool NpuLinear::forward_argmax(const uint16_t* input_f16, int M,
 }
 
 bool NpuLinear::forward_prepared_argmax(int* argmax_id, uint16_t* argmax_value) {
-    if (!argmax_id || !ctx_ || !A_mem_ || !C_mem_ ||
+    if (output_f32_ || !argmax_id || !ctx_ || !A_mem_ || !C_mem_ ||
         K_ <= 0 || N_ <= 0 || cur_M_ != 1) {
         return false;
     }

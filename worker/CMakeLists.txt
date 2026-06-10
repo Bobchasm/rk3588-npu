@@ -32,7 +32,9 @@ set(OPS_SOURCES
 set(BACKEND_SOURCES
     src/backend/cpu_linear.cpp
     src/backend/npu_linear.cpp
+    src/backend/npu_linear_i4.cpp
     src/backend/npu_linear_w8.cpp
+    src/backend/npu_weight_cache.cpp
     src/backend/sharded_npu_linear.cpp
 )
 
@@ -75,12 +77,21 @@ target_link_libraries(qwen2_demo PRIVATE worker_core)
 add_executable(qwen2_chat src/chat_main.cpp)
 target_link_libraries(qwen2_chat PRIVATE worker_core)
 
-# ---------- 工具：验证 RKNN 低比特 matmul 支持 ----------
-add_executable(probe_matmul_w8 src/tools/probe_matmul_w8.cpp)
-target_link_libraries(probe_matmul_w8 PRIVATE worker_core)
+# ---------- 工具：验证 RKNN matmul dtype 支持 ----------
+add_executable(probe_matmul_types src/tools/probe_matmul_types.cpp)
+target_link_libraries(probe_matmul_types PRIVATE worker_core)
+
+# ---------- 工具：单纯比较 CPU GEMM 和 RKNN NPU matmul ----------
+add_executable(probe_gemm_speed src/tools/probe_gemm_speed.cpp)
+target_link_libraries(probe_gemm_speed PRIVATE worker_core)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    target_compile_options(probe_gemm_speed PRIVATE
+        -O3 -ffast-math -funroll-loops -march=armv8.2-a+fp16
+    )
+endif()
 
 # ---------- install ----------
-install(TARGETS qwen2_demo qwen2_chat probe_matmul_w8
+install(TARGETS qwen2_demo qwen2_chat probe_matmul_types probe_gemm_speed
         DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/install)
 install(FILES
     ${RKNN_LIB}/librknnrt.so

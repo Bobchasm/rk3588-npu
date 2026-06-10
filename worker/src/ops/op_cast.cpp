@@ -6,6 +6,7 @@
 #endif
 
 void op_f32_to_f16(const float* src, uint16_t* dst, int n) {
+    // CPU FP32 激活进入 NPU 前的通用转换。aarch64 上用 NEON 批量转。
     int i = 0;
 #if defined(__aarch64__)
     for (; i + 4 <= n; i += 4) {
@@ -18,6 +19,8 @@ void op_f32_to_f16(const float* src, uint16_t* dst, int n) {
 }
 
 void op_add_f16_to_f32_inplace(float* dst, const uint16_t* src, int n) {
+    // NPU Linear 输出 FP16，residual/accum buffer 是 FP32；
+    // 这个函数用于“转换并累加”而不是先落一个 FP32 临时数组。
     int i = 0;
 #if defined(__aarch64__)
     for (; i + 4 <= n; i += 4) {

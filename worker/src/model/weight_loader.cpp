@@ -75,6 +75,9 @@ static const char* skip_value(const char* p, const char* end) {
 }
 
 TensorMap load_safetensors_meta(const std::string& path) {
+    // safetensors 的 header 是 JSON，真实 tensor 数据在 header 后连续存放。
+    // 这里只读 header，构建 key -> TensorMeta 的索引，避免加载阶段一开始
+    // 就把所有权重读入内存。
     FILE* fp = std::fopen(path.c_str(), "rb");
     if (!fp) throw std::runtime_error("Cannot open: " + path);
 
@@ -155,8 +158,12 @@ TensorMap load_safetensors_meta(const std::string& path) {
 // data 区起始 = 8 + hdr_size
 static int64_t get_data_base(const std::string& path) {
     FILE* fp = std::fopen(path.c_str(), "rb");
+    if (!fp) throw std::runtime_error("Cannot open: " + path);
     uint64_t hdr_size = 0;
-    std::fread(&hdr_size, 1, 8, fp);
+    if (std::fread(&hdr_size, 1, 8, fp) != 8) {
+        std::fclose(fp);
+        throw std::runtime_error("Bad safetensors header");
+    }
     std::fclose(fp);
     return (int64_t)(8 + hdr_size);
 }
@@ -164,6 +171,8 @@ static int64_t get_data_base(const std::string& path) {
 std::vector<uint16_t> load_tensor_f16(
     const std::string& path, const TensorMeta& meta, bool transpose)
 {
+    // 每次只按 TensorMeta 的 data_offsets 读取一个 tensor。Linear 权重会在
+    // 调用处设置 transpose=true，把 PyTorch [out, in] 转成本项目统一的 [K, N]。
     int64_t base     = get_data_base(path);
     int64_t byte_len = meta.data_end - meta.data_begin;
 
@@ -194,6 +203,8 @@ std::vector<uint16_t> load_tensor_f16(
     }
 
     if (transpose && meta.shape.size() == 2) {
+        // PyTorch Linear weight 通常是 [out_features, in_features]。
+        // 本项目所有 Linear 后端统一使用 A[M,K] * B[K,N]，因此加载时转置。
         int64_t rows = meta.shape[0], cols = meta.shape[1];
         std::vector<uint16_t> tmp(n);
         for (int64_t r = 0; r < rows; ++r)
@@ -213,7 +224,10 @@ std::vector<float> load_tensor_f32(const std::string& path, const TensorMeta& me
     std::fseek(fp, (long)(base + meta.data_begin), SEEK_SET);
 
     std::vector<uint8_t> raw(byte_len);
-    std::fread(raw.data(), 1, byte_len, fp);
+    if ((int64_t)std::fread(raw.data(), 1, byte_len, fp) != byte_len) {
+        std::fclose(fp);
+        throw std::runtime_error("Read failed: " + meta.dtype);
+    }
     std::fclose(fp);
 
     int64_t n = 1;

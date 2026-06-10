@@ -39,6 +39,8 @@ LLMEngine::LLMEngine()  : model_(new Qwen2Model()) {}
 LLMEngine::~LLMEngine() { destroy(); }
 
 bool LLMEngine::load(const std::string& model_dir, LinearBackend backend) {
+    // API 层只负责生命周期转发：真正的权重解析、NPU backend 创建、
+    // KV cache 分配都在 Qwen2Model::load() 内完成。
     bool ok = model_->load(model_dir, backend);
     if (!ok) model_->destroy();
     return ok;
@@ -66,6 +68,8 @@ GenerationResult LLMEngine::generate(
     };
 
     // ---- Prefill ----
+    // 第一次 forward 接收完整 prompt。模型会一次性写入 prompt 的全部 KV，
+    // 并返回最后一个 prompt 位置预测出的 next token。
     try {
         int64_t t0 = now_us();
         int next_id = model_->forward_next_token(input_ids);
@@ -75,6 +79,8 @@ GenerationResult LLMEngine::generate(
         std::vector<int> one_token(1);
 
         // ---- Decode ----
+        // 后续每步只喂上一步生成的单个 token。KV Cache 已经保存历史，
+        // 所以 decode 的主要工作是 seq=1 的增量 forward。
         int64_t t_decode_start = now_us();
         for (int step = 0; step < cfg.max_new_tokens; ++step) {
             // 1. stop token 检测

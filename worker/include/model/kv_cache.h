@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 // ============================================================
@@ -26,15 +27,16 @@ public:
     int  capacity() const { return capacity_; }
     int  kv_dim()   const { return kv_dim_; }
 
-    // 直接暴露每层底层指针，attention 算子和写入路径都通过它访问
-    uint16_t*       k_ptr(int layer)       { return k_cache_[layer].data(); }
-    uint16_t*       v_ptr(int layer)       { return v_cache_[layer].data(); }
-    const uint16_t* k_ptr(int layer) const { return k_cache_[layer].data(); }
-    const uint16_t* v_ptr(int layer) const { return v_cache_[layer].data(); }
+    // 直接暴露每层底层指针，attention 算子和写入路径都通过它访问。
+    // 调用方负责按 [position, kv_dim] 计算偏移。
+    uint16_t*       k_ptr(int layer)       { return k_cache_[layer].get(); }
+    uint16_t*       v_ptr(int layer)       { return v_cache_[layer].get(); }
+    const uint16_t* k_ptr(int layer) const { return k_cache_[layer].get(); }
+    const uint16_t* v_ptr(int layer) const { return v_cache_[layer].get(); }
 
 private:
-    std::vector<std::vector<uint16_t>> k_cache_;
-    std::vector<std::vector<uint16_t>> v_cache_;
+    std::vector<std::unique_ptr<uint16_t[]>> k_cache_;
+    std::vector<std::unique_ptr<uint16_t[]>> v_cache_;
     int capacity_ = 0;
     int kv_dim_   = 0;
     int cur_pos_  = 0;

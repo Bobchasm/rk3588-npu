@@ -26,6 +26,9 @@ struct GenerationConfig {
 
 // 生成结果统计
 struct GenerationResult {
+    // 统计口径：
+    //   prefill_* 覆盖整段输入 prompt 的一次 forward；
+    //   decode_* 只统计后续逐 token 的增量 forward，不含模型加载。
     std::vector<int> output_ids;   // 新生成的 token id（不含输入）
     int   prefill_tokens = 0;
     int   decode_tokens  = 0;

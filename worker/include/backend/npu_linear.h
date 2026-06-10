@@ -2,6 +2,7 @@
 #include "ops/op_linear.h"
 #include "rknn_matmul_api.h"
 #include <cstdint>
+#include <string>
 #include <vector>
 
 // ============================================================
@@ -26,6 +27,8 @@ public:
     NpuLinear& operator=(const NpuLinear&) = delete;
 
     bool init(int K, int N, const uint16_t* weight_kn) override;
+    void set_cache_key(const std::string& key) override { cache_key_ = key; }
+    bool init_from_cache(int K, int N) override;
     bool forward(const uint16_t* input_f16, int M, uint16_t* output_f16) override;
     bool forward_accumulate(const uint16_t* input_f16, int M, float* accum_f32) override;
     bool forward_f32_accumulate(const float* input_f32, int M, float* accum_f32) override;
@@ -39,6 +42,11 @@ public:
     bool forward_prepared_argmax(int* argmax_id, uint16_t* argmax_value = nullptr) override;
     void destroy() override;
 
+    // Optional FP32 output mode. Must be set before init().
+    void set_output_f32(bool enabled) { output_f32_ = enabled; }
+    const float* forward_prepared_output_f32() override;
+    bool forward_prepared_f32_accumulate(float* accum_f32);
+
     // 可选：绑定单个 NPU core。必须在 init() 前调用。
     void set_core_mask(rknn_core_mask mask);
 
@@ -46,6 +54,9 @@ public:
     bool bind_external_input_f16(int M, const rknn_tensor_mem* external_mem);
 
 private:
+    bool create_context_and_b(int K, int N, rknn_matmul_info* info);
+    rknn_matmul_tensor_attr current_b_attr() const;
+    bool bind_b_mem(const rknn_matmul_tensor_attr& B_attr);
     bool ensure_ac(int M);
     bool rebuild_ac(int M);
     bool bind_ac(int M, bool quiet = false);
@@ -54,8 +65,10 @@ private:
     void release_ac();
 
     int K_ = 0, N_ = 0;
+    std::string cache_key_;
     bool has_core_mask_ = false;
     rknn_core_mask core_mask_ = RKNN_NPU_CORE_AUTO;
+    bool output_f32_ = false;
 
     rknn_matmul_ctx     ctx_ = 0;
     rknn_matmul_io_attr io_attr_{};

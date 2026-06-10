@@ -6,13 +6,13 @@
 #include <string>
 #include <vector>
 
-class NpuLinearW8 : public ILinearOp {
+class NpuLinearI4 : public ILinearOp {
 public:
-    NpuLinearW8() = default;
-    ~NpuLinearW8() override { destroy(); }
+    NpuLinearI4() = default;
+    ~NpuLinearI4() override { destroy(); }
 
-    NpuLinearW8(const NpuLinearW8&) = delete;
-    NpuLinearW8& operator=(const NpuLinearW8&) = delete;
+    NpuLinearI4(const NpuLinearI4&) = delete;
+    NpuLinearI4& operator=(const NpuLinearI4&) = delete;
 
     bool init(int K, int N, const uint16_t* weight_kn) override;
     void set_cache_key(const std::string& key) override { cache_key_ = key; }
@@ -31,11 +31,8 @@ public:
     void destroy() override;
 
     void set_core_mask(rknn_core_mask mask);
-    static float quantize_input_row(int K, const uint16_t* input_f16, int8_t* input_i8);
 
 private:
-    static float quantize_float_row(int K, const float* input, int8_t* input_i8);
-
     bool configure_shape(int K, int N);
     bool create_context_and_b();
     rknn_matmul_tensor_attr current_b_attr() const;
@@ -47,17 +44,15 @@ private:
     bool bind_ac(int M, bool quiet = false);
     int dynamic_index_for_m(int M) const;
     void release_ac();
-    void scale_output_f16(const int32_t* raw, const float* input_scales,
-                          int M, uint16_t* out) const;
-    float quantize_current_input(const uint16_t* input_f16, int8_t* input_i8);
+    float quantize_current_input(const uint16_t* input_f16, uint8_t* input_i4);
     bool run_prepared_raw(std::vector<float>* input_scales);
+    void scale_output_f16(const int16_t* raw, const float* input_scales,
+                          int M, uint16_t* out) const;
 
-    int K_ = 0;         // original input width
-    int K_matmul_ = 0;  // actual RKNN matmul width
+    int K_ = 0;
+    int K_matmul_ = 0;
     int N_ = 0;
     std::string cache_key_;
-    bool use_hadamard_ = false;
-    int hadamard_block_ = 0;
     bool has_core_mask_ = false;
     rknn_core_mask core_mask_ = RKNN_NPU_CORE_AUTO;
 
@@ -75,7 +70,6 @@ private:
     int alloc_M_ = 0;
     int prepared_M_ = 0;
     std::vector<float> scales_;
-    std::vector<float> hadamard_buf_;
     std::vector<float> prepared_input_scales_;
     std::vector<uint16_t> prepared_input_f16_;
     std::vector<uint16_t> prepared_output_f16_;

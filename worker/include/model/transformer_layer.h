@@ -14,6 +14,8 @@
 struct TransformerLayer {
     // --- Attention ---
     std::vector<float>          input_layernorm;   // [hidden]
+    // NPU 路径默认使用 qkv_proj，把 q/k/v 三个矩阵合成一次 matmul；
+    // CPU 或调试路径可以退回 q_proj/k_proj/v_proj 三个独立 matmul。
     std::unique_ptr<ILinearOp>  qkv_proj;          // optional fused [hidden, hidden + 2 * kv_dim]
     std::unique_ptr<ILinearOp>  q_proj;            // [hidden, hidden]
     std::unique_ptr<ILinearOp>  k_proj;            // [hidden, kv_dim]
@@ -25,6 +27,8 @@ struct TransformerLayer {
 
     // --- FFN ---
     std::vector<float>          post_attention_layernorm;  // [hidden]
+    // NPU 路径默认使用 gate_up_proj，一次算出 SwiGLU 的 gate 和 up。
+    // 后续 CPU SiLU(gate)*up 得到 down_proj 的输入。
     std::unique_ptr<ILinearOp>  gate_up_proj; // optional fused [hidden, 2 * intermediate]
     std::unique_ptr<ILinearOp>  gate_proj;   // [hidden, intermediate]
     std::unique_ptr<ILinearOp>  up_proj;     // [hidden, intermediate]

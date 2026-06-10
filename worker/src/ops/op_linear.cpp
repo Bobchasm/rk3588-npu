@@ -1,6 +1,7 @@
 #include "ops/op_linear.h"
 
 #include "backend/cpu_linear.h"
+#include "backend/npu_linear_i4.h"
 #include "backend/npu_linear.h"
 #include "backend/npu_linear_w8.h"
 #include "backend/sharded_npu_linear.h"
@@ -110,6 +111,77 @@ bool autotune_enabled() {
                  std::strcmp(v, "ON") == 0);
 }
 
+bool env_flag_enabled(const char* v) {
+    return v && v[0] != '\0' &&
+           std::strcmp(v, "0") != 0 &&
+           std::strcmp(v, "false") != 0 &&
+           std::strcmp(v, "FALSE") != 0 &&
+           std::strcmp(v, "off") != 0 &&
+           std::strcmp(v, "OFF") != 0 &&
+           std::strcmp(v, "none") != 0 &&
+           std::strcmp(v, "NONE") != 0;
+}
+
+int env_int_or_default(const char* name, int fallback, int min_value, int max_value) {
+    const char* v = std::getenv(name);
+    if (!v || v[0] == '\0') {
+        return fallback;
+    }
+    char* end = nullptr;
+    long parsed = std::strtol(v, &end, 10);
+    if (end == v || parsed < min_value) {
+        std::fprintf(stderr, "[LinearPlanner] invalid %s=%s, use %d\n",
+                     name, v, fallback);
+        return fallback;
+    }
+    if (parsed > max_value) {
+        parsed = max_value;
+    }
+    return (int)parsed;
+}
+
+bool hybrid_cpu_scope_matches(const char* role) {
+    const char* scope = std::getenv("RKLLM_HYBRID_CPU_SHARD");
+    if (!env_flag_enabled(scope)) {
+        return false;
+    }
+    const bool is_gate_up = role && std::strcmp(role, "gate_up") == 0;
+    const bool is_down = role && std::strcmp(role, "down") == 0;
+    if (std::strcmp(scope, "gate_up") == 0) {
+        return is_gate_up;
+    }
+    if (std::strcmp(scope, "down") == 0 ||
+        std::strcmp(scope, "down_proj") == 0) {
+        return is_down;
+    }
+    if (std::strcmp(scope, "mlp") == 0 ||
+        std::strcmp(scope, "all") == 0) {
+        return is_gate_up || is_down;
+    }
+    std::fprintf(stderr,
+                 "[LinearPlanner] unknown RKLLM_HYBRID_CPU_SHARD=%s, use off\n",
+                 scope);
+    return false;
+}
+
+int hybrid_cpu_ratio() {
+    return env_int_or_default("RKLLM_HYBRID_CPU_RATIO", 5, 1, 25);
+}
+
+bool down_ksplit_enabled(int K, int N, const char* role) {
+    const char* v = std::getenv("RKLLM_DOWN_KSPLIT");
+    if (!env_flag_enabled(v)) {
+        return false;
+    }
+    const bool is_down = role ? std::strcmp(role, "down") == 0
+                              : (K == 8960 && N == 1536);
+    return is_down && K > 8192;
+}
+
+int down_ksplit_chunk_k() {
+    return env_int_or_default("RKLLM_DOWN_KSPLIT_K", 4480, 16, 8192);
+}
+
 bool npu_weight_int8_enabled() {
     const char* v = std::getenv("RKLLM_NPU_WEIGHT_DTYPE");
     if (v && (std::strcmp(v, "w8a16") == 0 ||
@@ -128,6 +200,16 @@ bool npu_weight_int8_enabled() {
                  std::strcmp(v, "A8W8") == 0 ||
                  std::strcmp(v, "w8") == 0 ||
                  std::strcmp(v, "W8") == 0);
+}
+
+bool npu_weight_int4_enabled() {
+    const char* v = std::getenv("RKLLM_NPU_WEIGHT_DTYPE");
+    return v && (std::strcmp(v, "int4") == 0 ||
+                 std::strcmp(v, "INT4") == 0 ||
+                 std::strcmp(v, "a4w4") == 0 ||
+                 std::strcmp(v, "A4W4") == 0 ||
+                 std::strcmp(v, "w4") == 0 ||
+                 std::strcmp(v, "W4") == 0);
 }
 
 bool token_eq(const char* begin, const char* end, const char* expected) {
@@ -217,12 +299,32 @@ bool npu_int8_for_context(int K, int N, int layer_idx, const char* role) {
     const bool has_role = role && role[0] != '\0';
     const bool is_gate_up = has_role ? std::strcmp(role, "gate_up") == 0
                                      : (K == 1536 && N == 17920);
+    const bool is_qkv = has_role ? std::strcmp(role, "qkv") == 0
+                                 : (K == 1536 && N == 2048);
+    const bool is_o_proj = has_role ? std::strcmp(role, "o_proj") == 0
+                                    : (K == 1536 && N == 1536);
+    const bool is_down = has_role ? std::strcmp(role, "down") == 0
+                                  : (K == 8960 && N == 1536);
+    const bool is_lm_head = has_role ? std::strcmp(role, "lm_head") == 0
+                                     : (K == 1536 && N > 100000);
     const char* scope = std::getenv("RKLLM_NPU_INT8_SCOPE");
     if (!scope || scope[0] == '\0') {
         return is_gate_up;
     }
     if (std::strcmp(scope, "gate_up") == 0) {
         return is_gate_up;
+    }
+    if (std::strcmp(scope, "mlp") == 0) {
+        return is_gate_up || is_down;
+    }
+    if (std::strcmp(scope, "attn") == 0) {
+        return is_qkv || is_o_proj;
+    }
+    if (std::strcmp(scope, "lm_head") == 0) {
+        return is_lm_head;
+    }
+    if (std::strcmp(scope, "all") == 0) {
+        return true;
     }
     if (std::strcmp(scope, "off") == 0 || std::strcmp(scope, "none") == 0) {
         return false;
@@ -233,9 +335,62 @@ bool npu_int8_for_context(int K, int N, int layer_idx, const char* role) {
     return is_gate_up;
 }
 
+bool npu_int4_for_context(int K, int N, int layer_idx, const char* role) {
+    if (!npu_weight_int4_enabled()) {
+        return false;
+    }
+    if (!npu_int8_layer_allowed(layer_idx)) {
+        return false;
+    }
+
+    const bool has_role = role && role[0] != '\0';
+    const bool is_gate_up = has_role ? std::strcmp(role, "gate_up") == 0
+                                     : (K == 1536 && N == 17920);
+    const bool is_qkv = has_role ? std::strcmp(role, "qkv") == 0
+                                 : (K == 1536 && N == 2048);
+    const bool is_o_proj = has_role ? std::strcmp(role, "o_proj") == 0
+                                    : (K == 1536 && N == 1536);
+    const bool is_down = has_role ? std::strcmp(role, "down") == 0
+                                  : (K == 8960 && N == 1536);
+    const bool is_lm_head = has_role ? std::strcmp(role, "lm_head") == 0
+                                     : (K == 1536 && N > 100000);
+    const char* scope = std::getenv("RKLLM_NPU_INT4_SCOPE");
+    if (!scope || scope[0] == '\0') {
+        scope = std::getenv("RKLLM_NPU_INT8_SCOPE");
+    }
+    if (!scope || scope[0] == '\0') {
+        return is_gate_up;
+    }
+    if (std::strcmp(scope, "gate_up") == 0) {
+        return is_gate_up;
+    }
+    if (std::strcmp(scope, "mlp") == 0) {
+        return is_gate_up || is_down;
+    }
+    if (std::strcmp(scope, "attn") == 0) {
+        return is_qkv || is_o_proj;
+    }
+    if (std::strcmp(scope, "lm_head") == 0) {
+        return is_lm_head;
+    }
+    if (std::strcmp(scope, "all") == 0) {
+        return true;
+    }
+    if (std::strcmp(scope, "off") == 0 || std::strcmp(scope, "none") == 0) {
+        return false;
+    }
+    std::fprintf(stderr,
+                 "[LinearPlanner] unknown RKLLM_NPU_INT4_SCOPE=%s, use gate_up\n",
+                 scope);
+    return is_gate_up;
+}
+
 std::unique_ptr<ILinearOp> make_single_npu_impl(int K = 0, int N = 0,
                                                 int layer_idx = -1,
                                                 const char* role = nullptr) {
+    if (npu_int4_for_context(K, N, layer_idx, role)) {
+        return std::unique_ptr<ILinearOp>(new NpuLinearI4());
+    }
     if (npu_int8_for_context(K, N, layer_idx, role)) {
         return std::unique_ptr<ILinearOp>(new NpuLinearW8());
     }
@@ -409,20 +564,34 @@ public:
         const char* role = role_.empty() ? nullptr : role_.c_str();
         if (selected_ == LinearBackend::NPU_SHARDED) {
             std::unique_ptr<ShardedNpuLinear> sharded(new ShardedNpuLinear());
+            sharded->set_allow_a4w4(npu_int4_for_context(K, N, layer_idx_, role));
             sharded->set_allow_a8w8(npu_int8_for_context(K, N, layer_idx_, role));
+            sharded->set_gate_up_pair_layout(role && std::strcmp(role, "gate_up") == 0);
+            sharded->set_hybrid_cpu_shard(hybrid_cpu_scope_matches(role),
+                                          hybrid_cpu_ratio());
+            const bool down_ksplit = down_ksplit_enabled(K, N, role);
+            sharded->set_k_shard_accumulate(down_ksplit);
+            sharded->set_k_split_accumulate(false, down_ksplit_chunk_k());
             impl_ = std::move(sharded);
         } else {
             impl_ = make_single_npu_impl(K, N, layer_idx_, role);
         }
+        if (impl_) {
+            impl_->set_cache_key(cache_key_);
+        }
         if (!impl_ || !impl_->init(K, N, weight_kn)) {
             if (impl_) impl_->destroy();
 
-            if (selected_ == LinearBackend::NPU_SHARDED) {
+            if (requested_backend_ == LinearBackend::NPU &&
+                selected_ == LinearBackend::NPU_SHARDED) {
                 std::fprintf(stderr,
                              "[LinearPlanner] sharded init failed K=%d N=%d, fallback single NPU\n",
                              K, N);
                 selected_ = LinearBackend::NPU_SINGLE;
                 impl_ = make_single_npu_impl(K, N, layer_idx_, role);
+                if (impl_) {
+                    impl_->set_cache_key(cache_key_);
+                }
                 if (impl_ && impl_->init(K, N, weight_kn)) {
                     return true;
                 }
@@ -434,6 +603,7 @@ public:
                              "[LinearPlanner] W8 init failed K=%d N=%d, fallback FP16\n",
                              K, N);
                 impl_.reset(new NpuLinear());
+                impl_->set_cache_key(cache_key_);
                 if (impl_ && impl_->init(K, N, weight_kn)) {
                     return true;
                 }
@@ -443,6 +613,74 @@ public:
             return false;
         }
         return true;
+    }
+
+    void set_cache_key(const std::string& key) override {
+        cache_key_ = key;
+        if (impl_) {
+            impl_->set_cache_key(key);
+        }
+    }
+
+    bool init_from_cache(int K, int N) override {
+        destroy();
+
+        if (hybrid_cpu_scope_matches(role_.empty() ? nullptr : role_.c_str())) {
+            return false;
+        }
+
+        std::vector<LinearBackend> candidates;
+        if (requested_backend_ == LinearBackend::NPU) {
+            // 自动 NPU 模式没有原始权重时无法 autotune，只能按当前规划规则
+            // 先猜一个后端。为了兼容历史缓存和环境变量变化，再尝试另一个
+            // NPU 形态；两者都 miss 时模型层会回到 safetensors 冷加载。
+            const LinearBackend planned = should_shard_npu_linear(K, N)
+                ? LinearBackend::NPU_SHARDED
+                : LinearBackend::NPU_SINGLE;
+            candidates.push_back(planned);
+            candidates.push_back(planned == LinearBackend::NPU_SHARDED
+                ? LinearBackend::NPU_SINGLE
+                : LinearBackend::NPU_SHARDED);
+        } else {
+            candidates.push_back(requested_backend_);
+        }
+
+        for (LinearBackend candidate : candidates) {
+            selected_ = candidate;
+            const char* role = role_.empty() ? nullptr : role_.c_str();
+            if (selected_ == LinearBackend::NPU_SHARDED) {
+                std::unique_ptr<ShardedNpuLinear> sharded(new ShardedNpuLinear());
+                sharded->set_allow_a4w4(npu_int4_for_context(K, N, layer_idx_, role));
+                sharded->set_allow_a8w8(npu_int8_for_context(K, N, layer_idx_, role));
+                // gate_up 的三核分片不是普通连续 N 切分，而是每个 shard
+                // 同时带 gate_slice 和 up_slice；缓存 key 和运行时输出解释
+                // 都需要知道这个布局。
+                sharded->set_gate_up_pair_layout(role && std::strcmp(role, "gate_up") == 0);
+                sharded->set_hybrid_cpu_shard(hybrid_cpu_scope_matches(role),
+                                              hybrid_cpu_ratio());
+                const bool down_ksplit = down_ksplit_enabled(K, N, role);
+                sharded->set_k_shard_accumulate(down_ksplit);
+                sharded->set_k_split_accumulate(false, down_ksplit_chunk_k());
+                impl_ = std::move(sharded);
+            } else {
+                impl_ = make_single_npu_impl(K, N, layer_idx_, role);
+            }
+
+            if (impl_) {
+                impl_->set_cache_key(cache_key_);
+                if (impl_->init_from_cache(K, N)) {
+                    if (requested_backend_ == LinearBackend::NPU) {
+                        cache_plan(K, N, selected_);
+                    }
+                    return true;
+                }
+                impl_->destroy();
+                impl_.reset();
+            }
+        }
+
+        selected_ = LinearBackend::NPU_SINGLE;
+        return false;
     }
 
     bool forward(const uint16_t* input_f16, int M, uint16_t* output_f16) override {
@@ -467,6 +705,23 @@ public:
 
     const uint16_t* forward_prepared_output_f16() override {
         return impl_ ? impl_->forward_prepared_output_f16() : nullptr;
+    }
+
+    const float* forward_prepared_output_f32() override {
+        return impl_ ? impl_->forward_prepared_output_f32() : nullptr;
+    }
+
+    bool forward_prepared_output_shards_f16(const uint16_t** outputs,
+                                            int* offsets,
+                                            int* sizes,
+                                            int max_shards,
+                                            int* num_shards) override {
+        return impl_ && impl_->forward_prepared_output_shards_f16(
+            outputs, offsets, sizes, max_shards, num_shards);
+    }
+
+    bool prepared_output_shards_are_gate_up_pairs() const override {
+        return impl_ && impl_->prepared_output_shards_are_gate_up_pairs();
     }
 
     bool forward_prepared_accumulate(float* accum_f32) override {
@@ -499,6 +754,7 @@ private:
     LinearBackend selected_ = LinearBackend::NPU_SINGLE;
     int layer_idx_ = -1;
     std::string role_;
+    std::string cache_key_;
     std::unique_ptr<ILinearOp> impl_;
 };
 

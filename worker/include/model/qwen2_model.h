@@ -5,9 +5,12 @@
 #include "ops/op_linear.h"
 
 #include <cstdint>
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <vector>
+
+struct TensorMeta;
 
 // ============================================================
 // Qwen2Model: 模型组织层
@@ -46,6 +49,12 @@ public:
 
 private:
     struct ForwardScratch {
+        // forward_internal() 的临时工作区。放在模型对象里复用容量，
+        // 避免每个 token 都重新申请大块 vector。
+        //
+        // 命名约定：
+        //   *_f16: 准备送入/接收自 NPU 的 FP16 buffer
+        //   其余 float vector: CPU 侧计算使用的 FP32 buffer
         std::vector<float> hidden;
         std::vector<float> q;
         std::vector<float> k;
@@ -68,10 +77,20 @@ private:
 
     int forward_internal(const std::vector<int>& tokens);
     void ensure_rope_cache(int required_positions);
+    bool map_embedding_weight(const std::string& sf_path, const TensorMeta& meta);
+    void unmap_embedding_weight();
 
     Qwen2Config config_;
 
+    // 权重组织：
+    //   embed_tokens_ 和 norm_weight_ 由 CPU 直接访问；
+    //   layers_ 内的 Linear 权重已经交给具体后端持有，NPU 后端会把权重
+    //   转成 RKNN native B buffer，CPU 后端则保留普通 [K, N]。
     std::vector<uint16_t>                           embed_tokens_;  // [vocab, hidden]
+    const void*                                     embed_tokens_mmap_ = nullptr;
+    size_t                                          embed_tokens_mmap_bytes_ = 0;
+    const void*                                     embed_tokens_view_ = nullptr;
+    int                                             embed_tokens_dtype_ = 0;
     std::vector<std::unique_ptr<TransformerLayer>>  layers_;
     std::vector<float>                              norm_weight_;   // [hidden]
     std::unique_ptr<ILinearOp>                      lm_head_;       // [hidden, vocab]

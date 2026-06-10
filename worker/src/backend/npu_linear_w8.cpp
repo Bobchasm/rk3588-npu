@@ -1,6 +1,8 @@
 #include "backend/npu_linear_w8.h"
 
+#include "backend/npu_weight_cache.h"
 #include "core/half.h"
+#include "ops/op_cast.h"
 
 #include <algorithm>
 #include <cmath>
@@ -54,6 +56,21 @@ bool a8w8_neon_quant_enabled() {
 
 bool a8w8_hadamard_enabled() {
     return env_flag_enabled(std::getenv("RKLLM_A8W8_HADAMARD"));
+}
+
+int linear_batch_limit_w8() {
+    constexpr int kDefaultBatchRows = 1;
+    const char* batch = std::getenv("RKLLM_LINEAR_BATCH");
+    if (!batch || batch[0] == '\0') {
+        return kDefaultBatchRows;
+    }
+
+    char* end = nullptr;
+    long parsed = std::strtol(batch, &end, 10);
+    if (end == batch || parsed <= 1) {
+        return 1;
+    }
+    return std::min<long>(parsed, 512);
 }
 
 bool is_power_of_two(int v) {
@@ -136,11 +153,8 @@ void fwht_matrix_k(float* data, int K, int N) {
 
 }  // namespace
 
-bool NpuLinearW8::init(int K, int N, const uint16_t* weight_kn) {
-    destroy();
-    ensure_nofile_limit_w8();
-
-    if (K <= 0 || N <= 0 || !weight_kn) {
+bool NpuLinearW8::configure_shape(int K, int N) {
+    if (K <= 0 || N <= 0) {
         std::fprintf(stderr, "[NpuLinearW8] invalid init args K=%d N=%d\n", K, N);
         return false;
     }
@@ -150,6 +164,8 @@ bool NpuLinearW8::init(int K, int N, const uint16_t* weight_kn) {
     }
 
     K_ = K;
+    // A8W8 的 hadamard 模式会改变实际 matmul K 和权重预处理方式，
+    // 所以 K_matmul_ 与 hadamard_block_ 必须进入 cache key/header flags。
     use_hadamard_ = a8w8_hadamard_enabled();
     hadamard_block_ = 0;
     if (use_hadamard_) {
@@ -162,7 +178,109 @@ bool NpuLinearW8::init(int K, int N, const uint16_t* weight_kn) {
         K_matmul_ = K_;
     }
     N_ = N;
+    return true;
+}
 
+bool NpuLinearW8::create_context_and_b() {
+    rknn_matmul_info info{};
+    info.M = 1;
+    info.K = K_matmul_;
+    info.N = N_;
+    info.type = RKNN_INT8_MM_INT8_TO_INT32;
+    info.B_layout = 1;
+    info.AC_layout = 0;
+    info.B_quant_type = 0;
+    info.AC_quant_type = 0;
+
+    int ret = 0;
+    dynamic_max_m_ = linear_batch_limit_w8();
+    if (dynamic_max_m_ > 1) {
+        dynamic_shapes_.resize(2);
+        dynamic_io_attrs_.resize(2);
+        dynamic_shapes_[0] = rknn_matmul_shape{1, K_matmul_, N_};
+        dynamic_shapes_[1] = rknn_matmul_shape{dynamic_max_m_, K_matmul_, N_};
+        ret = rknn_matmul_create_dynamic_shape(
+            &ctx_, &info, (int)dynamic_shapes_.size(),
+            dynamic_shapes_.data(), dynamic_io_attrs_.data());
+        if (ret < 0) {
+            std::fprintf(stderr,
+                         "[NpuLinearW8] dynamic shape create failed: %d (K=%d N=%d maxM=%d), fallback static M=1\n",
+                         ret, K_matmul_, N_, dynamic_max_m_);
+            ctx_ = 0;
+            dynamic_shapes_.clear();
+            dynamic_io_attrs_.clear();
+            dynamic_m_ = false;
+            dynamic_max_m_ = 1;
+        } else {
+            dynamic_m_ = true;
+            io_attr_ = dynamic_io_attrs_[0];
+        }
+    }
+
+    if (!ctx_) {
+        ret = rknn_matmul_create(&ctx_, &info, &io_attr_);
+        if (ret < 0) {
+            std::fprintf(stderr, "[NpuLinearW8] rknn_matmul_create failed: %d (K=%d N=%d)\n",
+                         ret, K_matmul_, N_);
+            destroy();
+            return false;
+        }
+    }
+
+    if (has_core_mask_) {
+        ret = rknn_matmul_set_core_mask(ctx_, core_mask_);
+        if (ret < 0) {
+            std::fprintf(stderr, "[NpuLinearW8] rknn_matmul_set_core_mask failed: %d\n", ret);
+            destroy();
+            return false;
+        }
+    }
+
+    const rknn_matmul_tensor_attr B_attr = current_b_attr();
+    B_mem_ = rknn_create_mem(ctx_, B_attr.size);
+    if (!B_mem_) {
+        std::fprintf(stderr, "[NpuLinearW8] rknn_create_mem(B) failed\n");
+        destroy();
+        return false;
+    }
+    return true;
+}
+
+rknn_matmul_tensor_attr NpuLinearW8::current_b_attr() const {
+    return dynamic_m_ ? dynamic_io_attrs_[0].B : io_attr_.B;
+}
+
+bool NpuLinearW8::bind_b_mem() {
+    rknn_matmul_tensor_attr B_attr = current_b_attr();
+    const int ret = rknn_matmul_set_io_mem(ctx_, B_mem_, &B_attr);
+    if (ret < 0) {
+        std::fprintf(stderr, "[NpuLinearW8] rknn_matmul_set_io_mem(B) failed: %d\n", ret);
+        destroy();
+        return false;
+    }
+    return true;
+}
+
+uint32_t NpuLinearW8::cache_flags() const {
+    uint32_t flags = use_hadamard_ ? 1u : 0u;
+    flags |= ((uint32_t)(hadamard_block_ & 0xffff)) << 8;
+    return flags;
+}
+
+bool NpuLinearW8::init(int K, int N, const uint16_t* weight_kn) {
+    destroy();
+    ensure_nofile_limit_w8();
+
+    if (!weight_kn) {
+        std::fprintf(stderr, "[NpuLinearW8] invalid init args K=%d N=%d\n", K, N);
+        return false;
+    }
+    if (!configure_shape(K, N)) {
+        return false;
+    }
+
+    // A8W8 冷加载：先把 FP16 权重按列量化成 int8，并保存每列 scale。
+    // 这些 scale 是推理时 int32 输出反量化回 FP16/FP32 的必要数据。
     std::vector<int8_t> weight_i8((size_t)K_matmul_ * N_);
     scales_.assign(N_, 1.0f);
     if (use_hadamard_) {
@@ -211,6 +329,10 @@ bool NpuLinearW8::init(int K, int N, const uint16_t* weight_kn) {
         }
     }
 
+    if (!create_context_and_b()) {
+        return false;
+    }
+
     rknn_matmul_info info{};
     info.M = 1;
     info.K = K_matmul_;
@@ -221,43 +343,36 @@ bool NpuLinearW8::init(int K, int N, const uint16_t* weight_kn) {
     info.B_quant_type = 0;
     info.AC_quant_type = 0;
 
-    int ret = rknn_matmul_create(&ctx_, &info, &io_attr_);
+    int ret = rknn_B_normal_layout_to_native_layout(weight_i8.data(), B_mem_->virt_addr,
+                                                    K_matmul_, N_, &info);
     if (ret < 0) {
-        std::fprintf(stderr, "[NpuLinearW8] rknn_matmul_create failed: %d (K=%d N=%d)\n",
-                     ret, K_matmul_, N_);
+        std::fprintf(stderr,
+                     "[NpuLinearW8] rknn_B_normal_layout_to_native_layout failed: %d\n",
+                     ret);
         destroy();
         return false;
     }
 
-    auto fail = [this](const char* msg, int code) {
-        if (code < 0) {
-            std::fprintf(stderr, "[NpuLinearW8] %s failed: %d\n", msg, code);
-        } else {
-            std::fprintf(stderr, "[NpuLinearW8] %s failed\n", msg);
-        }
-        destroy();
+    if (!cache_key_.empty()) {
+        // A8W8 缓存除了 native B，还必须保存 scales_。否则 warm-load
+        // 虽然能跑 matmul，但无法把 int32 输出恢复到正确数值尺度。
+        npu_weight_cache::CacheSpec spec;
+        spec.key = cache_key_;
+        spec.kind = npu_weight_cache::CACHE_KIND_A8W8_NATIVE;
+        spec.K = K_;
+        spec.N = N_;
+        spec.K_matmul = K_matmul_;
+        spec.flags = cache_flags();
+        const rknn_matmul_tensor_attr B_attr = current_b_attr();
+        spec.packed_bytes = B_attr.size;
+        spec.aux_bytes = scales_.size() * sizeof(float);
+        npu_weight_cache::write(spec,
+                                B_mem_->virt_addr, B_attr.size,
+                                scales_.data(), scales_.size() * sizeof(float));
+    }
+
+    if (!bind_b_mem()) {
         return false;
-    };
-
-    if (has_core_mask_) {
-        ret = rknn_matmul_set_core_mask(ctx_, core_mask_);
-        if (ret < 0) {
-            return fail("rknn_matmul_set_core_mask", ret);
-        }
-    }
-
-    B_mem_ = rknn_create_mem(ctx_, io_attr_.B.size);
-    if (!B_mem_) {
-        return fail("rknn_create_mem(B)", 0);
-    }
-    ret = rknn_B_normal_layout_to_native_layout(weight_i8.data(), B_mem_->virt_addr,
-                                                K_matmul_, N_, &info);
-    if (ret < 0) {
-        return fail("rknn_B_normal_layout_to_native_layout", ret);
-    }
-    ret = rknn_matmul_set_io_mem(ctx_, B_mem_, &io_attr_.B);
-    if (ret < 0) {
-        return fail("rknn_matmul_set_io_mem(B)", ret);
     }
 
     std::fprintf(stderr, "[NpuLinearA8W8] init K=%d", K_);
@@ -272,12 +387,71 @@ bool NpuLinearW8::init(int K, int N, const uint16_t* weight_kn) {
     return true;
 }
 
+bool NpuLinearW8::init_from_cache(int K, int N) {
+    if (cache_key_.empty() || !npu_weight_cache::enabled()) {
+        return false;
+    }
+
+    destroy();
+    ensure_nofile_limit_w8();
+    if (!configure_shape(K, N)) {
+        return false;
+    }
+
+    npu_weight_cache::CacheSpec spec;
+    spec.key = cache_key_;
+    spec.kind = npu_weight_cache::CACHE_KIND_A8W8_NATIVE;
+    spec.K = K_;
+    spec.N = N_;
+    spec.K_matmul = K_matmul_;
+    spec.flags = cache_flags();
+    // 和 FP16 一样，先轻量探测缓存文件，避免 cold miss 时创建 RKNN context。
+    if (!npu_weight_cache::exists(spec)) {
+        destroy();
+        return false;
+    }
+
+    scales_.resize((size_t)N_);
+    if (!create_context_and_b()) {
+        return false;
+    }
+    // context 创建后才知道 RKNN native B 的真实字节数，用它校验 header。
+    const rknn_matmul_tensor_attr B_attr = current_b_attr();
+    spec.packed_bytes = B_attr.size;
+    spec.aux_bytes = scales_.size() * sizeof(float);
+
+    if (!npu_weight_cache::read(spec,
+                                B_mem_->virt_addr, B_attr.size,
+                                scales_.data(), scales_.size() * sizeof(float))) {
+        destroy();
+        return false;
+    }
+    if (!bind_b_mem()) {
+        return false;
+    }
+    std::fprintf(stderr, "[NpuLinearA8W8] init K=%d", K_);
+    if (use_hadamard_) {
+        if (K_matmul_ != K_) {
+            std::fprintf(stderr, "->%d hadamard", K_matmul_);
+        } else {
+            std::fprintf(stderr, " hadamard_block=%d", hadamard_block_);
+        }
+    }
+    std::fprintf(stderr, " N=%d cache\n", N_);
+    return true;
+}
+
 bool NpuLinearW8::rebuild_ac(int M) {
     release_ac();
-    if (M != 1) return false;
 
-    A_mem_ = rknn_create_mem(ctx_, io_attr_.A.size);
-    C_mem_ = rknn_create_mem(ctx_, io_attr_.C.size);
+    uint32_t A_size = 0;
+    uint32_t C_size = 0;
+    if (!ac_sizes(M, &A_size, &C_size)) {
+        return false;
+    }
+
+    A_mem_ = rknn_create_mem(ctx_, A_size);
+    C_mem_ = rknn_create_mem(ctx_, C_size);
     auto cleanup = [this]() {
         if (A_mem_) { rknn_destroy_mem(ctx_, A_mem_); A_mem_ = nullptr; }
         if (C_mem_) { rknn_destroy_mem(ctx_, C_mem_); C_mem_ = nullptr; }
@@ -298,19 +472,83 @@ bool NpuLinearW8::rebuild_ac(int M) {
 }
 
 bool NpuLinearW8::bind_ac(int M, bool quiet) {
-    if (M != 1) return false;
-    int ret = rknn_matmul_set_io_mem(ctx_, A_mem_, &io_attr_.A);
+    if (dynamic_m_) {
+        const int shape_idx = dynamic_index_for_m(M);
+        if (shape_idx < 0) {
+            if (!quiet) {
+                std::fprintf(stderr,
+                             "[NpuLinearW8] unsupported dynamic M=%d maxM=%d\n",
+                             M, dynamic_max_m_);
+            }
+            return false;
+        }
+        rknn_matmul_shape shape = dynamic_shapes_[(size_t)shape_idx];
+        int ret = rknn_matmul_set_dynamic_shape(ctx_, &shape);
+        if (ret < 0) {
+            if (!quiet) {
+                std::fprintf(stderr, "[NpuLinearW8] set dynamic shape M=%d failed: %d\n",
+                             M, ret);
+            }
+            return false;
+        }
+    } else if (M != 1) {
+        return false;
+    }
+
+    const int shape_idx = dynamic_m_ ? dynamic_index_for_m(M) : -1;
+    rknn_matmul_tensor_attr A_attr = dynamic_m_
+        ? dynamic_io_attrs_[(size_t)shape_idx].A
+        : io_attr_.A;
+    rknn_matmul_tensor_attr C_attr = dynamic_m_
+        ? dynamic_io_attrs_[(size_t)shape_idx].C
+        : io_attr_.C;
+
+    int ret = rknn_matmul_set_io_mem(ctx_, A_mem_, &A_attr);
     if (ret < 0) {
         if (!quiet) std::fprintf(stderr, "[NpuLinearW8] set A failed: %d\n", ret);
         return false;
     }
-    ret = rknn_matmul_set_io_mem(ctx_, C_mem_, &io_attr_.C);
+    ret = rknn_matmul_set_io_mem(ctx_, C_mem_, &C_attr);
     if (ret < 0) {
         if (!quiet) std::fprintf(stderr, "[NpuLinearW8] set C failed: %d\n", ret);
         return false;
     }
     cur_M_ = M;
     return true;
+}
+
+bool NpuLinearW8::ac_sizes(int M, uint32_t* A_size, uint32_t* C_size) const {
+    if (!A_size || !C_size || M <= 0) {
+        return false;
+    }
+    if (dynamic_m_) {
+        const int shape_idx = dynamic_index_for_m(M);
+        if (shape_idx < 0) {
+            return false;
+        }
+        *A_size = dynamic_io_attrs_[(size_t)shape_idx].A.size;
+        *C_size = dynamic_io_attrs_[(size_t)shape_idx].C.size;
+        return true;
+    }
+    if (M != 1) {
+        return false;
+    }
+    *A_size = io_attr_.A.size;
+    *C_size = io_attr_.C.size;
+    return true;
+}
+
+int NpuLinearW8::dynamic_index_for_m(int M) const {
+    if (!dynamic_m_) {
+        return -1;
+    }
+    if (M == 1) {
+        return 0;
+    }
+    if (M == dynamic_max_m_ && dynamic_io_attrs_.size() >= 2) {
+        return 1;
+    }
+    return -1;
 }
 
 bool NpuLinearW8::ensure_ac(int M) {
@@ -321,6 +559,18 @@ bool NpuLinearW8::ensure_ac(int M) {
         return bind_ac(M, true) || rebuild_ac(M);
     }
     return true;
+}
+
+uint16_t* NpuLinearW8::prepare_input_f16(int M) {
+    if (!ctx_ || K_ <= 0 || K_matmul_ <= 0 || N_ <= 0 || M <= 0) {
+        return nullptr;
+    }
+    if (!ensure_ac(M)) {
+        return nullptr;
+    }
+    prepared_input_f16_.resize((size_t)M * K_);
+    prepared_M_ = M;
+    return prepared_input_f16_.data();
 }
 
 float NpuLinearW8::quantize_input_row(int K, const uint16_t* input_f16, int8_t* input_i8) {
@@ -412,8 +662,11 @@ float NpuLinearW8::quantize_current_input(const uint16_t* input_f16, int8_t* inp
     return quantize_float_row(K_matmul_, hadamard_buf_.data(), input_i8);
 }
 
-void NpuLinearW8::scale_output_f16(const int32_t* raw, float input_scale,
+void NpuLinearW8::scale_output_f16(const int32_t* raw, const float* input_scales,
                                    int M, uint16_t* out) const {
+    if (!input_scales) {
+        return;
+    }
     const float divisor = use_hadamard_ ? (float)hadamard_block_ : 1.0f;
     for (int m = 0; m < M; ++m) {
         const int32_t* src = raw + (size_t)m * N_;
@@ -421,7 +674,7 @@ void NpuLinearW8::scale_output_f16(const int32_t* raw, float input_scale,
         int n = 0;
 #if defined(__aarch64__)
         const float* scales = scales_.data();
-        const float32x4_t input_scale_v = vdupq_n_f32(input_scale / divisor);
+        const float32x4_t input_scale_v = vdupq_n_f32(input_scales[m] / divisor);
         for (; n + 4 <= N_; n += 4) {
             float32x4_t v = vcvtq_f32_s32(vld1q_s32(src + n));
             v = vmulq_f32(v, vld1q_f32(scales + n));
@@ -431,31 +684,111 @@ void NpuLinearW8::scale_output_f16(const int32_t* raw, float input_scale,
         }
 #endif
         for (; n < N_; ++n) {
-            dst[n] = f32_to_f16((float)src[n] * input_scale * scales_[n] / divisor);
+            dst[n] = f32_to_f16((float)src[n] * input_scales[m] * scales_[n] / divisor);
         }
     }
 }
 
-bool NpuLinearW8::forward(const uint16_t* input_f16, int M, uint16_t* output_f16) {
-    if (!ctx_ || !input_f16 || !output_f16 || K_ <= 0 || K_matmul_ <= 0 ||
-        N_ <= 0 || M != 1) {
+bool NpuLinearW8::run_prepared_raw(std::vector<float>* input_scales) {
+    if (!ctx_ || !A_mem_ || !C_mem_ || !input_scales ||
+        K_ <= 0 || K_matmul_ <= 0 || N_ <= 0 || prepared_M_ <= 0 ||
+        prepared_input_f16_.size() < (size_t)prepared_M_ * K_) {
         return false;
     }
-    if (!ensure_ac(M)) {
-        return false;
+
+    input_scales->resize((size_t)prepared_M_);
+    int8_t* a = reinterpret_cast<int8_t*>(A_mem_->virt_addr);
+    for (int m = 0; m < prepared_M_; ++m) {
+        (*input_scales)[(size_t)m] = quantize_current_input(
+            prepared_input_f16_.data() + (size_t)m * K_,
+            a + (size_t)m * K_matmul_);
     }
-    const float input_scale = quantize_current_input(
-        input_f16, reinterpret_cast<int8_t*>(A_mem_->virt_addr));
     const int ret = rknn_matmul_run(ctx_);
     if (ret < 0) {
         std::fprintf(stderr, "[NpuLinearW8] rknn_matmul_run failed: %d\n", ret);
         release_ac();
         return false;
     }
-
-    scale_output_f16(reinterpret_cast<const int32_t*>(C_mem_->virt_addr),
-                     input_scale, M, output_f16);
     return true;
+}
+
+bool NpuLinearW8::forward(const uint16_t* input_f16, int M, uint16_t* output_f16) {
+    if (!ctx_ || !input_f16 || !output_f16 || K_ <= 0 || K_matmul_ <= 0 ||
+        N_ <= 0 || M <= 0) {
+        return false;
+    }
+    uint16_t* prepared = prepare_input_f16(M);
+    if (!prepared) {
+        return false;
+    }
+    std::memcpy(prepared, input_f16, (size_t)M * K_ * sizeof(uint16_t));
+    return forward_prepared(output_f16);
+}
+
+bool NpuLinearW8::forward_accumulate(const uint16_t* input_f16, int M, float* accum_f32) {
+    if (!ctx_ || !input_f16 || !accum_f32 || K_ <= 0 || K_matmul_ <= 0 ||
+        N_ <= 0 || M <= 0) {
+        return false;
+    }
+    uint16_t* prepared = prepare_input_f16(M);
+    if (!prepared) {
+        return false;
+    }
+    std::memcpy(prepared, input_f16, (size_t)M * K_ * sizeof(uint16_t));
+    return forward_prepared_accumulate(accum_f32);
+}
+
+bool NpuLinearW8::forward_f32_accumulate(const float* input_f32, int M, float* accum_f32) {
+    if (!ctx_ || !input_f32 || !accum_f32 || K_ <= 0 || K_matmul_ <= 0 ||
+        N_ <= 0 || M <= 0) {
+        return false;
+    }
+    uint16_t* prepared = prepare_input_f16(M);
+    if (!prepared) {
+        return false;
+    }
+    op_f32_to_f16(input_f32, prepared, M * K_);
+    return forward_prepared_accumulate(accum_f32);
+}
+
+bool NpuLinearW8::forward_prepared(uint16_t* output_f16) {
+    if (!output_f16) {
+        return false;
+    }
+    const uint16_t* out = forward_prepared_output_f16();
+    if (!out) {
+        return false;
+    }
+    std::memcpy(output_f16, out, (size_t)prepared_M_ * N_ * sizeof(uint16_t));
+    return true;
+}
+
+const uint16_t* NpuLinearW8::forward_prepared_output_f16() {
+    if (!run_prepared_raw(&prepared_input_scales_)) {
+        return nullptr;
+    }
+
+    prepared_output_f16_.resize((size_t)prepared_M_ * N_);
+    scale_output_f16(reinterpret_cast<const int32_t*>(C_mem_->virt_addr),
+                     prepared_input_scales_.data(), prepared_M_,
+                     prepared_output_f16_.data());
+    return prepared_output_f16_.data();
+}
+
+bool NpuLinearW8::forward_prepared_accumulate(float* accum_f32) {
+    if (!accum_f32) {
+        return false;
+    }
+    const uint16_t* out = forward_prepared_output_f16();
+    if (!out) {
+        return false;
+    }
+    op_add_f16_to_f32_inplace(accum_f32, out, prepared_M_ * N_);
+    return true;
+}
+
+bool NpuLinearW8::supports_batch(int M) const {
+    return M == 1 || dynamic_index_for_m(M) >= 0;
 }
 
 bool NpuLinearW8::forward_argmax(const uint16_t* input_f16, int M,
@@ -464,19 +797,22 @@ bool NpuLinearW8::forward_argmax(const uint16_t* input_f16, int M,
         K_matmul_ <= 0 || N_ <= 0) {
         return false;
     }
-    if (!ensure_ac(M)) {
+    uint16_t* prepared = prepare_input_f16(M);
+    if (!prepared) {
+        return false;
+    }
+    std::memcpy(prepared, input_f16, (size_t)K_ * sizeof(uint16_t));
+    return forward_prepared_argmax(argmax_id, argmax_value);
+}
+
+bool NpuLinearW8::forward_prepared_argmax(int* argmax_id, uint16_t* argmax_value) {
+    if (!argmax_id || !ctx_ || K_ <= 0 || K_matmul_ <= 0 || N_ <= 0) {
         return false;
     }
 
-    const float input_scale = quantize_current_input(
-        input_f16, reinterpret_cast<int8_t*>(A_mem_->virt_addr));
-    int ret = rknn_matmul_run(ctx_);
-    if (ret < 0) {
-        std::fprintf(stderr, "[NpuLinearW8] rknn_matmul_run failed: %d\n", ret);
-        release_ac();
+    if (!run_prepared_raw(&prepared_input_scales_)) {
         return false;
     }
-
     const int32_t* raw = reinterpret_cast<const int32_t*>(C_mem_->virt_addr);
     int best = 0;
     float best_score = (float)raw[0] * scales_[0];
@@ -490,7 +826,7 @@ bool NpuLinearW8::forward_argmax(const uint16_t* input_f16, int M,
     *argmax_id = best;
     if (argmax_value) {
         const float divisor = use_hadamard_ ? (float)hadamard_block_ : 1.0f;
-        *argmax_value = f32_to_f16(best_score * input_scale / divisor);
+        *argmax_value = f32_to_f16(best_score * prepared_input_scales_[0] / divisor);
     }
     return true;
 }
@@ -500,6 +836,7 @@ void NpuLinearW8::release_ac() {
     if (C_mem_) { rknn_destroy_mem(ctx_, C_mem_); C_mem_ = nullptr; }
     cur_M_ = 0;
     alloc_M_ = 0;
+    prepared_M_ = 0;
 }
 
 void NpuLinearW8::destroy() {
@@ -511,8 +848,16 @@ void NpuLinearW8::destroy() {
     N_ = 0;
     use_hadamard_ = false;
     hadamard_block_ = 0;
+    prepared_M_ = 0;
+    dynamic_shapes_.clear();
+    dynamic_io_attrs_.clear();
+    dynamic_m_ = false;
+    dynamic_max_m_ = 1;
     scales_.clear();
     hadamard_buf_.clear();
+    prepared_input_scales_.clear();
+    prepared_input_f16_.clear();
+    prepared_output_f16_.clear();
 }
 
 void NpuLinearW8::set_core_mask(rknn_core_mask mask) {
