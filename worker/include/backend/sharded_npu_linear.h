@@ -92,6 +92,7 @@ private:
     int prepared_M_ = 0;
 
     bool bind_shared_prepared_inputs();
+    bool bind_shared_quantized_prepared_inputs();
     bool configure_layout(int K, int N);
     bool init_k_sharded(int K, int N, const uint16_t* weight_kn);
     bool init_k_sharded_from_cache(int K, int N);

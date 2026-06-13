@@ -74,6 +74,7 @@ private:
     rknn_matmul_io_attr io_attr_{};
     std::vector<rknn_matmul_shape> dynamic_shapes_;
     std::vector<rknn_matmul_io_attr> dynamic_io_attrs_;
+    std::vector<int> dynamic_ms_;
     bool dynamic_m_ = false;
     int dynamic_max_m_ = 1;
 

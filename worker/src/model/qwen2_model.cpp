@@ -222,7 +222,8 @@ static void run_linear_batched_or_throw(const std::unique_ptr<ILinearOp>& linear
             continue;
         }
 
-        const bool can_batch = linear && linear->supports_batch(batch_rows);
+        const bool can_batch = linear &&
+            (linear->supports_batch(chunk) || linear->supports_batch(batch_rows));
         if (!can_batch) {
             if (qwen2_batch_trace_enabled()) {
                 std::fprintf(stderr,
@@ -238,7 +239,7 @@ static void run_linear_batched_or_throw(const std::unique_ptr<ILinearOp>& linear
             continue;
         }
 
-        if (chunk == batch_rows && linear->forward(in, chunk, out)) {
+        if (linear->supports_batch(chunk) && linear->forward(in, chunk, out)) {
             if (qwen2_batch_trace_enabled()) {
                 std::fprintf(stderr,
                              "[batch] %s rows=%d start=%d chunk=%d runM=%d path=batch\n",

@@ -48,6 +48,10 @@ bool env_enabled(const char* name) {
            std::strcmp(v, "OFF") != 0;
 }
 
+bool shared_a8w8_quant_input_enabled() {
+    return env_enabled("RKLLM_A8W8_SHARED_QUANT_A");
+}
+
 bool mlp_profile_enabled() {
     return env_enabled("RKLLM_MLP_PROFILE");
 }
@@ -1048,11 +1052,11 @@ bool ShardedNpuLinear::forward(const uint16_t* input_f16, int M, uint16_t* outpu
         prepared_k_shard_input_.assign(input_f16, input_f16 + (size_t)M * K_);
         prepared_input_ = prepared_k_shard_input_.data();
         prepared_M_ = M;
-        k_shard_accum_.assign((size_t)M * N_, 0.0f);
-        if (!run_k_shard_accumulate(k_shard_accum_.data())) {
+        std::vector<float> accum((size_t)M * N_, 0.0f);
+        if (!run_k_shard_accumulate(accum.data())) {
             return false;
         }
-        f32_to_f16_buffer(k_shard_accum_.data(), output_f16, M * N_);
+        f32_to_f16_buffer(accum.data(), output_f16, M * N_);
         return true;
     }
 
@@ -1132,6 +1136,11 @@ uint16_t* ShardedNpuLinear::prepare_input_f16(int M) {
         return nullptr;
     }
     if (k_shard_accumulate_active_) {
+        for (const auto& shard : shards_) {
+            if (!shard || !shard->supports_batch(M)) {
+                return nullptr;
+            }
+        }
         prepared_k_shard_input_.resize((size_t)M * K_);
         prepared_input_ = prepared_k_shard_input_.data();
         prepared_M_ = M;
@@ -1178,6 +1187,46 @@ bool ShardedNpuLinear::bind_shared_prepared_inputs() {
     return true;
 }
 
+bool ShardedNpuLinear::bind_shared_quantized_prepared_inputs() {
+    if (!shared_a8w8_quant_input_enabled()) {
+        return false;
+    }
+    if (cpu_shard_index_ >= 0 || prepared_M_ <= 0 ||
+        (int)shards_.size() != kNumNpuShards) {
+        return false;
+    }
+
+    NpuLinearW8* owner = dynamic_cast<NpuLinearW8*>(shards_[0].get());
+    if (!owner || !owner->can_share_quantized_input() ||
+        !owner->quantize_prepared_input()) {
+        return false;
+    }
+
+    const rknn_tensor_mem* shared_input = owner->prepared_quantized_input_mem();
+    const float* input_scales = owner->prepared_input_scales_data();
+    const int input_scale_count = owner->prepared_input_scale_count();
+    if (!shared_input || !input_scales || input_scale_count < prepared_M_) {
+        return false;
+    }
+
+    for (int i = 1; i < kNumNpuShards; ++i) {
+        NpuLinearW8* shard = dynamic_cast<NpuLinearW8*>(shards_[i].get());
+        if (!shard ||
+            !shard->bind_external_quantized_input(prepared_M_, shared_input,
+                                                  input_scales,
+                                                  input_scale_count)) {
+            return false;
+        }
+    }
+
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        std::fprintf(stderr, "[ShardedNpuLinear] shared A8W8 quantized A buffer enabled\n");
+    }
+    return true;
+}
+
 void ShardedNpuLinear::clear_prepared_state() {
     prepared_input_ = nullptr;
     prepared_M_ = 0;
@@ -1192,7 +1241,8 @@ bool ShardedNpuLinear::run_prepared_output_shards() {
     const bool profile = mlp_profile_enabled_for_key(cache_key_);
     const int M = prepared_M_;
     const int64_t t0 = profile ? now_us() : 0;
-    const bool shared = bind_shared_prepared_inputs();
+    const bool shared_quant = bind_shared_quantized_prepared_inputs();
+    const bool shared = shared_quant || bind_shared_prepared_inputs();
     const int64_t t_bind = profile ? now_us() : 0;
     int copied_inputs = 0;
     int64_t copy_inputs_us = 0;
@@ -1254,13 +1304,14 @@ bool ShardedNpuLinear::run_prepared_output_shards() {
     }
     if (profile) {
         std::fprintf(stderr,
-                     "[mlp_profile] sharded_prepared M=%d K=%d N=%d total=%.3f ms bind=%.3f ms input_copy=%.3f ms input_setup=%.3f ms run=%.3f ms shared=%d copied=%d gate_up_pair=%d\n",
+                     "[mlp_profile] sharded_prepared M=%d K=%d N=%d total=%.3f ms bind=%.3f ms input_copy=%.3f ms input_setup=%.3f ms run=%.3f ms shared=%d shared_quant=%d copied=%d gate_up_pair=%d\n",
                      M, K_, N_, us_to_ms(now_us() - t0),
                      us_to_ms(t_bind - t0),
                      us_to_ms(copy_inputs_us),
                      us_to_ms(t_inputs - t_bind),
                      us_to_ms(t_run1 - t_run0),
                      shared ? 1 : 0,
+                     shared_quant ? 1 : 0,
                      copied_inputs,
                      gate_up_pair_layout_ ? 1 : 0);
     }
@@ -1378,12 +1429,12 @@ const uint16_t* ShardedNpuLinear::forward_prepared_output_f16() {
 
     const int M = prepared_M_;
     if (k_shard_accumulate_active_) {
-        k_shard_accum_.assign((size_t)M * N_, 0.0f);
-        if (!run_k_shard_accumulate(k_shard_accum_.data())) {
+        std::vector<float> accum((size_t)M * N_, 0.0f);
+        if (!run_k_shard_accumulate(accum.data())) {
             return nullptr;
         }
         prepared_output_.resize((size_t)M * N_);
-        f32_to_f16_buffer(k_shard_accum_.data(), prepared_output_.data(), M * N_);
+        f32_to_f16_buffer(accum.data(), prepared_output_.data(), M * N_);
         return prepared_output_.data();
     }
     if (!run_prepared_output_shards()) {
@@ -1422,7 +1473,8 @@ bool ShardedNpuLinear::forward_prepared_argmax(int* argmax_id, uint16_t* argmax_
         return false;
     }
 
-    if (!bind_shared_prepared_inputs()) {
+    if (!bind_shared_quantized_prepared_inputs() &&
+        !bind_shared_prepared_inputs()) {
         for (int i = 1; i < kNumNpuShards; ++i) {
             uint16_t* shard_input = shards_[i] ? shards_[i]->prepare_input_f16(prepared_M_) : nullptr;
             if (!shard_input) {

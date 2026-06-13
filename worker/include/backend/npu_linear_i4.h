@@ -106,6 +106,7 @@ private:
     int ksplit_chunk_k_ = 0;
     std::vector<KSplitChunk> ksplit_chunks_;
     std::vector<float> ksplit_output_f32_;
+    std::vector<float> ksplit_input_scales_;
     std::vector<float> scales_;
     std::vector<float> prepared_input_scales_;
     std::vector<uint16_t> prepared_input_f16_;

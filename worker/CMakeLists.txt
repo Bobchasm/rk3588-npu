@@ -45,6 +45,7 @@ set(MODEL_SOURCES
 )
 
 set(API_SOURCES
+    src/api/env_preset.cpp
     src/api/llm_engine.cpp
 )
 

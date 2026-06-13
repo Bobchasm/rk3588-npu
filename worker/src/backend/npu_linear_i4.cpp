@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <sys/resource.h>
+#include <sys/time.h>
 #include <utility>
 
 #if defined(__aarch64__)
@@ -61,6 +62,15 @@ inline void set_i4(uint8_t* data, size_t idx, int8_t value) {
     }
 }
 
+inline void set_i4_zeroed(uint8_t* data, size_t idx, int8_t value) {
+    const uint8_t packed = (uint8_t)value & 0x0f;
+    if ((idx & 1) == 0) {
+        data[idx / 2] = packed;
+    } else {
+        data[idx / 2] |= (uint8_t)(packed << 4);
+    }
+}
+
 inline void set_i4_unpacked(uint8_t* data, size_t idx, int8_t value) {
     data[idx] = (uint8_t)value;
 }
@@ -106,6 +116,10 @@ bool int4_ksplit_enabled() {
     return env_flag_enabled_i4(std::getenv("RKLLM_INT4_KSPLIT"));
 }
 
+bool i4_profile_enabled() {
+    return env_flag_enabled_i4(std::getenv("RKLLM_INT4_PROFILE"));
+}
+
 int int4_ksplit_chunk_k(int K) {
     constexpr int kDefaultChunkK = 512;
     constexpr int kMaxSafeChunkK = 640;  // 640 * 7 * 7 = 31360 < int16 max.
@@ -128,6 +142,62 @@ int int4_ksplit_chunk_k(int K) {
         chunk = 32;
     }
     return std::min(chunk, align_up(K, 32));
+}
+
+int64_t now_us_i4() {
+    struct timeval tv;
+    gettimeofday(&tv, nullptr);
+    return (int64_t)tv.tv_sec * 1000000LL + tv.tv_usec;
+}
+
+double us_to_ms_i4(int64_t us) {
+    return (double)us / 1000.0;
+}
+
+void f32_to_f16_buffer_i4(const float* src, uint16_t* dst, int n) {
+    int i = 0;
+#if defined(__aarch64__)
+    for (; i + 4 <= n; i += 4) {
+        const float32x4_t f = vld1q_f32(src + i);
+        const float16x4_t h = vcvt_f16_f32(f);
+        vst1_f16(reinterpret_cast<float16_t*>(dst + i), h);
+    }
+#endif
+    for (; i < n; ++i) {
+        dst[i] = f32_to_f16(src[i]);
+    }
+}
+
+void add_scaled_i16_to_f32(float* dst, const int16_t* src,
+                           const float* weight_scales, float input_scale, int n) {
+    int i = 0;
+#if defined(__aarch64__)
+    const float32x4_t in_scale = vdupq_n_f32(input_scale);
+    for (; i + 8 <= n; i += 8) {
+        const int16x8_t raw = vld1q_s16(src + i);
+        const int32x4_t lo_i32 = vmovl_s16(vget_low_s16(raw));
+        const int32x4_t hi_i32 = vmovl_s16(vget_high_s16(raw));
+        const float32x4_t lo = vcvtq_f32_s32(lo_i32);
+        const float32x4_t hi = vcvtq_f32_s32(hi_i32);
+        const float32x4_t ws0 = vld1q_f32(weight_scales + i);
+        const float32x4_t ws1 = vld1q_f32(weight_scales + i + 4);
+        const float32x4_t d0 = vld1q_f32(dst + i);
+        const float32x4_t d1 = vld1q_f32(dst + i + 4);
+        vst1q_f32(dst + i, vmlaq_f32(d0, vmulq_f32(lo, ws0), in_scale));
+        vst1q_f32(dst + i + 4, vmlaq_f32(d1, vmulq_f32(hi, ws1), in_scale));
+    }
+    for (; i + 4 <= n; i += 4) {
+        const int16x4_t raw = vld1_s16(src + i);
+        const int32x4_t raw_i32 = vmovl_s16(raw);
+        const float32x4_t vals = vcvtq_f32_s32(raw_i32);
+        const float32x4_t ws = vld1q_f32(weight_scales + i);
+        const float32x4_t d = vld1q_f32(dst + i);
+        vst1q_f32(dst + i, vmlaq_f32(d, vmulq_f32(vals, ws), in_scale));
+    }
+#endif
+    for (; i < n; ++i) {
+        dst[i] += (float)src[i] * input_scale * weight_scales[i];
+    }
 }
 
 }  // namespace
@@ -877,6 +947,7 @@ void NpuLinearI4::destroy_ksplit() {
     }
     ksplit_chunks_.clear();
     ksplit_output_f32_.clear();
+    ksplit_input_scales_.clear();
     ksplit_ = false;
     ksplit_chunk_k_ = 0;
 }
@@ -885,7 +956,13 @@ float NpuLinearI4::quantize_ksplit_input_chunk(const uint16_t* input_f16,
                                                const KSplitChunk& chunk,
                                                uint8_t* input_i4) const {
     const size_t row_bytes = ((size_t)chunk.K_matmul + 1) / 2;
-    std::memset(input_i4, 0, row_bytes);
+    const size_t used_bytes = ((size_t)chunk.K + 1) / 2;
+    if (used_bytes > 0) {
+        std::memset(input_i4, 0, used_bytes);
+    }
+    if (row_bytes > used_bytes) {
+        std::memset(input_i4 + used_bytes, 0, row_bytes - used_bytes);
+    }
     float max_abs = 0.0f;
     for (int k = 0; k < chunk.K; ++k) {
         max_abs = std::max(max_abs,
@@ -895,7 +972,7 @@ float NpuLinearI4::quantize_ksplit_input_chunk(const uint16_t* input_f16,
     const float inv = 1.0f / scale;
     for (int k = 0; k < chunk.K; ++k) {
         int q = (int)std::lrint(f16_to_f32(input_f16[chunk.offset + k]) * inv);
-        set_i4(input_i4, (size_t)k, clamp_i4(q));
+        set_i4_zeroed(input_i4, (size_t)k, clamp_i4(q));
     }
     return scale;
 }
@@ -909,18 +986,34 @@ bool NpuLinearI4::run_ksplit_accumulate(std::vector<float>* output_f32) {
         return false;
     }
 
+    const bool profile = i4_profile_enabled();
+    const int64_t t0 = profile ? now_us_i4() : 0;
+    int64_t quant_us = 0;
+    int64_t sync_a_us = 0;
+    int64_t run_us = 0;
+    int64_t sync_c_us = 0;
+    int64_t accum_us = 0;
+
     output_f32->assign((size_t)prepared_M_ * N_, 0.0f);
-    std::vector<float> input_scales((size_t)prepared_M_);
+    ksplit_input_scales_.resize((size_t)prepared_M_);
     for (auto& chunk : ksplit_chunks_) {
         const size_t row_bytes = ((size_t)chunk.K_matmul + 1) / 2;
         uint8_t* a = reinterpret_cast<uint8_t*>(chunk.A_mem->virt_addr);
+        const int64_t tq0 = profile ? now_us_i4() : 0;
         for (int m = 0; m < prepared_M_; ++m) {
-            input_scales[(size_t)m] = quantize_ksplit_input_chunk(
+            ksplit_input_scales_[(size_t)m] = quantize_ksplit_input_chunk(
                 prepared_input_f16_.data() + (size_t)m * K_,
                 chunk, a + (size_t)m * row_bytes);
         }
+        if (profile) {
+            quant_us += now_us_i4() - tq0;
+        }
 
+        const int64_t tsa0 = profile ? now_us_i4() : 0;
         int ret = rknn_mem_sync(chunk.ctx, chunk.A_mem, RKNN_MEMORY_SYNC_TO_DEVICE);
+        if (profile) {
+            sync_a_us += now_us_i4() - tsa0;
+        }
         if (ret < 0) {
             std::fprintf(stderr,
                          "[NpuLinearI4] ksplit rknn_mem_sync(A TO_DEVICE) failed: %d\n",
@@ -928,13 +1021,21 @@ bool NpuLinearI4::run_ksplit_accumulate(std::vector<float>* output_f32) {
             release_ksplit_ac(&chunk);
             return false;
         }
+        const int64_t tr0 = profile ? now_us_i4() : 0;
         ret = rknn_matmul_run(chunk.ctx);
+        if (profile) {
+            run_us += now_us_i4() - tr0;
+        }
         if (ret < 0) {
             std::fprintf(stderr, "[NpuLinearI4] ksplit rknn_matmul_run failed: %d\n", ret);
             release_ksplit_ac(&chunk);
             return false;
         }
+        const int64_t tsc0 = profile ? now_us_i4() : 0;
         ret = rknn_mem_sync(chunk.ctx, chunk.C_mem, RKNN_MEMORY_SYNC_FROM_DEVICE);
+        if (profile) {
+            sync_c_us += now_us_i4() - tsc0;
+        }
         if (ret < 0) {
             std::fprintf(stderr,
                          "[NpuLinearI4] ksplit rknn_mem_sync(C FROM_DEVICE) failed: %d\n",
@@ -944,14 +1045,25 @@ bool NpuLinearI4::run_ksplit_accumulate(std::vector<float>* output_f32) {
         }
 
         const int16_t* raw = reinterpret_cast<const int16_t*>(chunk.C_mem->virt_addr);
+        const int64_t ta0 = profile ? now_us_i4() : 0;
         for (int m = 0; m < prepared_M_; ++m) {
             const int16_t* src = raw + (size_t)m * N_;
             float* dst = output_f32->data() + (size_t)m * N_;
-            const float input_scale = input_scales[(size_t)m];
-            for (int n = 0; n < N_; ++n) {
-                dst[n] += (float)src[n] * input_scale * chunk.scales[(size_t)n];
-            }
+            add_scaled_i16_to_f32(dst, src, chunk.scales.data(),
+                                  ksplit_input_scales_[(size_t)m], N_);
         }
+        if (profile) {
+            accum_us += now_us_i4() - ta0;
+        }
+    }
+    if (profile) {
+        const int64_t total = now_us_i4() - t0;
+        std::fprintf(stderr,
+                     "[NpuLinearI4] ksplit profile M=%d K=%d N=%d chunks=%zu total=%.3f ms quant=%.3f syncA=%.3f run=%.3f syncC=%.3f accum=%.3f\n",
+                     prepared_M_, K_, N_, ksplit_chunks_.size(),
+                     us_to_ms_i4(total), us_to_ms_i4(quant_us),
+                     us_to_ms_i4(sync_a_us), us_to_ms_i4(run_us),
+                     us_to_ms_i4(sync_c_us), us_to_ms_i4(accum_us));
     }
     return true;
 }
@@ -1130,9 +1242,8 @@ const uint16_t* NpuLinearI4::forward_prepared_output_f16() {
             return nullptr;
         }
         prepared_output_f16_.resize((size_t)prepared_M_ * N_);
-        for (size_t i = 0; i < ksplit_output_f32_.size(); ++i) {
-            prepared_output_f16_[i] = f32_to_f16(ksplit_output_f32_[i]);
-        }
+        f32_to_f16_buffer_i4(ksplit_output_f32_.data(), prepared_output_f16_.data(),
+                             (int)ksplit_output_f32_.size());
         return prepared_output_f16_.data();
     }
     if (!run_prepared_raw(&prepared_input_scales_)) {

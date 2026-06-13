@@ -42,6 +42,76 @@ inline uint16_t f16_order_key(uint16_t v) {
     return (v & 0x8000u) ? (uint16_t)~v : (uint16_t)(v ^ 0x8000u);
 }
 
+int argmax_i32_scaled_row(const int32_t* raw, const float* scales,
+                          int N, float* best_score_out) {
+    int best = 0;
+    float best_score = (float)raw[0] * scales[0];
+
+#if defined(__aarch64__)
+    if (N >= 8) {
+        static const int32_t kLaneOffsets[4] = {0, 1, 2, 3};
+        const int32x4_t lane_offsets = vld1q_s32(kLaneOffsets);
+
+        float32x4_t best_scores =
+            vmulq_f32(vcvtq_f32_s32(vld1q_s32(raw)), vld1q_f32(scales));
+        int32x4_t best_indices = lane_offsets;
+
+        int i = 4;
+        for (; i + 4 <= N; i += 4) {
+            const float32x4_t scores =
+                vmulq_f32(vcvtq_f32_s32(vld1q_s32(raw + i)),
+                          vld1q_f32(scales + i));
+            const int32x4_t indices = vaddq_s32(vdupq_n_s32(i), lane_offsets);
+            const uint32x4_t better = vcgtq_f32(scores, best_scores);
+            best_scores = vbslq_f32(better, scores, best_scores);
+            best_indices = vreinterpretq_s32_u32(vbslq_u32(
+                better,
+                vreinterpretq_u32_s32(indices),
+                vreinterpretq_u32_s32(best_indices)));
+        }
+
+        alignas(16) float lane_scores[4];
+        alignas(16) int32_t lane_indices[4];
+        vst1q_f32(lane_scores, best_scores);
+        vst1q_s32(lane_indices, best_indices);
+
+        best_score = lane_scores[0];
+        best = lane_indices[0];
+        for (int lane = 1; lane < 4; ++lane) {
+            const float score = lane_scores[lane];
+            const int idx = lane_indices[lane];
+            if (score > best_score || (score == best_score && idx < best)) {
+                best_score = score;
+                best = idx;
+            }
+        }
+        for (; i < N; ++i) {
+            const float score = (float)raw[i] * scales[i];
+            if (score > best_score) {
+                best_score = score;
+                best = i;
+            }
+        }
+        if (best_score_out) {
+            *best_score_out = best_score;
+        }
+        return best;
+    }
+#endif
+
+    for (int i = 1; i < N; ++i) {
+        const float score = (float)raw[i] * scales[i];
+        if (score > best_score) {
+            best_score = score;
+            best = i;
+        }
+    }
+    if (best_score_out) {
+        *best_score_out = best_score;
+    }
+    return best;
+}
+
 bool env_flag_enabled(const char* v) {
     return v && (std::strcmp(v, "1") == 0 ||
                  std::strcmp(v, "true") == 0 ||
@@ -81,6 +151,55 @@ int linear_batch_limit_w8() {
         return 1;
     }
     return std::min<long>(parsed, 512);
+}
+
+std::vector<int> dynamic_m_values_w8(int max_m) {
+    std::vector<int> values;
+    values.push_back(1);
+    if (max_m > 1) {
+        values.push_back(max_m);
+    }
+
+    const char* spec = std::getenv("RKLLM_LINEAR_EXTRA_M");
+    if (spec && spec[0] != '\0') {
+        const char* p = spec;
+        while (*p) {
+            while (*p == ',' || *p == ' ' || *p == '\t') {
+                ++p;
+            }
+            if (!*p) {
+                break;
+            }
+            char* end = nullptr;
+            long parsed = std::strtol(p, &end, 10);
+            if (end == p) {
+                while (*p && *p != ',') {
+                    ++p;
+                }
+                continue;
+            }
+            if (parsed > 1 && parsed < max_m) {
+                values.push_back((int)parsed);
+            }
+            p = end;
+        }
+    }
+
+    std::sort(values.begin(), values.end());
+    values.erase(std::unique(values.begin(), values.end()), values.end());
+    constexpr size_t kMaxDynamicShapes = 4;
+    if (values.size() > kMaxDynamicShapes) {
+        std::fprintf(stderr,
+                     "[NpuLinearW8] RKLLM_LINEAR_EXTRA_M creates %zu dynamic shapes; keep first %zu to avoid RKNN fd pressure\n",
+                     values.size(), kMaxDynamicShapes);
+        values.resize(kMaxDynamicShapes);
+        if (values.back() != max_m) {
+            values.back() = max_m;
+            std::sort(values.begin(), values.end());
+            values.erase(std::unique(values.begin(), values.end()), values.end());
+        }
+    }
+    return values;
 }
 
 bool is_power_of_two(int v) {
@@ -206,10 +325,12 @@ bool NpuLinearW8::create_context_and_b() {
     const bool allow_dynamic_m = !has_core_mask_ || shard_dynamic_m_enabled_w8();
     dynamic_max_m_ = allow_dynamic_m ? linear_batch_limit_w8() : 1;
     if (dynamic_max_m_ > 1) {
-        dynamic_shapes_.resize(2);
-        dynamic_io_attrs_.resize(2);
-        dynamic_shapes_[0] = rknn_matmul_shape{1, K_matmul_, N_};
-        dynamic_shapes_[1] = rknn_matmul_shape{dynamic_max_m_, K_matmul_, N_};
+        dynamic_ms_ = dynamic_m_values_w8(dynamic_max_m_);
+        dynamic_shapes_.resize(dynamic_ms_.size());
+        dynamic_io_attrs_.resize(dynamic_ms_.size());
+        for (size_t i = 0; i < dynamic_ms_.size(); ++i) {
+            dynamic_shapes_[i] = rknn_matmul_shape{dynamic_ms_[i], K_matmul_, N_};
+        }
         ret = rknn_matmul_create_dynamic_shape(
             &ctx_, &info, (int)dynamic_shapes_.size(),
             dynamic_shapes_.data(), dynamic_io_attrs_.data());
@@ -220,6 +341,7 @@ bool NpuLinearW8::create_context_and_b() {
             ctx_ = 0;
             dynamic_shapes_.clear();
             dynamic_io_attrs_.clear();
+            dynamic_ms_.clear();
             dynamic_m_ = false;
             dynamic_max_m_ = 1;
         } else {
@@ -277,7 +399,14 @@ uint32_t NpuLinearW8::cache_flags(bool dynamic_m) const {
     flags |= ((uint32_t)(hadamard_block_ & 0xffff)) << 8;
     if (dynamic_m) {
         const uint32_t capped_m = (uint32_t)std::min(std::max(dynamic_max_m_, 1), 255);
+        uint32_t extra_sig = 0;
+        for (int m : dynamic_m_values_w8(dynamic_max_m_)) {
+            if (m > 1 && m < dynamic_max_m_) {
+                extra_sig = (extra_sig * 131u) ^ (uint32_t)m;
+            }
+        }
         flags |= 0x2u | (capped_m << 24);
+        flags |= (extra_sig & 0xffu) << 16;
     }
     return flags;
 }
@@ -495,6 +624,10 @@ bool NpuLinearW8::rebuild_ac(int M) {
     return true;
 }
 
+bool NpuLinearW8::can_share_quantized_input() const {
+    return !use_hadamard_ && ctx_ && K_ > 0 && K_matmul_ == K_ && N_ > 0;
+}
+
 bool NpuLinearW8::bind_ac(int M, bool quiet) {
     if (dynamic_m_) {
         const int shape_idx = dynamic_index_for_m(M);
@@ -566,11 +699,10 @@ int NpuLinearW8::dynamic_index_for_m(int M) const {
     if (!dynamic_m_) {
         return -1;
     }
-    if (M == 1) {
-        return 0;
-    }
-    if (M == dynamic_max_m_ && dynamic_io_attrs_.size() >= 2) {
-        return 1;
+    for (size_t i = 0; i < dynamic_ms_.size(); ++i) {
+        if (dynamic_ms_[i] == M && i < dynamic_io_attrs_.size()) {
+            return (int)i;
+        }
     }
     return -1;
 }
@@ -589,11 +721,15 @@ uint16_t* NpuLinearW8::prepare_input_f16(int M) {
     if (!ctx_ || K_ <= 0 || K_matmul_ <= 0 || N_ <= 0 || M <= 0) {
         return nullptr;
     }
+    if (A_mem_external_) {
+        release_ac();
+    }
     if (!ensure_ac(M)) {
         return nullptr;
     }
     prepared_input_f16_.resize((size_t)M * K_);
     prepared_M_ = M;
+    quantized_input_ready_ = false;
     return prepared_input_f16_.data();
 }
 
@@ -741,17 +877,24 @@ void NpuLinearW8::accumulate_output_f32(const int32_t* raw, const float* input_s
 
 bool NpuLinearW8::run_prepared_raw(std::vector<float>* input_scales) {
     if (!ctx_ || !A_mem_ || !C_mem_ || !input_scales ||
-        K_ <= 0 || K_matmul_ <= 0 || N_ <= 0 || prepared_M_ <= 0 ||
-        prepared_input_f16_.size() < (size_t)prepared_M_ * K_) {
+        K_ <= 0 || K_matmul_ <= 0 || N_ <= 0 || prepared_M_ <= 0) {
         return false;
     }
 
-    input_scales->resize((size_t)prepared_M_);
-    int8_t* a = reinterpret_cast<int8_t*>(A_mem_->virt_addr);
-    for (int m = 0; m < prepared_M_; ++m) {
-        (*input_scales)[(size_t)m] = quantize_current_input(
-            prepared_input_f16_.data() + (size_t)m * K_,
-            a + (size_t)m * K_matmul_);
+    if (!quantized_input_ready_) {
+        if (prepared_input_f16_.size() < (size_t)prepared_M_ * K_) {
+            return false;
+        }
+        input_scales->resize((size_t)prepared_M_);
+        int8_t* a = reinterpret_cast<int8_t*>(A_mem_->virt_addr);
+        for (int m = 0; m < prepared_M_; ++m) {
+            (*input_scales)[(size_t)m] = quantize_current_input(
+                prepared_input_f16_.data() + (size_t)m * K_,
+                a + (size_t)m * K_matmul_);
+        }
+        quantized_input_ready_ = true;
+    } else if (input_scales->size() < (size_t)prepared_M_) {
+        return false;
     }
     const int ret = rknn_matmul_run(ctx_);
     if (ret < 0) {
@@ -759,6 +902,85 @@ bool NpuLinearW8::run_prepared_raw(std::vector<float>* input_scales) {
         release_ac();
         return false;
     }
+    return true;
+}
+
+bool NpuLinearW8::quantize_prepared_input() {
+    if (!can_share_quantized_input() || !A_mem_ || prepared_M_ <= 0 ||
+        prepared_input_f16_.size() < (size_t)prepared_M_ * K_) {
+        return false;
+    }
+    prepared_input_scales_.resize((size_t)prepared_M_);
+    int8_t* a = reinterpret_cast<int8_t*>(A_mem_->virt_addr);
+    for (int m = 0; m < prepared_M_; ++m) {
+        prepared_input_scales_[(size_t)m] = quantize_current_input(
+            prepared_input_f16_.data() + (size_t)m * K_,
+            a + (size_t)m * K_matmul_);
+    }
+    quantized_input_ready_ = true;
+    return true;
+}
+
+const rknn_tensor_mem* NpuLinearW8::prepared_quantized_input_mem() const {
+    return quantized_input_ready_ ? A_mem_ : nullptr;
+}
+
+const float* NpuLinearW8::prepared_input_scales_data() const {
+    return prepared_input_scales_.empty() ? nullptr : prepared_input_scales_.data();
+}
+
+int NpuLinearW8::prepared_input_scale_count() const {
+    return (int)prepared_input_scales_.size();
+}
+
+bool NpuLinearW8::bind_external_quantized_input(int M,
+                                               const rknn_tensor_mem* external_mem,
+                                               const float* input_scales,
+                                               int input_scale_count) {
+    if (!can_share_quantized_input() || !external_mem || external_mem->fd < 0 ||
+        !external_mem->virt_addr || !input_scales || input_scale_count < M ||
+        M <= 0) {
+        return false;
+    }
+
+    uint32_t A_size = 0;
+    uint32_t C_size = 0;
+    if (!ac_sizes(M, &A_size, &C_size) || external_mem->size < A_size) {
+        return false;
+    }
+
+    if (!A_mem_external_ || !A_mem_ || !C_mem_ || cur_M_ != M ||
+        external_A_fd_ != external_mem->fd ||
+        external_A_virt_addr_ != external_mem->virt_addr ||
+        external_A_offset_ != external_mem->offset) {
+        release_ac();
+
+        A_mem_ = rknn_create_mem_from_fd(ctx_, external_mem->fd,
+                                         external_mem->virt_addr,
+                                         A_size, external_mem->offset);
+        C_mem_ = rknn_create_mem(ctx_, C_size);
+        if (!A_mem_ || !C_mem_) {
+            std::fprintf(stderr,
+                         "[NpuLinearW8] shared quantized rknn_create_mem(A/C) failed M=%d\n",
+                         M);
+            release_ac();
+            return false;
+        }
+
+        A_mem_external_ = true;
+        external_A_fd_ = external_mem->fd;
+        external_A_virt_addr_ = external_mem->virt_addr;
+        external_A_offset_ = external_mem->offset;
+        alloc_M_ = M;
+        if (!bind_ac(M)) {
+            release_ac();
+            return false;
+        }
+    }
+
+    prepared_M_ = M;
+    prepared_input_scales_.assign(input_scales, input_scales + M);
+    quantized_input_ready_ = true;
     return true;
 }
 
@@ -864,15 +1086,8 @@ bool NpuLinearW8::forward_prepared_argmax(int* argmax_id, uint16_t* argmax_value
         return false;
     }
     const int32_t* raw = reinterpret_cast<const int32_t*>(C_mem_->virt_addr);
-    int best = 0;
-    float best_score = (float)raw[0] * scales_[0];
-    for (int i = 1; i < N_; ++i) {
-        const float score = (float)raw[i] * scales_[i];
-        if (score > best_score) {
-            best_score = score;
-            best = i;
-        }
-    }
+    float best_score = 0.0f;
+    const int best = argmax_i32_scaled_row(raw, scales_.data(), N_, &best_score);
     *argmax_id = best;
     if (argmax_value) {
         const float divisor = use_hadamard_ ? (float)hadamard_block_ : 1.0f;
@@ -884,6 +1099,11 @@ bool NpuLinearW8::forward_prepared_argmax(int* argmax_id, uint16_t* argmax_value
 void NpuLinearW8::release_ac() {
     if (A_mem_) { rknn_destroy_mem(ctx_, A_mem_); A_mem_ = nullptr; }
     if (C_mem_) { rknn_destroy_mem(ctx_, C_mem_); C_mem_ = nullptr; }
+    A_mem_external_ = false;
+    quantized_input_ready_ = false;
+    external_A_fd_ = -1;
+    external_A_virt_addr_ = nullptr;
+    external_A_offset_ = 0;
     cur_M_ = 0;
     alloc_M_ = 0;
     prepared_M_ = 0;
@@ -901,6 +1121,7 @@ void NpuLinearW8::destroy() {
     prepared_M_ = 0;
     dynamic_shapes_.clear();
     dynamic_io_attrs_.clear();
+    dynamic_ms_.clear();
     dynamic_m_ = false;
     dynamic_max_m_ = 1;
     scales_.clear();

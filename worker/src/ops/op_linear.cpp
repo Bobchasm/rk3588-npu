@@ -217,6 +217,99 @@ bool token_eq(const char* begin, const char* end, const char* expected) {
     return std::strlen(expected) == len && std::strncmp(begin, expected, len) == 0;
 }
 
+bool quant_scope_token_matches(const char* begin, const char* end,
+                               bool is_gate_up, bool is_qkv,
+                               bool is_o_proj, bool is_down,
+                               bool is_lm_head) {
+    if (token_eq(begin, end, "gate_up")) {
+        return is_gate_up;
+    }
+    if (token_eq(begin, end, "qkv")) {
+        return is_qkv;
+    }
+    if (token_eq(begin, end, "o_proj") || token_eq(begin, end, "o")) {
+        return is_o_proj;
+    }
+    if (token_eq(begin, end, "down") || token_eq(begin, end, "down_proj")) {
+        return is_down;
+    }
+    if (token_eq(begin, end, "mlp")) {
+        return is_gate_up || is_down;
+    }
+    if (token_eq(begin, end, "attn")) {
+        return is_qkv || is_o_proj;
+    }
+    if (token_eq(begin, end, "lm_head")) {
+        return is_lm_head;
+    }
+    if (token_eq(begin, end, "all")) {
+        return true;
+    }
+    return false;
+}
+
+bool quant_scope_matches(const char* scope, const char* env_name,
+                         bool is_gate_up, bool is_qkv,
+                         bool is_o_proj, bool is_down,
+                         bool is_lm_head) {
+    if (!scope || scope[0] == '\0') {
+        return is_gate_up;
+    }
+
+    bool saw_token = false;
+    bool saw_unknown = false;
+    const char* p = scope;
+    while (*p) {
+        while (*p == ',' || std::isspace((unsigned char)*p)) {
+            ++p;
+        }
+        const char* begin = p;
+        while (*p && *p != ',') {
+            ++p;
+        }
+        const char* end = p;
+        while (end > begin && std::isspace((unsigned char)*(end - 1))) {
+            --end;
+        }
+        while (begin < end && std::isspace((unsigned char)*begin)) {
+            ++begin;
+        }
+        if (begin == end) {
+            continue;
+        }
+        saw_token = true;
+        if (token_eq(begin, end, "off") || token_eq(begin, end, "none")) {
+            return false;
+        }
+        if (quant_scope_token_matches(begin, end, is_gate_up, is_qkv,
+                                      is_o_proj, is_down, is_lm_head)) {
+            return true;
+        }
+        if (!token_eq(begin, end, "gate_up") &&
+            !token_eq(begin, end, "qkv") &&
+            !token_eq(begin, end, "o_proj") &&
+            !token_eq(begin, end, "o") &&
+            !token_eq(begin, end, "down") &&
+            !token_eq(begin, end, "down_proj") &&
+            !token_eq(begin, end, "mlp") &&
+            !token_eq(begin, end, "attn") &&
+            !token_eq(begin, end, "lm_head") &&
+            !token_eq(begin, end, "all")) {
+            saw_unknown = true;
+        }
+    }
+
+    if (!saw_token) {
+        return is_gate_up;
+    }
+    if (saw_unknown) {
+        std::fprintf(stderr,
+                     "[LinearPlanner] unknown %s=%s token(s), unmatched layers use off\n",
+                     env_name, scope);
+    }
+    return false;
+}
+
 bool npu_int8_layer_allowed(int layer_idx) {
     const char* spec = std::getenv("RKLLM_NPU_INT8_LAYERS");
     if (!spec || spec[0] == '\0') {
@@ -308,31 +401,9 @@ bool npu_int8_for_context(int K, int N, int layer_idx, const char* role) {
     const bool is_lm_head = has_role ? std::strcmp(role, "lm_head") == 0
                                      : (K == 1536 && N > 100000);
     const char* scope = std::getenv("RKLLM_NPU_INT8_SCOPE");
-    if (!scope || scope[0] == '\0') {
-        return is_gate_up;
-    }
-    if (std::strcmp(scope, "gate_up") == 0) {
-        return is_gate_up;
-    }
-    if (std::strcmp(scope, "mlp") == 0) {
-        return is_gate_up || is_down;
-    }
-    if (std::strcmp(scope, "attn") == 0) {
-        return is_qkv || is_o_proj;
-    }
-    if (std::strcmp(scope, "lm_head") == 0) {
-        return is_lm_head;
-    }
-    if (std::strcmp(scope, "all") == 0) {
-        return true;
-    }
-    if (std::strcmp(scope, "off") == 0 || std::strcmp(scope, "none") == 0) {
-        return false;
-    }
-    std::fprintf(stderr,
-                 "[LinearPlanner] unknown RKLLM_NPU_INT8_SCOPE=%s, use gate_up\n",
-                 scope);
-    return is_gate_up;
+    return quant_scope_matches(scope, "RKLLM_NPU_INT8_SCOPE",
+                               is_gate_up, is_qkv, is_o_proj,
+                               is_down, is_lm_head);
 }
 
 bool npu_int4_for_context(int K, int N, int layer_idx, const char* role) {
@@ -358,31 +429,9 @@ bool npu_int4_for_context(int K, int N, int layer_idx, const char* role) {
     if (!scope || scope[0] == '\0') {
         scope = std::getenv("RKLLM_NPU_INT8_SCOPE");
     }
-    if (!scope || scope[0] == '\0') {
-        return is_gate_up;
-    }
-    if (std::strcmp(scope, "gate_up") == 0) {
-        return is_gate_up;
-    }
-    if (std::strcmp(scope, "mlp") == 0) {
-        return is_gate_up || is_down;
-    }
-    if (std::strcmp(scope, "attn") == 0) {
-        return is_qkv || is_o_proj;
-    }
-    if (std::strcmp(scope, "lm_head") == 0) {
-        return is_lm_head;
-    }
-    if (std::strcmp(scope, "all") == 0) {
-        return true;
-    }
-    if (std::strcmp(scope, "off") == 0 || std::strcmp(scope, "none") == 0) {
-        return false;
-    }
-    std::fprintf(stderr,
-                 "[LinearPlanner] unknown RKLLM_NPU_INT4_SCOPE=%s, use gate_up\n",
-                 scope);
-    return is_gate_up;
+    return quant_scope_matches(scope, "RKLLM_NPU_INT4_SCOPE",
+                               is_gate_up, is_qkv, is_o_proj,
+                               is_down, is_lm_head);
 }
 
 std::unique_ptr<ILinearOp> make_single_npu_impl(int K = 0, int N = 0,

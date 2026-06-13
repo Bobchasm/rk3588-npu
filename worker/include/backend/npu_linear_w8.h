@@ -32,6 +32,13 @@ public:
 
     void set_core_mask(rknn_core_mask mask);
     static float quantize_input_row(int K, const uint16_t* input_f16, int8_t* input_i8);
+    bool can_share_quantized_input() const;
+    bool quantize_prepared_input();
+    const rknn_tensor_mem* prepared_quantized_input_mem() const;
+    const float* prepared_input_scales_data() const;
+    int prepared_input_scale_count() const;
+    bool bind_external_quantized_input(int M, const rknn_tensor_mem* external_mem,
+                                       const float* input_scales, int input_scale_count);
 
 private:
     static float quantize_float_row(int K, const float* input, int8_t* input_i8);
@@ -67,11 +74,17 @@ private:
     rknn_matmul_io_attr io_attr_{};
     std::vector<rknn_matmul_shape> dynamic_shapes_;
     std::vector<rknn_matmul_io_attr> dynamic_io_attrs_;
+    std::vector<int> dynamic_ms_;
     bool dynamic_m_ = false;
     int dynamic_max_m_ = 1;
     rknn_tensor_mem* A_mem_ = nullptr;
     rknn_tensor_mem* B_mem_ = nullptr;
     rknn_tensor_mem* C_mem_ = nullptr;
+    bool A_mem_external_ = false;
+    bool quantized_input_ready_ = false;
+    int external_A_fd_ = -1;
+    void* external_A_virt_addr_ = nullptr;
+    int external_A_offset_ = 0;
 
     int cur_M_ = 0;
     int alloc_M_ = 0;

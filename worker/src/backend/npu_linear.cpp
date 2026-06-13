@@ -64,6 +64,55 @@ int dynamic_m_limit() {
     return std::min<long>(parsed, 512);
 }
 
+std::vector<int> dynamic_m_values(int max_m) {
+    std::vector<int> values;
+    values.push_back(1);
+    if (max_m > 1) {
+        values.push_back(max_m);
+    }
+
+    const char* spec = std::getenv("RKLLM_LINEAR_EXTRA_M");
+    if (spec && spec[0] != '\0') {
+        const char* p = spec;
+        while (*p) {
+            while (*p == ',' || *p == ' ' || *p == '\t') {
+                ++p;
+            }
+            if (!*p) {
+                break;
+            }
+            char* end = nullptr;
+            long parsed = std::strtol(p, &end, 10);
+            if (end == p) {
+                while (*p && *p != ',') {
+                    ++p;
+                }
+                continue;
+            }
+            if (parsed > 1 && parsed < max_m) {
+                values.push_back((int)parsed);
+            }
+            p = end;
+        }
+    }
+
+    std::sort(values.begin(), values.end());
+    values.erase(std::unique(values.begin(), values.end()), values.end());
+    constexpr size_t kMaxDynamicShapes = 4;
+    if (values.size() > kMaxDynamicShapes) {
+        std::fprintf(stderr,
+                     "[NpuLinear] RKLLM_LINEAR_EXTRA_M creates %zu dynamic shapes; keep first %zu to avoid RKNN fd pressure\n",
+                     values.size(), kMaxDynamicShapes);
+        values.resize(kMaxDynamicShapes);
+        if (values.back() != max_m) {
+            values.back() = max_m;
+            std::sort(values.begin(), values.end());
+            values.erase(std::unique(values.begin(), values.end()), values.end());
+        }
+    }
+    return values;
+}
+
 bool shard_dynamic_m_enabled() {
     const char* v = std::getenv("RKLLM_SHARD_DYNAMIC_M");
     return v && v[0] != '\0' &&
@@ -80,7 +129,14 @@ uint32_t fp16_cache_flags_for_dynamic_m(bool dynamic_m, int max_m, bool output_f
         return flags;
     }
     const uint32_t capped_m = (uint32_t)std::min(std::max(max_m, 1), 0xffff);
+    uint32_t extra_sig = 0;
+    for (int m : dynamic_m_values(max_m)) {
+        if (m > 1 && m < max_m) {
+            extra_sig = (extra_sig * 131u) ^ (uint32_t)m;
+        }
+    }
     flags |= 0x1u | (capped_m << 8);
+    flags |= (extra_sig & 0xffu) << 24;
     return flags;
 }
 
@@ -260,10 +316,12 @@ bool NpuLinear::create_context_and_b(int K, int N, rknn_matmul_info* info_out) {
     const bool allow_dynamic_m = (!has_core_mask_ || shard_dynamic_m_enabled()) && N_ <= 32768;
     dynamic_max_m_ = allow_dynamic_m ? dynamic_m_limit() : 1;
     if (dynamic_max_m_ > 1) {
-        dynamic_shapes_.resize(2);
-        dynamic_io_attrs_.resize(2);
-        dynamic_shapes_[0] = rknn_matmul_shape{1, K_, N_};
-        dynamic_shapes_[1] = rknn_matmul_shape{dynamic_max_m_, K_, N_};
+        dynamic_ms_ = dynamic_m_values(dynamic_max_m_);
+        dynamic_shapes_.resize(dynamic_ms_.size());
+        dynamic_io_attrs_.resize(dynamic_ms_.size());
+        for (size_t i = 0; i < dynamic_ms_.size(); ++i) {
+            dynamic_shapes_[i] = rknn_matmul_shape{dynamic_ms_[i], K_, N_};
+        }
         ret = rknn_matmul_create_dynamic_shape(
             &ctx_, &info, (int)dynamic_shapes_.size(),
             dynamic_shapes_.data(), dynamic_io_attrs_.data());
@@ -274,6 +332,7 @@ bool NpuLinear::create_context_and_b(int K, int N, rknn_matmul_info* info_out) {
             ctx_ = 0;
             dynamic_shapes_.clear();
             dynamic_io_attrs_.clear();
+            dynamic_ms_.clear();
             dynamic_m_ = false;
             dynamic_max_m_ = 1;
         } else {
@@ -307,6 +366,7 @@ bool NpuLinear::create_context_and_b(int K, int N, rknn_matmul_info* info_out) {
                 io_attr_ = {};
                 dynamic_shapes_.clear();
                 dynamic_io_attrs_.clear();
+                dynamic_ms_.clear();
                 dynamic_m_ = false;
                 dynamic_max_m_ = 1;
 
@@ -468,11 +528,10 @@ int NpuLinear::dynamic_index_for_m(int M) const {
     if (!dynamic_m_) {
         return -1;
     }
-    if (M == 1) {
-        return 0;
-    }
-    if (M == dynamic_max_m_ && dynamic_io_attrs_.size() >= 2) {
-        return 1;
+    for (size_t i = 0; i < dynamic_ms_.size(); ++i) {
+        if (dynamic_ms_[i] == M && i < dynamic_io_attrs_.size()) {
+            return (int)i;
+        }
     }
     return -1;
 }
@@ -728,6 +787,7 @@ void NpuLinear::destroy() {
     alloc_M_ = 0;
     dynamic_shapes_.clear();
     dynamic_io_attrs_.clear();
+    dynamic_ms_.clear();
     dynamic_m_ = false;
     dynamic_max_m_ = 1;
 }

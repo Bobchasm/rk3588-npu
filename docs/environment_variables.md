@@ -15,24 +15,54 @@
 默认正确性测试：
 
 ```bash
-./qwen2_chat Qwen1.5B 64 < cases.txt > out.txt 2> log.txt
+RKLLM_PRESET=accurate ./qwen2_chat Qwen1.5B 64 < cases.txt > out.txt 2> log.txt
 ```
 
-prefill 速度测试常用组合：
+速度/质量折中：
 
 ```bash
-RKLLM_LINEAR_BATCH=23 RKLLM_SHARD_DYNAMIC_M=1 RKLLM_NPU_ATTENTION=1 \
-./qwen2_chat Qwen1.5B 64 < cases.txt > out.txt 2> log.txt
+RKLLM_PRESET=balanced ./qwen2_chat Qwen1.5B 64 < cases.txt > out.txt 2> log.txt
+```
+
+最快速度实验：
+
+```bash
+RKLLM_PRESET=fast ./qwen2_chat Qwen1.5B 64 < cases.txt > out.txt 2> log.txt
 ```
 
 带 profile 的排查组合：
 
 ```bash
-RKLLM_PROFILE=1 RKLLM_LINEAR_BATCH=23 RKLLM_SHARD_DYNAMIC_M=1 RKLLM_NPU_ATTENTION=1 \
+RKLLM_PROFILE=1 RKLLM_PRESET=balanced \
 ./qwen2_chat Qwen1.5B 64 < cases.txt > out.txt 2> log.txt
 ```
 
 注意：`RKLLM_BATCH_TRACE`、`RKLLM_NPU_ATTENTION_TRACE`、`RKLLM_NPU_ATTENTION_VERIFY` 会增加日志和额外 CPU 计算，不适合正式测速。
+
+## Preset
+
+### `RKLLM_PRESET`
+
+- 默认：不设置，直接使用当前环境变量。
+- 作用：在模型加载前填充一组推荐环境变量；已经显式设置的变量不会被覆盖。
+- 可选值：
+  - `accurate`：FP16 正确性基准，设置 `RKLLM_LINEAR_BATCH=30`、`RKLLM_SHARD_DYNAMIC_M=1`、`RKLLM_NPU_WEIGHT_DTYPE=fp16`。
+  - `balanced`：速度/质量折中，设置 `RKLLM_NPU_WEIGHT_DTYPE=int8`、`RKLLM_NPU_INT8_SCOPE=gate_up,attn`、`RKLLM_A8W8_NEON_QUANT=1`，并使用 `RKLLM_LINEAR_BATCH=30`。
+  - `fast`：最快实验路径，设置 `RKLLM_NPU_INT8_SCOPE=all`，其余同 `balanced`。
+  - `custom`：不做任何设置。
+- 入口：`qwen2_chat` 和 `qwen2_demo` 都会调用 preset。
+
+### 一键 benchmark
+
+```bash
+python3 scripts/bench_presets.py --run-remote --log-dir /tmp/rk3588_preset_bench
+```
+
+脚本会在板端依次运行 `accurate`、`balanced`、`fast`，拉回日志并输出 markdown 表格。只解析已有日志时：
+
+```bash
+python3 scripts/bench_presets.py --log-dir /tmp/rk3588_preset_bench
+```
 
 ## 日志和 Profile
 
@@ -92,7 +122,7 @@ RKLLM_PROFILE=1 RKLLM_LINEAR_BATCH=23 RKLLM_SHARD_DYNAMIC_M=1 RKLLM_NPU_ATTENTIO
 
 - 默认：`1`。
 - 作用：设置 prefill 阶段 linear 的目标 batch 行数，也就是 NPU matmul 的 `M`。
-- 典型值：prompt 有 23 个 token 时用 `RKLLM_LINEAR_BATCH=23`。
+- 取值建议：按当前批次/服务的常见 prompt 上限选值；例如 `cases.txt` 的 prompt 为 23-30 token，`RKLLM_LINEAR_BATCH=30` 比 `23` 更适合 prefill。
 - 影响路径：
   - `run_linear_batched_or_throw()` 使用它决定按多少行分块。
   - `NpuLinear`、`NpuLinearW8`、`NpuLinearI4` 用它创建 dynamic shape。
@@ -101,6 +131,16 @@ RKLLM_PROFILE=1 RKLLM_LINEAR_BATCH=23 RKLLM_SHARD_DYNAMIC_M=1 RKLLM_NPU_ATTENTIO
   - `M>1` 需要后端支持 dynamic shape，否则会 fallback 到逐行。
   - 对三核分片后端，通常还需要配合 `RKLLM_SHARD_DYNAMIC_M=1`。
   - 改变该值会改变 native cache header flags，可能导致旧缓存 miss。
+  - 默认只创建 `M=1` 和 `M=RKLLM_LINEAR_BATCH` 两个 dynamic shape；尾块会 padding 到目标 batch。
+  - 尝试创建 `1..30` 全 shape 会让 RKNN runtime 消耗过多 fd，不建议直接启用。
+
+### `RKLLM_LINEAR_EXTRA_M`
+
+- 默认：不设置。
+- 作用：给 prefill linear 额外创建少量 dynamic shape，格式为逗号分隔的 `M` 值，例如 `RKLLM_LINEAR_EXTRA_M=23,24`。
+- 限制：后端最多保留 4 个 dynamic shape，包含固定的 `1` 和 `RKLLM_LINEAR_BATCH`，超出会截断，以避免 RKNN fd 压力。
+- 适用场景：prompt 长度高度集中在少数值，并且服务会充分预热这些 shape。
+- 实测结论：在当前 16 条 `cases.txt` 上，`fast + RKLLM_LINEAR_BATCH=30` 平均 prefill 为 `1111.4 ms`；加入 `RKLLM_LINEAR_EXTRA_M=23,24` 后平均为 `1139.0 ms`，不适合作为默认 preset。单条 23/24 token 在预热后可能变快，但首次运行额外 shape 会带来初始化开销。
 
 ### `RKLLM_SHARD_DYNAMIC_M`
 
@@ -248,12 +288,27 @@ RKLLM_PROFILE=1 RKLLM_LINEAR_BATCH=23 RKLLM_SHARD_DYNAMIC_M=1 RKLLM_NPU_ATTENTIO
 - 作用：启用 A8W8 时，限制哪些 linear 使用 int8。
 - 可选值：
   - `gate_up`
+  - `qkv`
+  - `o_proj`
+  - `down` 或 `down_proj`
   - `mlp`：gate_up 和 down。
   - `attn`：qkv 和 o_proj。
   - `lm_head`
   - `all`
   - `off` 或 `none`
-- 未识别值会打印警告并回到 `gate_up`。
+- 支持逗号组合，例如 `gate_up,attn` 或 `gate_up,o_proj`。
+- 未识别 token 会打印警告；已识别 token 仍会正常生效，未匹配的层保持关闭。
+- 当前 16 条 `cases.txt` 实测：
+  - `all + RKLLM_LINEAR_BATCH=30` 是最快 decode 组合，约 `7.54-7.57 tok/s`，首 token 命中 `9/16`。
+  - `qkv,o_proj,gate_up,down` 保持 `lm_head` 为 FP16，decode 降到约 `7.08 tok/s`，只把首 token 命中提高到 `10/16`，不建议作为默认。
+  - `gate_up,attn` 更稳，首 token 命中 `16/16`，但 decode 约 `6.44 tok/s`。
+
+### `RKLLM_A8W8_SHARED_QUANT_A`
+
+- 默认：关闭。
+- 作用：实验性地让 A8W8 三核 N 维分片共享第 0 个 shard 量化后的 INT8 A buffer，避免每个 shard 重复量化同一行激活。
+- 开启值：`1`、`true`、`TRUE`、`on`、`ON`。
+- 实测结论：在当前 RKNN runtime 上，虽然 NPU run 时间略降，但每层每 token 绑定共享 fd 的开销更大。16 条 `cases.txt` 下 `fast` decode 从 `7.57 tok/s` 降到 `7.38 tok/s`，prefill 从约 `1140 ms` 升到 `1335 ms`，因此不作为默认。
 
 ### `RKLLM_NPU_INT4_SCOPE`
 

@@ -24,6 +24,7 @@
 // ============================================================
 
 #include "api/llm_engine.h"
+#include "api/env_preset.h"
 
 #include <csignal>
 #include <cstdio>
@@ -60,6 +61,8 @@ int main(int argc, char* argv[]) {
 
     std::string model_dir       = argv[1];
     int         max_new_tokens  = (argc >= 3) ? std::atoi(argv[2]) : 128;
+
+    apply_rkllm_env_preset();
 
     std::fprintf(stderr, "[qwen2_chat] 加载模型: %s\n", model_dir.c_str());
 

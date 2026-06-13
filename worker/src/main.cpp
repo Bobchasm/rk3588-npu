@@ -16,6 +16,7 @@
 // ============================================================
 
 #include "api/llm_engine.h"
+#include "api/env_preset.h"
 
 #include <algorithm>
 #include <csignal>
@@ -53,6 +54,8 @@ int main(int argc, char* argv[]) {
     std::string model_dir = argv[1];
     std::vector<int> input_ids;
     for (int i = 2; i < argc; ++i) input_ids.push_back(std::atoi(argv[i]));
+
+    apply_rkllm_env_preset();
 
     std::printf("[build] matmul-api A8W8(INT8xINT8->INT32) path available\n");
     std::printf("模型目录: %s\n", model_dir.c_str());
