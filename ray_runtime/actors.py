@@ -45,6 +45,7 @@ class FullModelWorkerActor:
             f"target={self._target} device={self._device}",
             flush=True,
         )
+        print("[ray/FullModelWorkerActor] ---------- ready for requests ----------", flush=True)
 
     def metadata(self) -> dict:
         return {

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import logging
 import sys
 from pathlib import Path
 
@@ -17,6 +18,7 @@ def usage():
 
 
 def load_tokenizer(model_dir):
+    logging.getLogger("transformers").setLevel(logging.ERROR)
     return AutoTokenizer.from_pretrained(model_dir)
 
 

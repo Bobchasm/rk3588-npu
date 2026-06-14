@@ -1,11 +1,53 @@
 #include "worker_interface.h"
 
 #include "network/rpc_client.h"
+#include <cstdio>
 #include <iostream>
+#include <sstream>
 
 #ifdef SCHEDULER_USE_WORKER_CORE
 #include <api/llm_engine.h>
 #endif
+
+namespace {
+
+#ifndef SCHEDULER_REPO_ROOT
+#define SCHEDULER_REPO_ROOT "."
+#endif
+
+std::string escape_shell_arg(const std::string& arg) {
+    std::string escaped;
+    escaped.reserve(arg.size() + 2);
+    for (char ch : arg) {
+        if (ch == '\\' || ch == '"') {
+            escaped.push_back('\\');
+        }
+        escaped.push_back(ch);
+    }
+    return "\"" + escaped + "\"";
+}
+
+bool run_command(const std::string& command, std::string& output) {
+    FILE* pipe = popen(command.c_str(), "r");
+    if (!pipe) {
+        return false;
+    }
+
+    output.clear();
+    char buffer[256];
+    while (fgets(buffer, sizeof(buffer), pipe)) {
+        output += buffer;
+    }
+
+    const int status = pclose(pipe);
+    return status == 0;
+}
+
+std::string ray_generate_script_path() {
+    return std::string(SCHEDULER_REPO_ROOT) + "/scheduler/tools/ray_generate.py";
+}
+
+}  // namespace
 
 class LocalWorker : public WorkerInterface {
 public:
@@ -199,6 +241,109 @@ private:
     RequestId next_request_id_;
 };
 
+class RayWorker : public WorkerInterface {
+public:
+    RayWorker(std::string actor_name, WorkerId worker_id)
+        : worker_id_(std::move(worker_id)), actor_name_(std::move(actor_name)) {}
+
+    bool register_node(const WorkerId& id) override {
+        worker_id_ = id;
+        return true;
+    }
+
+    void set_worker_id(const WorkerId& id) override {
+        worker_id_ = id;
+    }
+
+    WorkerId worker_id() const override {
+        return worker_id_;
+    }
+
+    bool supports_full_model() const override {
+        return true;
+    }
+
+    bool supports_stage() const override {
+        return false;
+    }
+
+    GenerationResult generate_tokens(const GenerateTokensRequest& req,
+                                     TokenCallback on_token = nullptr) override
+    {
+        (void)req.context;
+        std::ostringstream cmd;
+        cmd << "PYTHONPATH=" << escape_shell_arg(std::string(SCHEDULER_REPO_ROOT) + "/bindings/python")
+            << " python3 "
+            << escape_shell_arg(ray_generate_script_path())
+            << " --actor-name " << escape_shell_arg(actor_name_)
+            << " --max-new-tokens " << req.generation.max_new_tokens
+            << " --repetition-window " << req.generation.repetition_window;
+        for (int token_id : req.input_token_ids) {
+            cmd << " " << token_id;
+        }
+
+        std::string raw;
+        GenerationResult result;
+        if (!run_command(cmd.str(), raw)) {
+            result.error_message = "Ray worker command failed";
+            return result;
+        }
+
+        std::istringstream lines(raw);
+        std::string line;
+        while (std::getline(lines, line)) {
+            if (line.rfind("STATUS ", 0) == 0) {
+                if (line.substr(7) != "OK") {
+                    if (result.error_message.empty()) {
+                        result.error_message = "Ray worker returned error";
+                    }
+                }
+            } else if (line.rfind("ERROR ", 0) == 0) {
+                result.error_message = line.substr(6);
+            } else if (line.rfind("OUTPUT_IDS ", 0) == 0) {
+                std::istringstream iss(line.substr(11));
+                int token_id = 0;
+                while (iss >> token_id) {
+                    result.output_ids.push_back(token_id);
+                }
+            } else if (line.rfind("PREFILL_TOKENS ", 0) == 0) {
+                result.prefill_tokens = std::stoi(line.substr(15));
+            } else if (line.rfind("DECODE_TOKENS ", 0) == 0) {
+                result.decode_tokens = std::stoi(line.substr(14));
+            } else if (line.rfind("PREFILL_MS ", 0) == 0) {
+                result.prefill_ms = std::stof(line.substr(11));
+            } else if (line.rfind("DECODE_MS ", 0) == 0) {
+                result.decode_ms = std::stof(line.substr(10));
+            } else if (line.rfind("HIT_STOP ", 0) == 0) {
+                result.hit_stop = line.substr(9) == "1";
+            } else if (line.rfind("HIT_REPETITION ", 0) == 0) {
+                result.hit_repetition = line.substr(15) == "1";
+            } else if (line.rfind("REQUEST_COUNT ", 0) == 0) {
+                result.request_count = std::stoi(line.substr(14));
+            }
+        }
+
+        if (result.error_message.empty() && on_token) {
+            for (int step = 0; step < static_cast<int>(result.output_ids.size()); ++step) {
+                on_token(step, result.output_ids[step], result.decode_ms);
+            }
+        }
+        return result;
+    }
+
+    StageForwardResponse forward_stage(const StageForwardRequest& req) override {
+        StageForwardResponse resp;
+        resp.context = req.context;
+        resp.status = RequestStatus::kUnsupported;
+        resp.message = "RayWorker does not support stage forwarding yet";
+        return resp;
+    }
+
+private:
+    WorkerId worker_id_;
+    std::string actor_name_;
+};
+
 std::unique_ptr<WorkerInterface> make_local_worker(const std::string& model_dir) {
     return std::make_unique<LocalWorker>(model_dir);
 }
@@ -210,4 +355,9 @@ std::unique_ptr<WorkerInterface> make_remote_worker(const std::string& endpoint,
         return nullptr;
     }
     return worker;
+}
+
+std::unique_ptr<WorkerInterface> make_ray_worker(const std::string& actor_name,
+                                                 const WorkerId& worker_id) {
+    return std::make_unique<RayWorker>(actor_name, worker_id);
 }

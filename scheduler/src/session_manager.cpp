@@ -38,8 +38,12 @@ std::string SessionManager::get_prompt(const SessionId& session_id, int max_toke
 
     std::ostringstream oss;
     for (const auto& message : it->second.history) {
-        oss << "[" << message.role << "] " << message.text << "\n";
+        oss << "<|im_start|>" << message.role << "\n"
+            << message.text
+            << "<|im_end|>\n";
     }
+    // Qwen chat template expects the next assistant turn prefix without im_end.
+    oss << "<|im_start|>assistant\n";
     std::string prompt = oss.str();
     if (max_tokens > 0 && (int)prompt.size() > max_tokens) {
         prompt = prompt.substr(prompt.size() - max_tokens);

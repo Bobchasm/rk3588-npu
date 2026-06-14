@@ -20,6 +20,7 @@ struct GenerationResult {
     std::vector<int> output_ids;
     std::string output_text;
     std::vector<int> prompt_ids;
+    int request_count = 0;
     int prefill_tokens = 0;
     int decode_tokens = 0;
     float prefill_ms = 0.0f;

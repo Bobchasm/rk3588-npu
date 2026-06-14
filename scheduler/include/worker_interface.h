@@ -33,3 +33,5 @@ public:
 std::unique_ptr<WorkerInterface> make_local_worker(const std::string& model_dir);
 std::unique_ptr<WorkerInterface> make_remote_worker(const std::string& endpoint,
                                                     const WorkerId& worker_id);
+std::unique_ptr<WorkerInterface> make_ray_worker(const std::string& actor_name,
+                                                 const WorkerId& worker_id);
