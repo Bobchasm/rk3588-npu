@@ -45,6 +45,8 @@ LLMEngine::LLMEngine() : model_(new Qwen2Model()) {}
 LLMEngine::~LLMEngine() { destroy(); }
 
 bool LLMEngine::load(const std::string& model_dir, ComputeDevice device) {
+    const int64_t t0 = now_us();
+    std::fprintf(stderr, "[worker-pc/LLMEngine] load begin model_dir=%s\n", model_dir.c_str());
     device_cfg_ = resolve_device_config(device);
 
     if (device_cfg_.requested == ComputeDevice::kAuto) {
@@ -59,6 +61,11 @@ bool LLMEngine::load(const std::string& model_dir, ComputeDevice device) {
     const bool ok = model_->load(model_dir, device_cfg_.resolved);
     if (!ok) {
         model_->destroy();
+        std::fprintf(stderr, "[worker-pc/LLMEngine] load failed elapsed_ms=%.2f\n",
+                     (now_us() - t0) / 1e3f);
+    } else {
+        std::fprintf(stderr, "[worker-pc/LLMEngine] load done elapsed_ms=%.2f\n",
+                     (now_us() - t0) / 1e3f);
     }
     return ok;
 }
@@ -77,6 +84,9 @@ GenerationResult LLMEngine::generate(
     const std::vector<int>& input_ids,
     const GenerationConfig& cfg,
     TokenCallback on_token) {
+    std::fprintf(stderr,
+                 "[worker-pc/LLMEngine] generate begin input_tokens=%d max_new_tokens=%d\n",
+                 static_cast<int>(input_ids.size()), cfg.max_new_tokens);
     GenerationResult result;
     if (input_ids.empty()) {
         return result;
@@ -125,6 +135,9 @@ GenerationResult LLMEngine::generate(
 
         result.decode_ms = (now_us() - decode_begin) / 1e3f;
         result.decode_tokens = static_cast<int>(result.output_ids.size());
+        std::fprintf(stderr,
+                     "[worker-pc/LLMEngine] generate done prefill_ms=%.2f decode_ms=%.2f output_tokens=%d\n",
+                     result.prefill_ms, result.decode_ms, result.decode_tokens);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[worker-pc/LLMEngine] generate failed: %s\n", e.what());
         model_->reset_kv_cache();

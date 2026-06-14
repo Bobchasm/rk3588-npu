@@ -260,7 +260,7 @@ cd ~/worker
 ./scripts/setup_python_deps.sh
 
 # 方式二：手动
-conda create -y -n rk3588 python=3.8
+conda create -y -n rk3588 python=3.10
 conda activate rk3588
 pip install -r requirements.txt
 ```
@@ -289,3 +289,148 @@ ssh -N -g -L 0.0.0.0:5001:127.0.0.1:5001 root@172.28.9.59
 cd /scheduler/build
 ./scheduler_cli ~/rk3588-npu/models/qwen1.5b-instruct/Qwen2-1.5B-Instruct 172.26.0.1:5001
 ```
+
+
+# PC 跑通 Ray 的环境配置 + 运行
+
+这一节只说明当前已经跑通的 `pc` 路径，也就是：
+
+```text
+用户文本 -> scheduler / client -> Ray actor -> Python binding -> worker-pc -> token 输出
+```
+
+当前 `rk3588` 路径仍在验证中，不放进这里的主运行流程。
+
+## 1. 环境准备
+
+建议使用 `rk3588` conda 环境：
+
+```bash
+conda activate rk3588
+pip install -r requirements.txt
+```
+
+如果还没有环境：
+
+```bash
+conda create -y -n rk3588 python=3.10
+conda activate rk3588
+pip install -r requirements.txt
+```
+
+## 2. 构建 PC 版 binding
+
+```bash
+rm -rf bindings/build
+rm -f bindings/python/runtime/pc_engine*.so
+cmake -S bindings -B bindings/build
+cmake --build bindings/build -j4
+```
+
+成功后，`bindings/python/runtime/` 下应出现 `pc_engine` 对应的 `.so` 文件。
+
+## 3. 先直接验证 worker-pc
+
+```bash
+PYTHONPATH=bindings/python python3 - <<'PY'
+from runtime import create_engine
+engine = create_engine("pc")
+engine.load("models/qwen1.5b-instruct/Qwen2-1.5B-Instruct", "gpu")
+result = engine.generate([151644, 8948, 198], max_new_tokens=4)
+print(result)
+engine.destroy()
+PY
+```
+
+如果本机 GPU 不可用，可以先把 `"gpu"` 换成 `"cpu"` 或 `"auto"`。
+
+## 4. 启动 Ray 常驻 worker
+
+```bash
+PYTHONPATH=bindings/python \
+RAY_memory_monitor_refresh_ms=0 \
+RAY_memory_usage_threshold=0.99 \
+python3 ray_runtime/serve_worker.py \
+  models/qwen1.5b-instruct/Qwen2-1.5B-Instruct \
+  --target pc \
+  --device gpu \
+  --actor-name pc-full-model
+```
+
+说明：
+
+- `--target pc`：当前只跑通 PC 实现
+- `--device gpu`：明确走 GPU
+- `--device auto`：自动探测 GPU，没有则回退 CPU
+- `pc-full-model`：这个 actor 的名字，可自定义
+
+首次启动会有模型冷加载，耗时明显长于后续请求，属于正常现象。
+
+## 5. 从另一个终端发送请求
+
+```bash
+PYTHONPATH=bindings/python python3 ray_runtime/generate_request.py \
+  --actor-name pc-full-model \
+  151644 8948 198
+```
+
+如果想直接用固定测试输入，也可以：
+
+```bash
+PYTHONPATH=bindings/python python3 ray_runtime/generate_request.py \
+  --actor-name pc-full-model \
+  151644 8948 198 2610 525 264 10950 17847 13 151645 198 151644 872 198 108386 37945 109432 107828 151645 198 151644 77091 198
+```
+
+返回结果是 JSON，重点看：
+
+- `output_ids`
+- `prefill_ms`
+- `decode_ms`
+- `elapsed_ms`
+- `request_count`
+
+如果 `request_count` 递增而 Ray 服务端没有重新打印 `load begin`，说明模型确实只加载了一次。
+
+## 6. 查看和停止 actor
+
+查看状态：
+
+```bash
+PYTHONPATH=bindings/python python3 ray_runtime/actor_status.py \
+  --actor-name pc-full-model
+```
+
+停止服务：
+
+```bash
+PYTHONPATH=bindings/python python3 ray_runtime/stop_worker.py \
+  --actor-name pc-full-model
+```
+
+如果 `serve_worker.py` 是前台启动的，也可以直接在那个终端按 `Ctrl+C`。
+
+## 7. 只做一次性验证
+
+如果只是想快速验证整条 Ray 链，而不需要常驻加载，可以直接用：
+
+```bash
+PYTHONPATH=bindings/python python3 ray_runtime/single_worker_demo.py \
+  models/qwen1.5b-instruct/Qwen2-1.5B-Instruct \
+  --target pc \
+  --device gpu \
+  151644 8948 198
+```
+
+它会启动临时 actor，跑完一次请求后退出。
+
+## 8. 和调度器的关系
+
+当前最推荐的分层是：
+
+- `scheduler/`：负责用户输入文本、session/history、tokenize、decode
+- `ray_runtime/`：负责常驻 actor、模型生命周期、后续多节点调度
+- `worker-pc/`：负责真正的 PC 端推理执行
+
+也就是说，后面要把“用户输入文本 -> 文本输出”整条链跑通时，不是丢掉调度器，而是让调度器改为连接 Ray 后端。
+

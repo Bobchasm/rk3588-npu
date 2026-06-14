@@ -53,6 +53,8 @@ add_library(worker_pc_core STATIC
     ${WORKER_PC_API_SOURCES}
 )
 
+set_target_properties(worker_pc_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 target_include_directories(worker_pc_core PUBLIC
     include
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/include

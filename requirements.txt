@@ -4,3 +4,5 @@ sentencepiece
 requests
 numpy
 tqdm
+pybind11>=3.0
+ray[default]>=2.55

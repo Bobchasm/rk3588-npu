@@ -24,8 +24,8 @@ else
 fi
 
 if ! conda env list | awk '{print $1}' | grep -qx "$ENV_NAME"; then
-  echo "Conda 环境 '$ENV_NAME' 不存在，正在创建 (python=3.8)..."
-  conda create -y -n "$ENV_NAME" python=3.8
+  echo "Conda 环境 '$ENV_NAME' 不存在，正在创建 (python=3.10)..."
+  conda create -y -n "$ENV_NAME" python=3.10
 fi
 
 echo "激活环境 $ENV_NAME ..."

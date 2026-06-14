@@ -1,0 +1,145 @@
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+
+#ifndef RK3588_ENGINE_SMOKE_TEST
+#include "api/generation_config.h"
+#include "api/llm_engine.h"
+#include "ops/op_linear.h"
+#endif
+
+#include <cstdio>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace py = pybind11;
+
+namespace {
+
+#ifndef RK3588_ENGINE_SMOKE_TEST
+LinearBackend parse_linear_backend(const std::string& text) {
+    std::string value = text;
+    for (char& ch : value) {
+        if (ch >= 'A' && ch <= 'Z') {
+            ch = static_cast<char>(ch - 'A' + 'a');
+        }
+    }
+    if (value.empty() || value == "auto" || value == "npu") {
+        return LinearBackend::NPU;
+    }
+    if (value == "cpu") {
+        return LinearBackend::CPU;
+    }
+    if (value == "npu_single" || value == "single") {
+        return LinearBackend::NPU_SINGLE;
+    }
+    if (value == "npu_sharded" || value == "sharded") {
+        return LinearBackend::NPU_SHARDED;
+    }
+    throw std::invalid_argument("unsupported rk3588 backend: " + text);
+}
+#endif
+
+#ifdef RK3588_ENGINE_SMOKE_TEST
+class PyRk3588Engine {
+public:
+    PyRk3588Engine() = default;
+
+    void load(const std::string&, const std::string&) {}
+    void reset() {}
+    void destroy() {}
+    py::dict generate(const std::vector<int>&, int, int, const std::vector<int>&) {
+        throw std::runtime_error("rk3588 smoke test module: worker_core is disabled");
+    }
+};
+#else
+class PyRk3588Engine {
+public:
+    PyRk3588Engine() : engine_(std::make_unique<LLMEngine>()) {}
+
+    void load(const std::string& model_dir, const std::string& backend) {
+        std::fprintf(stderr, "[bindings/rk3588_engine] load enter backend=%s model_dir=%s\n",
+                     backend.c_str(), model_dir.c_str());
+        const LinearBackend parsed = parse_linear_backend(backend);
+        if (!engine_->load(model_dir, parsed)) {
+            throw std::runtime_error("failed to load rk3588 worker model");
+        }
+        std::fprintf(stderr, "[bindings/rk3588_engine] load leave\n");
+    }
+
+    void reset() {
+        engine_->reset();
+    }
+
+    void destroy() {
+        engine_->destroy();
+    }
+
+    GenerationResult generate(const std::vector<int>& input_ids,
+                              int max_new_tokens,
+                              int repetition_window,
+                              const std::vector<int>& stop_tokens) {
+        std::fprintf(stderr,
+                     "[bindings/rk3588_engine] generate enter input_tokens=%d max_new_tokens=%d\n",
+                     static_cast<int>(input_ids.size()), max_new_tokens);
+        GenerationConfig cfg;
+        cfg.max_new_tokens = max_new_tokens;
+        cfg.repetition_window = repetition_window;
+        if (!stop_tokens.empty()) {
+            cfg.stop_tokens = stop_tokens;
+        }
+        GenerationResult result = engine_->generate(input_ids, cfg, nullptr);
+        std::fprintf(stderr,
+                     "[bindings/rk3588_engine] generate leave output_tokens=%d\n",
+                     static_cast<int>(result.output_ids.size()));
+        return result;
+    }
+
+private:
+    std::unique_ptr<LLMEngine> engine_;
+};
+#endif
+
+}  // namespace
+
+PYBIND11_MODULE(rk3588_engine, m) {
+#ifdef RK3588_ENGINE_SMOKE_TEST
+    m.doc() = "smoke test pybind11 binding for rk3588 module import";
+    py::class_<PyRk3588Engine>(m, "Engine")
+        .def(py::init<>())
+        .def("load", &PyRk3588Engine::load, py::arg("model_dir"), py::arg("backend") = "npu")
+        .def("reset", &PyRk3588Engine::reset)
+        .def("destroy", &PyRk3588Engine::destroy)
+        .def("generate",
+             &PyRk3588Engine::generate,
+             py::arg("input_ids"),
+             py::arg("max_new_tokens") = 10,
+             py::arg("repetition_window") = 6,
+             py::arg("stop_tokens") = std::vector<int>{});
+    m.def("ping", []() { return "rk3588_engine_smoke_ok"; });
+#else
+    m.doc() = "pybind11 binding for rk3588 worker LLMEngine";
+
+    py::class_<GenerationResult>(m, "GenerationResult")
+        .def_readonly("output_ids", &GenerationResult::output_ids)
+        .def_readonly("prefill_tokens", &GenerationResult::prefill_tokens)
+        .def_readonly("decode_tokens", &GenerationResult::decode_tokens)
+        .def_readonly("prefill_ms", &GenerationResult::prefill_ms)
+        .def_readonly("decode_ms", &GenerationResult::decode_ms)
+        .def_readonly("hit_stop", &GenerationResult::hit_stop)
+        .def_readonly("hit_repetition", &GenerationResult::hit_repetition);
+
+    py::class_<PyRk3588Engine>(m, "Engine")
+        .def(py::init<>())
+        .def("load", &PyRk3588Engine::load, py::arg("model_dir"), py::arg("backend") = "npu")
+        .def("reset", &PyRk3588Engine::reset)
+        .def("destroy", &PyRk3588Engine::destroy)
+        .def("generate",
+             &PyRk3588Engine::generate,
+             py::arg("input_ids"),
+             py::arg("max_new_tokens") = 10,
+             py::arg("repetition_window") = 6,
+             py::arg("stop_tokens") = std::vector<int>{});
+#endif
+}
