@@ -19,11 +19,21 @@ class PyPcEngine {
 public:
     PyPcEngine() : engine_(std::make_unique<LLMEngine>()) {}
 
-    void load(const std::string& model_dir, const std::string& device) {
+    void load(const std::string& model_dir,
+              const std::string& device,
+              int layer_begin = 0,
+              int layer_end = -1,
+              bool include_embedding = true,
+              bool include_final_norm_and_head = true) {
         std::fprintf(stderr, "[bindings/pc_engine] load enter device=%s model_dir=%s\n",
                      device.c_str(), model_dir.c_str());
         const ComputeDevice parsed = parse_compute_device(device);
-        if (!engine_->load(model_dir, parsed)) {
+        LLMEngine::PartitionConfig partition;
+        partition.layer_begin = layer_begin;
+        partition.layer_end = layer_end;
+        partition.include_embedding = include_embedding;
+        partition.include_final_norm_and_head = include_final_norm_and_head;
+        if (!engine_->load(model_dir, parsed, partition)) {
             throw std::runtime_error("failed to load worker-pc model");
         }
         std::fprintf(stderr, "[bindings/pc_engine] load leave\n");
@@ -35,6 +45,37 @@ public:
 
     void destroy() {
         engine_->destroy();
+    }
+
+    std::vector<uint16_t> tokens_to_hidden(const std::vector<int>& input_ids) {
+        std::vector<uint16_t> output;
+        std::string error;
+        if (!engine_->forward_tokens_to_hidden(input_ids, output, &error)) {
+            throw std::runtime_error(error.empty() ? "tokens_to_hidden failed" : error);
+        }
+        return output;
+    }
+
+    std::vector<uint16_t> hidden_forward(const std::vector<uint16_t>& input_f16,
+                                         int seq,
+                                         int pos_base) {
+        std::vector<uint16_t> output;
+        std::string error;
+        if (!engine_->forward_hidden_states(input_f16, seq, pos_base, output, &error)) {
+            throw std::runtime_error(error.empty() ? "hidden_forward failed" : error);
+        }
+        return output;
+    }
+
+    int hidden_to_token(const std::vector<uint16_t>& input_f16,
+                        int seq,
+                        int pos_base) {
+        int token_id = 0;
+        std::string error;
+        if (!engine_->forward_hidden_to_token(input_f16, seq, pos_base, token_id, &error)) {
+            throw std::runtime_error(error.empty() ? "hidden_to_token failed" : error);
+        }
+        return token_id;
     }
 
     GenerationResult generate(const std::vector<int>& input_ids,
@@ -77,9 +118,19 @@ PYBIND11_MODULE(pc_engine, m) {
 
     py::class_<PyPcEngine>(m, "Engine")
         .def(py::init<>())
-        .def("load", &PyPcEngine::load, py::arg("model_dir"), py::arg("device") = "cpu")
+        .def("load",
+             &PyPcEngine::load,
+             py::arg("model_dir"),
+             py::arg("device") = "cpu",
+             py::arg("layer_begin") = 0,
+             py::arg("layer_end") = -1,
+             py::arg("include_embedding") = true,
+             py::arg("include_final_norm_and_head") = true)
         .def("reset", &PyPcEngine::reset)
         .def("destroy", &PyPcEngine::destroy)
+        .def("tokens_to_hidden", &PyPcEngine::tokens_to_hidden)
+        .def("hidden_forward", &PyPcEngine::hidden_forward)
+        .def("hidden_to_token", &PyPcEngine::hidden_to_token)
         .def("generate",
              &PyPcEngine::generate,
              py::arg("input_ids"),

@@ -23,8 +23,23 @@ class _ModuleEngineAdapter:
         module = importlib.import_module(self.module_name, package=__package__)
         self._engine = module.Engine()
 
-    def load(self, model_dir: str, device: str = "cpu") -> None:
-        self._engine.load(model_dir, device)
+    def load(
+        self,
+        model_dir: str,
+        device: str = "cpu",
+        layer_begin: int = 0,
+        layer_end: int = -1,
+        include_embedding: bool = True,
+        include_final_norm_and_head: bool = True,
+    ) -> None:
+        self._engine.load(
+            model_dir,
+            device,
+            layer_begin,
+            layer_end,
+            include_embedding,
+            include_final_norm_and_head,
+        )
 
     def reset(self) -> None:
         self._engine.reset()
@@ -54,6 +69,15 @@ class _ModuleEngineAdapter:
             hit_stop=raw.hit_stop,
             hit_repetition=raw.hit_repetition,
         )
+
+    def tokens_to_hidden(self, input_ids: Sequence[int]):
+        return list(self._engine.tokens_to_hidden(list(input_ids)))
+
+    def hidden_forward(self, input_f16: Sequence[int], seq: int, pos_base: int):
+        return list(self._engine.hidden_forward(list(input_f16), seq, pos_base))
+
+    def hidden_to_token(self, input_f16: Sequence[int], seq: int, pos_base: int):
+        return int(self._engine.hidden_to_token(list(input_f16), seq, pos_base))
 
 
 class PcEngineAdapter(_ModuleEngineAdapter):

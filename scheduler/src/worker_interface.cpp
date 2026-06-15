@@ -47,6 +47,14 @@ std::string ray_generate_script_path() {
     return std::string(SCHEDULER_REPO_ROOT) + "/scheduler/tools/ray_generate.py";
 }
 
+std::string scheduler_python_executable() {
+    const char* env_python = std::getenv("SCHEDULER_RAY_PYTHON");
+    if (env_python && *env_python) {
+        return std::string(env_python);
+    }
+    return "python3";
+}
+
 }  // namespace
 
 class LocalWorker : public WorkerInterface {
@@ -339,15 +347,15 @@ public:
     }
 
     bool supports_tokens_to_hidden() const override {
-        return false;
+        return true;
     }
 
     bool supports_stage() const override {
-        return false;
+        return true;
     }
 
     bool supports_hidden_to_token() const override {
-        return false;
+        return true;
     }
 
     bool reset_cache() override {
@@ -360,7 +368,8 @@ public:
         (void)req.context;
         std::ostringstream cmd;
         cmd << "PYTHONPATH=" << escape_shell_arg(std::string(SCHEDULER_REPO_ROOT) + "/bindings/python")
-            << " python3 "
+            << " " << scheduler_python_executable()
+            << " "
             << escape_shell_arg(ray_generate_script_path())
             << " --actor-name " << escape_shell_arg(actor_name_)
             << " --max-new-tokens " << req.generation.max_new_tokens

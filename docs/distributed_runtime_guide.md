@@ -1,6 +1,6 @@
 # 分布式运行指南
 
-## 自实现
+## 自实现路径
 
 当前文档只描述我们自己这套分布式运行流程：
 
@@ -9,8 +9,6 @@
 - 当前链路是 `head -> stage -> stage -> tail`
 
 当前这套流程还没有接 Ray。Ray 相关内容单独留在文末占位。
-
-## 运行前提
 
 ### 1. 环境
 
@@ -33,7 +31,7 @@ cmake -S scheduler -B scheduler/build
 cmake --build scheduler/build -j4
 ```
 
-### 1. 启动 worker
+### 3. 启动 worker
 
 建议开 4 个终端，分别启动 `head / stage / stage / tail`。
 
@@ -82,7 +80,7 @@ cmake --build scheduler/build -j4
   127.0.0.1:5004
 ```
 
-### 2. 启动调度器
+### 4. 启动调度器
 
 再开一个终端，启动调度器主程序：
 
@@ -95,7 +93,7 @@ cmake --build scheduler/build -j4
   stage:127.0.0.1:5003
 ```
 
-### 3. 输入文本
+### 5. 输入文本
 
 启动后直接在命令行输入文本，例如：
 
@@ -113,7 +111,7 @@ cmake --build scheduler/build -j4
 - 把最后 hidden state 送入 `tail`
 - 把输出 token ids decode 回文本
 
-### 4. 参数说明
+### 6. 参数说明
 
 `scheduler_cli` 这一行里各参数含义如下：
 
@@ -130,7 +128,7 @@ cmake --build scheduler/build -j4
 
 多个 `stage:` 会按命令行顺序串起来执行。
 
-## 默认行为
+**默认行为**
 
 - 当前默认 `max_new_tokens = 64`
 - 当前生成策略是 greedy
@@ -139,7 +137,7 @@ cmake --build scheduler/build -j4
 
 如果后面你要测试 GPU，只需要把各个 worker 启动命令中的 `--device cpu` 改成 `--device gpu` 或 `--device auto`
 
-## 验证工具
+**验证工具**
 
 下面两个工具不是主流程，只是辅助验证：
 
@@ -165,3 +163,139 @@ cmake --build scheduler/build -j4
 - `distributed_generate_demo`
   验证 `head -> stage -> tail` 的最小生成链
 
+## Ray 接入
+
+下面是当前已经可用的 Ray 版本运行方式。
+
+### 1. 先构建 Python binding
+
+```bash
+cmake -S bindings -B bindings/build
+cmake --build bindings/build -j4
+```
+
+还需要重新编译一次 `scheduler`，因为 `ray:pc-distributed` 路径和 Ray Python 调用方式已经补充过：
+
+```bash
+cmake -S scheduler -B scheduler/build
+cmake --build scheduler/build -j4
+```
+
+### 2. 环境配置
+
+建议统一在 `rk3588` conda 环境下运行：
+
+```bash
+conda activate rk3588
+cd ~/rk3588-npu
+```
+
+Ray 分布式版本当前有两个必须注意的环境变量：
+
+```bash
+export PYTHONPATH=bindings/python
+export SCHEDULER_RAY_PYTHON=/home/deep/miniforge3/envs/rk3588/bin/python3.10
+```
+
+含义分别是：
+
+- `PYTHONPATH=bindings/python`
+  让 Ray actor 和 Python binding 能导入 `runtime.pc_engine`
+- `SCHEDULER_RAY_PYTHON=...python3.10`
+  让 `scheduler_cli` 内部调用 `scheduler/tools/ray_generate.py` 时，使用和 Ray 集群一致的 Python 3.10，而不是系统 `python3`
+
+如果机器内存比较紧张，当前还建议额外加：
+
+```bash
+export RAY_memory_monitor_refresh_ms=0
+```
+
+这会关闭 Ray 的内存监控自动杀进程逻辑，避免 `tail actor` 在模型加载过程中因为单机内存接近阈值而被提前杀掉。
+
+### 3. 启动 Ray distributed actor
+
+```bash
+PYTHONPATH=bindings/python python3 ray_runtime/serve_worker.py \
+  models/qwen1.5b-instruct/Qwen2-1.5B-Instruct \
+  --target pc \
+  --device cpu \
+  --mode distributed \
+  --num-stages 1 \
+  --actor-name pc-distributed \
+  --object-store-memory-mb 80
+```
+
+如果是单卡 GPU 机器，不要直接用默认 GPU 资源声明。当前每个分段 actor 都需要共享同一张卡，建议显式设置：
+
+```bash
+PYTHONPATH=bindings/python python3 ray_runtime/serve_worker.py \
+  models/qwen1.5b-instruct/Qwen2-1.5B-Instruct \
+  --target pc \
+  --device gpu \
+  --mode distributed \
+  --num-stages 1 \
+  --actor-name pc-distributed \
+  --object-store-memory-mb 80 \
+  --gpu-fraction 0.25
+```
+
+参数含义：
+
+- `--num-stages 1`
+  当前 Ray 版本使用 `head + 1 stage + tail`
+- `--object-store-memory-mb 80`
+  降低本地 Ray object store 预留，适合低内存机器
+- `--gpu-fraction 0.25`
+  每个 GPU actor 向 Ray 申请 `0.25` 张卡，便于单卡机器同时调度多个 stage actor
+
+如果日志里最终出现：
+
+```text
+[ray/serve_worker] distributed actor ready: {'actor_name': 'pc-distributed', ...}
+[ray/serve_worker] service running, press Ctrl+C to stop
+```
+
+说明这条 Ray 分布式链已经真正拉起来了。
+
+### 4. 直接发送 token 请求
+
+如果只想先验证 Ray actor 本身能否返回 token，可以另开一个终端执行：
+
+```bash
+PYTHONPATH=bindings/python python3 ray_runtime/generate_request.py \
+  --actor-name pc-distributed \
+  151644 8948 198
+```
+
+### 5. 启动调度器，走文本输入到文本输出
+
+如果想跑完整的“用户输入文本 -> 调度器 -> Ray distributed actor -> 文本输出”流程，再开一个终端：
+
+```bash
+export SCHEDULER_RAY_PYTHON=/home/deep/miniforge3/envs/rk3588/bin/python3.10
+./scheduler/build/scheduler_cli \
+  models/qwen1.5b-instruct/Qwen2-1.5B-Instruct \
+  ray:pc-distributed
+```
+
+启动成功后会看到：
+
+```text
+Using Ray worker actor: pc-distributed
+Scheduler CLI started. Enter text to generate, or type /exit.
+```
+
+然后就可以直接输入：
+
+```text
+你好
+```
+
+### 6. 当前注意事项
+
+- CPU 版 Ray distributed 已经可以完成请求
+- 单机低内存下，Ray distributed 仍然比较吃内存
+- 单卡 GPU 下必须设置较小的 `--gpu-fraction`，否则 `head` 起完后 `stage/tail` 会因为 Ray 认为 GPU 不够而一直不调度
+- 当前最外层 `DistributedPipelineActor` 不占 GPU，GPU 资源只分配给 `head/stage/tail`
+- `scheduler_cli` 走 Ray 时，内部会调用 `scheduler/tools/ray_generate.py`，所以必须保证 `SCHEDULER_RAY_PYTHON` 指向和 Ray 集群一致的 Python 环境
+- 如果前一次请求挂住，`DistributedPipelineActor` 由于 `max_concurrency=1` 会阻塞后续请求；这种情况下建议直接停掉当前 Ray 服务，重新启动整组 actor

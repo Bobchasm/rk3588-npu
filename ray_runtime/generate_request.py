@@ -23,7 +23,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    init_ray(args.ray_address or "auto", args.ray_namespace)
+    init_ray(args.ray_address or "auto", args.ray_namespace, args.object_store_memory_mb)
     actor = ray.get_actor(args.actor_name, namespace=args.ray_namespace)
     started = time.time()
     result = ray.get(

@@ -38,6 +38,8 @@ PYTHONPATH=bindings/python python3 ray_runtime/single_worker_demo.py \
 
 ## 2. 启动常驻服务
 
+### 2.1 Full Model 模式
+
 这会启动一个命名 actor，并让模型只加载一次：
 
 ```bash
@@ -54,6 +56,29 @@ PYTHONPATH=bindings/python python3 ray_runtime/serve_worker.py \
 --detach-only
 ```
 
+### 2.2 Distributed 模式
+
+如果想用 Ray 管理 `head/stage/tail` 这套分布式形态，可以启动：
+
+```bash
+PYTHONPATH=bindings/python python3 ray_runtime/serve_worker.py \
+  models/qwen1.5b-instruct/Qwen2-1.5B-Instruct \
+  --target pc \
+  --device auto \
+  --mode distributed \
+  --num-stages 2 \
+  --actor-name pc-distributed
+```
+
+这会在 Ray 内部创建：
+
+- `head actor`
+- `stage actor x N`
+- `tail actor`
+- `distributed pipeline actor`
+
+上层请求仍然只需要调用最外层的 `pc-distributed`。
+
 ## 3. 发送推理请求
 
 另开一个终端：
@@ -61,6 +86,14 @@ PYTHONPATH=bindings/python python3 ray_runtime/serve_worker.py \
 ```bash
 PYTHONPATH=bindings/python python3 ray_runtime/generate_request.py \
   --actor-name pc-full-model \
+  151644 8948 198
+```
+
+如果是 distributed 模式，则把 actor 名字换成：
+
+```bash
+PYTHONPATH=bindings/python python3 ray_runtime/generate_request.py \
+  --actor-name pc-distributed \
   151644 8948 198
 ```
 
@@ -131,11 +164,11 @@ Ray 不是简单把原来的 `worker_rpc_server` 重写一遍，它更像是更�
 
 ## 8. 后续扩展方向
 
-当前 `FullModelWorkerActor` 是“完整模型单节点 actor”。后面扩展分布式时，可以继续沿这个接口拆成：
+当前已经有两种 Ray 形态：
 
-- `StageWorkerActor`
-- `PrefillWorkerActor`
-- `DecodeWorkerActor`
-- `PipelineCoordinator`
+- `FullModelWorkerActor`
+  单 actor 完整模型
+- `DistributedPipelineActor`
+  一个 pipeline actor，内部串 `HeadWorkerActor + StageWorkerActor + TailWorkerActor`
 
-这样可以保持上层调度逻辑稳定，把平台差异继续留在 `bindings/` 和底层 engine 实现里。
+这样可以保持上层调用接口稳定，把平台差异继续留在 `bindings/` 和底层 engine 实现里。

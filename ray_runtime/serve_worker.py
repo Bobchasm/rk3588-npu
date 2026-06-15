@@ -7,7 +7,7 @@ import time
 import ray
 from ray.exceptions import RayError
 
-from actors import FullModelWorkerActor
+from actors import DistributedPipelineActor, FullModelWorkerActor, HeadWorkerActor, StageWorkerActor, TailWorkerActor
 from ray_common import add_runtime_args, build_actor_options, init_ray
 
 
@@ -16,6 +16,8 @@ def parse_args():
     parser.add_argument("model_dir")
     parser.add_argument("--target", default="pc", choices=["pc"])
     parser.add_argument("--device", default="auto", choices=["cpu", "gpu", "auto"])
+    parser.add_argument("--mode", default="full", choices=["full", "distributed"])
+    parser.add_argument("--num-stages", type=int, default=2)
     parser.add_argument("--detach-only", action="store_true",
                         help="Create detached actor and exit without keeping the driver alive")
     add_runtime_args(parser)
@@ -24,18 +26,83 @@ def parse_args():
 
 def main():
     args = parse_args()
-    init_ray(args.ray_address, args.ray_namespace)
+    init_ray(args.ray_address, args.ray_namespace, args.object_store_memory_mb)
 
-    actor_options = build_actor_options(args.device, detached=True)
-    actor_options["name"] = args.actor_name
-    actor = FullModelWorkerActor.options(**actor_options).remote(
-        args.target,
-        args.model_dir,
-        args.device,
-        args.actor_name,
-    )
-    metadata = ray.get(actor.metadata.remote())
-    print(f"[ray/serve_worker] actor ready: {metadata}", flush=True)
+    actor_options = build_actor_options(args.device, detached=True, gpu_fraction=args.gpu_fraction)
+
+    if args.mode == "full":
+        full_actor_options = dict(actor_options)
+        full_actor_options["name"] = args.actor_name
+        actor = FullModelWorkerActor.options(**full_actor_options).remote(
+            args.target,
+            args.model_dir,
+            args.device,
+            args.actor_name,
+        )
+        metadata = ray.get(actor.metadata.remote())
+        print(f"[ray/serve_worker] actor ready: {metadata}", flush=True)
+    else:
+        if args.num_stages == 1:
+            stage_ranges = [(4, 12)]
+            tail_begin = 12
+        elif args.num_stages == 2:
+            stage_ranges = [(4, 8), (8, 12)]
+            tail_begin = 12
+        else:
+            raise ValueError("currently only --num-stages 1 or 2 is supported")
+
+        head_actor_options = dict(actor_options)
+        head_actor_options["name"] = args.actor_name + "-head"
+        head = HeadWorkerActor.options(**head_actor_options).remote(
+            args.target,
+            args.model_dir,
+            args.device,
+            args.actor_name + "-head",
+            0,
+            4,
+        )
+        ray.get(head.metadata.remote())
+        stages = [
+            None
+            for _ in range(args.num_stages)
+        ]
+        for i in range(args.num_stages):
+            stages[i] = StageWorkerActor.options(
+                **{**actor_options, "name": f"{args.actor_name}-stage-{i}"}
+            ).remote(
+                args.target,
+                args.model_dir,
+                args.device,
+                f"{args.actor_name}-stage-{i}",
+                stage_ranges[i][0],
+                stage_ranges[i][1],
+            )
+            ray.get(stages[i].metadata.remote())
+        tail_actor_options = dict(actor_options)
+        tail_actor_options["name"] = args.actor_name + "-tail"
+        tail = TailWorkerActor.options(**tail_actor_options).remote(
+            args.target,
+            args.model_dir,
+            args.device,
+            args.actor_name + "-tail",
+            tail_begin,
+            28,
+        )
+        ray.get(tail.metadata.remote())
+        pipeline_actor_options = {
+            "name": args.actor_name,
+            "max_restarts": 0,
+        }
+        if actor_options.get("lifetime") == "detached":
+            pipeline_actor_options["lifetime"] = "detached"
+        actor = DistributedPipelineActor.options(**pipeline_actor_options).remote(
+            head,
+            stages,
+            tail,
+            args.actor_name,
+        )
+        metadata = ray.get(actor.metadata.remote())
+        print(f"[ray/serve_worker] distributed actor ready: {metadata}", flush=True)
 
     if args.detach_only:
         print("[ray/serve_worker] detach-only mode, exiting launcher", flush=True)

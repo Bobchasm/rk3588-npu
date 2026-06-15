@@ -27,6 +27,9 @@ def parse_args():
 def main() -> int:
     args = parse_args()
     warnings.filterwarnings("ignore", category=FutureWarning, module=r"ray\._private\.worker")
+    python_executable = os.environ.get("SCHEDULER_RAY_PYTHON")
+    if python_executable:
+        os.environ["RAY_PYTHON_EXECUTABLE"] = python_executable
     ray.init(
         address=args.ray_address,
         namespace=args.namespace,
@@ -38,7 +41,7 @@ def main() -> int:
         actor = ray.get_actor(args.actor_name, namespace=args.namespace)
         result = ray.get(
             actor.generate.remote(
-                args.token_ids,
+                input_ids=args.token_ids,
                 max_new_tokens=args.max_new_tokens,
                 repetition_window=args.repetition_window,
             )

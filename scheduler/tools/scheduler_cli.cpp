@@ -9,6 +9,7 @@ int main(int argc, char** argv) {
         std::cerr << "Usage: " << argv[0] << " <model_dir> [remote_endpoint|ray:<actor_name>|head:<endpoint> tail:<endpoint> [stage:<endpoint> ...]]" << std::endl;
         std::cerr << "Example: " << argv[0] << " models/qwen1.5b-instruct 127.0.0.1:5001" << std::endl;
         std::cerr << "Example: " << argv[0] << " models/qwen1.5b-instruct ray:pc-full-model" << std::endl;
+        std::cerr << "Example Ray distributed: " << argv[0] << " models/qwen1.5b-instruct ray:pc-distributed" << std::endl;
         std::cerr << "Example distributed: " << argv[0]
                   << " models/qwen1.5b-instruct head:127.0.0.1:5001 tail:127.0.0.1:5004 stage:127.0.0.1:5002 stage:127.0.0.1:5003"
                   << std::endl;
