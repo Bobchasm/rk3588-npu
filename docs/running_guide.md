@@ -291,7 +291,7 @@ cd /scheduler/build
 ```
 
 
-# PC 跑通 Ray 的环境配置 + 运行
+# 全模型 Ray 方案启动
 
 这一节只说明当前已经跑通的 `pc` 路径，也就是：
 
@@ -410,7 +410,7 @@ PYTHONPATH=bindings/python python3 ray_runtime/stop_worker.py \
 
 如果 `serve_worker.py` 是前台启动的，也可以直接在那个终端按 `Ctrl+C`。
 
-## 7. 只做一次性验证
+## 7. 一次性验证
 
 如果只是想快速验证整条 Ray 链，而不需要常驻加载，可以直接用：
 
@@ -423,14 +423,3 @@ PYTHONPATH=bindings/python python3 ray_runtime/single_worker_demo.py \
 ```
 
 它会启动临时 actor，跑完一次请求后退出。
-
-## 8. 和调度器的关系
-
-当前最推荐的分层是：
-
-- `scheduler/`：负责用户输入文本、session/history、tokenize、decode
-- `ray_runtime/`：负责常驻 actor、模型生命周期、后续多节点调度
-- `worker-pc/`：负责真正的 PC 端推理执行
-
-也就是说，后面要把“用户输入文本 -> 文本输出”整条链跑通时，不是丢掉调度器，而是让调度器改为连接 Ray 后端。
-

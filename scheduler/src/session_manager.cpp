@@ -50,3 +50,11 @@ std::string SessionManager::get_prompt(const SessionId& session_id, int max_toke
     }
     return prompt;
 }
+
+std::vector<ChatMessage> SessionManager::get_history(const SessionId& session_id) const {
+    auto it = sessions_.find(session_id);
+    if (it == sessions_.end()) {
+        return {};
+    }
+    return it->second.history;
+}

@@ -74,7 +74,7 @@ int main(int argc, char* argv[]) {
 
     engine.reset();
     GenerationConfig cfg;
-    cfg.max_new_tokens = 10;
+    cfg.max_new_tokens = 64;
     const auto result = engine.generate(input_ids, cfg,
         [](int step, int id, float elapsed_ms) {
             std::printf("step %2d (%.0f ms): emit=%d\n", step, elapsed_ms, id);
@@ -89,4 +89,3 @@ int main(int argc, char* argv[]) {
     std::printf("\n");
     return 0;
 }
-

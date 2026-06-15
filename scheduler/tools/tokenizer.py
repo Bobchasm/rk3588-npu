@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-import json
 import logging
 import sys
 from pathlib import Path
+import json
 
 try:
     from transformers import AutoTokenizer
@@ -13,6 +13,7 @@ except ImportError:
 
 def usage():
     print('Usage: tokenizer.py encode <model_dir> <text>')
+    print('       tokenizer.py encode_chat <model_dir> <json_messages>')
     print('       tokenizer.py decode <model_dir> <ids>')
     sys.exit(1)
 
@@ -33,6 +34,16 @@ if __name__ == '__main__':
     tokenizer = load_tokenizer(model_dir)
     if mode == 'encode':
         ids = tokenizer.encode(payload)
+        print(' '.join(str(x) for x in ids))
+    elif mode == 'encode_chat':
+        messages = json.loads(payload)
+        encoded = tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+        )
+        ids = encoded["input_ids"]
         print(' '.join(str(x) for x in ids))
     elif mode == 'decode':
         ids = [int(x) for x in payload.strip().split() if x.strip()]

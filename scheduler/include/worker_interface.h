@@ -18,7 +18,10 @@ public:
     virtual WorkerId worker_id() const = 0;
 
     virtual bool supports_full_model() const = 0;
+    virtual bool supports_tokens_to_hidden() const = 0;
     virtual bool supports_stage() const = 0;
+    virtual bool supports_hidden_to_token() const = 0;
+    virtual bool reset_cache() = 0;
 
     // 当前单 worker 场景走 full-model 生成。
     // 后续若拆分为 head + 多个 stage，也仍可以由调度器先构造这类请求再做路由拆分。
@@ -28,10 +31,17 @@ public:
 
     // 预留给后续中间 stage worker 的 hidden-state 转发执行接口。
     virtual StageForwardResponse forward_stage(const StageForwardRequest& req) = 0;
+    virtual TokensToHiddenResponse tokens_to_hidden(const TokensToHiddenRequest& req) = 0;
+    virtual HiddenToTokenResponse hidden_to_token(const HiddenToTokenRequest& req) = 0;
 };
 
 std::unique_ptr<WorkerInterface> make_local_worker(const std::string& model_dir);
 std::unique_ptr<WorkerInterface> make_remote_worker(const std::string& endpoint,
                                                     const WorkerId& worker_id);
+std::unique_ptr<WorkerInterface> make_distributed_worker(
+    const std::string& head_endpoint,
+    const std::vector<std::string>& stage_endpoints,
+    const std::string& tail_endpoint,
+    const WorkerId& worker_id);
 std::unique_ptr<WorkerInterface> make_ray_worker(const std::string& actor_name,
                                                  const WorkerId& worker_id);

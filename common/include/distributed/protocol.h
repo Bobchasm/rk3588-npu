@@ -29,8 +29,11 @@ using StageId = int32_t;
 enum class RpcCommand {
     kUnknown = 0,
     kPing,
+    kResetCache,
     kGenerateTokens,
     kForwardStage,
+    kTokensToHidden,
+    kHiddenToToken,
 };
 
 enum class StatusCode {
@@ -69,7 +72,7 @@ struct RequestContext {
 
 // 生成参数单独抽象，避免混入业务逻辑。
 struct GenerationParameters {
-    int32_t max_new_tokens = 10;       // 本次最多生成多少个新 token
+    int32_t max_new_tokens = 64;       // 本次最多生成多少个新 token
     int32_t max_prompt_chars = 8192;   // 调度器历史拼 prompt 时的截断上限（字符级）
     int32_t repetition_window = 6;     // 与当前 LLMEngine 的重复检测窗口保持一致
 };
@@ -114,6 +117,34 @@ struct StageForwardResponse {
     StatusCode status = StatusCode::kOk;
     std::string message;
     TensorPayload output_tensor;
+};
+
+// head worker 的输入：
+// 输入是 token ids，输出是经过本地 embedding + 若干层后的 hidden state。
+struct TokensToHiddenRequest {
+    RequestContext context;
+    std::vector<int32_t> input_token_ids;
+};
+
+struct TokensToHiddenResponse {
+    RequestContext context;
+    StatusCode status = StatusCode::kOk;
+    std::string message;
+    TensorPayload output_tensor;
+};
+
+// tail worker 的输入：
+// 输入是上一跳 hidden state，输出是本轮 greedy 选出的 token id。
+struct HiddenToTokenRequest {
+    RequestContext context;
+    TensorPayload input_tensor;
+};
+
+struct HiddenToTokenResponse {
+    RequestContext context;
+    StatusCode status = StatusCode::kOk;
+    std::string message;
+    int32_t output_token_id = 0;
 };
 
 namespace detail {
@@ -227,10 +258,16 @@ inline std::string command_to_string(RpcCommand command) {
     switch (command) {
     case RpcCommand::kPing:
         return "PING";
+    case RpcCommand::kResetCache:
+        return "RESET_CACHE";
     case RpcCommand::kGenerateTokens:
         return "GENERATE_TOKENS";
     case RpcCommand::kForwardStage:
         return "FORWARD_STAGE";
+    case RpcCommand::kTokensToHidden:
+        return "TOKENS_TO_HIDDEN";
+    case RpcCommand::kHiddenToToken:
+        return "HIDDEN_TO_TOKEN";
     default:
         return "UNKNOWN";
     }
@@ -240,11 +277,20 @@ inline RpcCommand string_to_command(const std::string& text) {
     if (text == "PING") {
         return RpcCommand::kPing;
     }
+    if (text == "RESET_CACHE") {
+        return RpcCommand::kResetCache;
+    }
     if (text == "GENERATE_TOKENS") {
         return RpcCommand::kGenerateTokens;
     }
     if (text == "FORWARD_STAGE") {
         return RpcCommand::kForwardStage;
+    }
+    if (text == "TOKENS_TO_HIDDEN") {
+        return RpcCommand::kTokensToHidden;
+    }
+    if (text == "HIDDEN_TO_TOKEN") {
+        return RpcCommand::kHiddenToToken;
     }
     return RpcCommand::kUnknown;
 }
@@ -541,14 +587,109 @@ inline bool deserialize_stage_response(const std::string& payload, StageForwardR
            detail::read_tensor(kvs, "output", response.output_tensor);
 }
 
+inline std::string serialize_tokens_to_hidden_request(const TokensToHiddenRequest& request) {
+    std::map<std::string, std::string> kvs;
+    detail::put_context(kvs, request.context);
+    kvs["input_token_ids"] = detail::join_numbers(request.input_token_ids);
+    return detail::encode_record(RpcCommand::kTokensToHidden, kvs);
+}
+
+inline bool deserialize_tokens_to_hidden_request(const std::string& payload,
+                                                 TokensToHiddenRequest& request) {
+    RpcCommand command = RpcCommand::kUnknown;
+    std::map<std::string, std::string> kvs;
+    if (!detail::decode_record(payload, command, kvs) ||
+        command != RpcCommand::kTokensToHidden) {
+        return false;
+    }
+    return detail::read_context(kvs, request.context) &&
+           detail::parse_numbers(detail::get_or_default(kvs, "input_token_ids"),
+                                 request.input_token_ids);
+}
+
+inline std::string serialize_tokens_to_hidden_response(const TokensToHiddenResponse& response) {
+    std::map<std::string, std::string> kvs;
+    detail::put_context(kvs, response.context);
+    kvs["status"] = detail::status_to_string(response.status);
+    kvs["message"] = response.message;
+    detail::put_tensor(kvs, "output", response.output_tensor);
+    return detail::encode_record(RpcCommand::kTokensToHidden, kvs);
+}
+
+inline bool deserialize_tokens_to_hidden_response(const std::string& payload,
+                                                  TokensToHiddenResponse& response) {
+    RpcCommand command = RpcCommand::kUnknown;
+    std::map<std::string, std::string> kvs;
+    if (!detail::decode_record(payload, command, kvs) ||
+        command != RpcCommand::kTokensToHidden) {
+        return false;
+    }
+    response.status = detail::string_to_status(detail::get_or_default(kvs, "status", "ERROR"));
+    response.message = detail::get_or_default(kvs, "message");
+    return detail::read_context(kvs, response.context) &&
+           detail::read_tensor(kvs, "output", response.output_tensor);
+}
+
+inline std::string serialize_hidden_to_token_request(const HiddenToTokenRequest& request) {
+    std::map<std::string, std::string> kvs;
+    detail::put_context(kvs, request.context);
+    detail::put_tensor(kvs, "input", request.input_tensor);
+    return detail::encode_record(RpcCommand::kHiddenToToken, kvs);
+}
+
+inline bool deserialize_hidden_to_token_request(const std::string& payload,
+                                                HiddenToTokenRequest& request) {
+    RpcCommand command = RpcCommand::kUnknown;
+    std::map<std::string, std::string> kvs;
+    if (!detail::decode_record(payload, command, kvs) ||
+        command != RpcCommand::kHiddenToToken) {
+        return false;
+    }
+    return detail::read_context(kvs, request.context) &&
+           detail::read_tensor(kvs, "input", request.input_tensor);
+}
+
+inline std::string serialize_hidden_to_token_response(const HiddenToTokenResponse& response) {
+    std::map<std::string, std::string> kvs;
+    detail::put_context(kvs, response.context);
+    kvs["status"] = detail::status_to_string(response.status);
+    kvs["message"] = response.message;
+    kvs["output_token_id"] = std::to_string(response.output_token_id);
+    return detail::encode_record(RpcCommand::kHiddenToToken, kvs);
+}
+
+inline bool deserialize_hidden_to_token_response(const std::string& payload,
+                                                 HiddenToTokenResponse& response) {
+    RpcCommand command = RpcCommand::kUnknown;
+    std::map<std::string, std::string> kvs;
+    if (!detail::decode_record(payload, command, kvs) ||
+        command != RpcCommand::kHiddenToToken) {
+        return false;
+    }
+    response.status = detail::string_to_status(detail::get_or_default(kvs, "status", "ERROR"));
+    response.message = detail::get_or_default(kvs, "message");
+    return detail::read_context(kvs, response.context) &&
+           detail::parse_int32(kvs, "output_token_id", response.output_token_id);
+}
+
 inline std::string serialize_ping_request() {
     return detail::encode_record(RpcCommand::kPing, {});
+}
+
+inline std::string serialize_reset_cache_request() {
+    return detail::encode_record(RpcCommand::kResetCache, {});
 }
 
 inline bool is_ping_payload(const std::string& payload) {
     RpcCommand command = RpcCommand::kUnknown;
     std::map<std::string, std::string> kvs;
     return detail::decode_record(payload, command, kvs) && command == RpcCommand::kPing;
+}
+
+inline bool is_reset_cache_payload(const std::string& payload) {
+    RpcCommand command = RpcCommand::kUnknown;
+    std::map<std::string, std::string> kvs;
+    return detail::decode_record(payload, command, kvs) && command == RpcCommand::kResetCache;
 }
 
 inline std::string serialize_error_response(RpcCommand command,

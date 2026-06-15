@@ -88,8 +88,25 @@ public:
         return true;
     }
 
+    bool supports_tokens_to_hidden() const override {
+        return false;
+    }
+
     bool supports_stage() const override {
         return false;
+    }
+
+    bool supports_hidden_to_token() const override {
+        return false;
+    }
+
+    bool reset_cache() override {
+#ifdef SCHEDULER_USE_WORKER_CORE
+        engine_.reset();
+        return true;
+#else
+        return false;
+#endif
     }
 
     GenerationResult generate_tokens(const GenerateTokensRequest& req,
@@ -127,6 +144,22 @@ public:
         resp.context = req.context;
         resp.status = RequestStatus::kUnsupported;
         resp.message = "LocalWorker does not support stage forwarding yet";
+        return resp;
+    }
+
+    TokensToHiddenResponse tokens_to_hidden(const TokensToHiddenRequest& req) override {
+        TokensToHiddenResponse resp;
+        resp.context = req.context;
+        resp.status = RequestStatus::kUnsupported;
+        resp.message = "LocalWorker does not support tokens_to_hidden yet";
+        return resp;
+    }
+
+    HiddenToTokenResponse hidden_to_token(const HiddenToTokenRequest& req) override {
+        HiddenToTokenResponse resp;
+        resp.context = req.context;
+        resp.status = RequestStatus::kUnsupported;
+        resp.message = "LocalWorker does not support hidden_to_token yet";
         return resp;
     }
 
@@ -168,8 +201,20 @@ public:
         return true;
     }
 
+    bool supports_tokens_to_hidden() const override {
+        return true;
+    }
+
     bool supports_stage() const override {
-        return false;
+        return true;
+    }
+
+    bool supports_hidden_to_token() const override {
+        return true;
+    }
+
+    bool reset_cache() override {
+        return connected_ && client_.send_reset_cache();
     }
 
     bool connected() const {
@@ -233,6 +278,36 @@ public:
         return resp;
     }
 
+    TokensToHiddenResponse tokens_to_hidden(const TokensToHiddenRequest& req) override {
+        TokensToHiddenResponse resp;
+        resp.context = req.context;
+        if (!connected_) {
+            resp.status = RequestStatus::kError;
+            resp.message = "RemoteWorker not connected";
+            return resp;
+        }
+        if (!client_.send_tokens_to_hidden(req, resp)) {
+            resp.status = RequestStatus::kError;
+            resp.message = "Remote tokens_to_hidden RPC failed";
+        }
+        return resp;
+    }
+
+    HiddenToTokenResponse hidden_to_token(const HiddenToTokenRequest& req) override {
+        HiddenToTokenResponse resp;
+        resp.context = req.context;
+        if (!connected_) {
+            resp.status = RequestStatus::kError;
+            resp.message = "RemoteWorker not connected";
+            return resp;
+        }
+        if (!client_.send_hidden_to_token(req, resp)) {
+            resp.status = RequestStatus::kError;
+            resp.message = "Remote hidden_to_token RPC failed";
+        }
+        return resp;
+    }
+
 private:
     WorkerId worker_id_;
     std::string endpoint_;
@@ -263,7 +338,19 @@ public:
         return true;
     }
 
+    bool supports_tokens_to_hidden() const override {
+        return false;
+    }
+
     bool supports_stage() const override {
+        return false;
+    }
+
+    bool supports_hidden_to_token() const override {
+        return false;
+    }
+
+    bool reset_cache() override {
         return false;
     }
 
@@ -339,9 +426,190 @@ public:
         return resp;
     }
 
+    TokensToHiddenResponse tokens_to_hidden(const TokensToHiddenRequest& req) override {
+        TokensToHiddenResponse resp;
+        resp.context = req.context;
+        resp.status = RequestStatus::kUnsupported;
+        resp.message = "RayWorker does not support tokens_to_hidden yet";
+        return resp;
+    }
+
+    HiddenToTokenResponse hidden_to_token(const HiddenToTokenRequest& req) override {
+        HiddenToTokenResponse resp;
+        resp.context = req.context;
+        resp.status = RequestStatus::kUnsupported;
+        resp.message = "RayWorker does not support hidden_to_token yet";
+        return resp;
+    }
+
 private:
     WorkerId worker_id_;
     std::string actor_name_;
+};
+
+class DistributedWorker : public WorkerInterface {
+public:
+    DistributedWorker(std::unique_ptr<WorkerInterface> head_worker,
+                      std::vector<std::unique_ptr<WorkerInterface>> stage_workers,
+                      std::unique_ptr<WorkerInterface> tail_worker,
+                      WorkerId worker_id)
+        : worker_id_(std::move(worker_id)),
+          head_worker_(std::move(head_worker)),
+          stage_workers_(std::move(stage_workers)),
+          tail_worker_(std::move(tail_worker)) {}
+
+    bool register_node(const WorkerId& id) override {
+        worker_id_ = id;
+        return true;
+    }
+
+    void set_worker_id(const WorkerId& id) override {
+        worker_id_ = id;
+    }
+
+    WorkerId worker_id() const override {
+        return worker_id_;
+    }
+
+    bool supports_full_model() const override {
+        return false;
+    }
+
+    bool supports_tokens_to_hidden() const override {
+        return head_worker_ && head_worker_->supports_tokens_to_hidden();
+    }
+
+    bool supports_stage() const override {
+        return !stage_workers_.empty();
+    }
+
+    bool supports_hidden_to_token() const override {
+        return tail_worker_ && tail_worker_->supports_hidden_to_token();
+    }
+
+    bool reset_cache() override {
+        bool ok = true;
+        if (head_worker_) {
+            ok = head_worker_->reset_cache() && ok;
+        }
+        for (auto& stage_worker : stage_workers_) {
+            ok = stage_worker->reset_cache() && ok;
+        }
+        if (tail_worker_) {
+            ok = tail_worker_->reset_cache() && ok;
+        }
+        return ok;
+    }
+
+    GenerationResult generate_tokens(const GenerateTokensRequest& req,
+                                     TokenCallback on_token = nullptr) override {
+        GenerationResult result;
+        if (!head_worker_ || !tail_worker_) {
+            result.error_message = "distributed worker missing head/tail";
+            return result;
+        }
+        if (!reset_cache()) {
+            result.error_message = "failed to reset distributed worker caches";
+            return result;
+        }
+
+        const std::vector<int> prompt_ids(req.input_token_ids.begin(), req.input_token_ids.end());
+        std::vector<int> current_input = prompt_ids;
+
+        auto is_stop = [](int token_id) {
+            return token_id == 151645 || token_id == 151643;
+        };
+
+        for (int step = 0; step < req.generation.max_new_tokens; ++step) {
+            TokensToHiddenRequest head_req;
+            head_req.context = req.context;
+            head_req.context.request_id = req.context.request_id != 0 ? req.context.request_id : static_cast<uint64_t>(step + 1);
+            head_req.context.route.pos_base =
+                static_cast<int32_t>(prompt_ids.size() + result.output_ids.size() - current_input.size());
+            head_req.input_token_ids.assign(current_input.begin(), current_input.end());
+
+            TokensToHiddenResponse head_resp = head_worker_->tokens_to_hidden(head_req);
+            if (!distributed::is_success(head_resp.status)) {
+                result.error_message = head_resp.message.empty() ? "head tokens_to_hidden failed" : head_resp.message;
+                return result;
+            }
+
+            TensorBuffer hidden = head_resp.output_tensor;
+            const int32_t pos_base = head_req.context.route.pos_base;
+
+            for (size_t i = 0; i < stage_workers_.size(); ++i) {
+                StageForwardRequest stage_req;
+                stage_req.context = head_req.context;
+                stage_req.context.route.hop_index = static_cast<int32_t>(i + 1);
+                stage_req.context.route.pos_base = pos_base;
+                stage_req.input_tensor = hidden;
+
+                StageForwardResponse stage_resp = stage_workers_[i]->forward_stage(stage_req);
+                if (!distributed::is_success(stage_resp.status)) {
+                    result.error_message = stage_resp.message.empty() ? "stage forward failed" : stage_resp.message;
+                    return result;
+                }
+                hidden = stage_resp.output_tensor;
+            }
+
+            HiddenToTokenRequest tail_req;
+            tail_req.context = head_req.context;
+            tail_req.context.route.hop_index = static_cast<int32_t>(stage_workers_.size() + 1);
+            tail_req.context.route.pos_base = pos_base;
+            tail_req.input_tensor = hidden;
+
+            HiddenToTokenResponse tail_resp = tail_worker_->hidden_to_token(tail_req);
+            if (!distributed::is_success(tail_resp.status)) {
+                result.error_message = tail_resp.message.empty() ? "tail hidden_to_token failed" : tail_resp.message;
+                return result;
+            }
+
+            const int token_id = tail_resp.output_token_id;
+            result.output_ids.push_back(token_id);
+            if (on_token) {
+                on_token(step, token_id, 0.0f);
+            }
+            if (is_stop(token_id)) {
+                result.hit_stop = true;
+                break;
+            }
+            current_input.assign(1, token_id);
+        }
+
+        result.prefill_tokens = static_cast<int>(prompt_ids.size());
+        result.decode_tokens = static_cast<int>(result.output_ids.size());
+        return result;
+    }
+
+    StageForwardResponse forward_stage(const StageForwardRequest& req) override {
+        StageForwardResponse resp;
+        resp.context = req.context;
+        resp.status = RequestStatus::kUnsupported;
+        resp.message = "DistributedWorker does not expose raw stage forwarding";
+        return resp;
+    }
+
+    TokensToHiddenResponse tokens_to_hidden(const TokensToHiddenRequest& req) override {
+        TokensToHiddenResponse resp;
+        resp.context = req.context;
+        resp.status = RequestStatus::kUnsupported;
+        resp.message = "DistributedWorker does not expose raw tokens_to_hidden";
+        return resp;
+    }
+
+    HiddenToTokenResponse hidden_to_token(const HiddenToTokenRequest& req) override {
+        HiddenToTokenResponse resp;
+        resp.context = req.context;
+        resp.status = RequestStatus::kUnsupported;
+        resp.message = "DistributedWorker does not expose raw hidden_to_token";
+        return resp;
+    }
+
+private:
+    WorkerId worker_id_;
+    std::unique_ptr<WorkerInterface> head_worker_;
+    std::vector<std::unique_ptr<WorkerInterface>> stage_workers_;
+    std::unique_ptr<WorkerInterface> tail_worker_;
 };
 
 std::unique_ptr<WorkerInterface> make_local_worker(const std::string& model_dir) {
@@ -355,6 +623,34 @@ std::unique_ptr<WorkerInterface> make_remote_worker(const std::string& endpoint,
         return nullptr;
     }
     return worker;
+}
+
+std::unique_ptr<WorkerInterface> make_distributed_worker(
+    const std::string& head_endpoint,
+    const std::vector<std::string>& stage_endpoints,
+    const std::string& tail_endpoint,
+    const WorkerId& worker_id) {
+    auto head_worker = make_remote_worker(head_endpoint, worker_id + "-head");
+    auto tail_worker = make_remote_worker(tail_endpoint, worker_id + "-tail");
+    if (!head_worker || !tail_worker) {
+        return nullptr;
+    }
+
+    std::vector<std::unique_ptr<WorkerInterface>> stage_workers;
+    stage_workers.reserve(stage_endpoints.size());
+    for (size_t i = 0; i < stage_endpoints.size(); ++i) {
+        auto stage_worker = make_remote_worker(stage_endpoints[i], worker_id + "-stage-" + std::to_string(i));
+        if (!stage_worker) {
+            return nullptr;
+        }
+        stage_workers.push_back(std::move(stage_worker));
+    }
+
+    return std::make_unique<DistributedWorker>(
+        std::move(head_worker),
+        std::move(stage_workers),
+        std::move(tail_worker),
+        worker_id);
 }
 
 std::unique_ptr<WorkerInterface> make_ray_worker(const std::string& actor_name,

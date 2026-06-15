@@ -40,6 +40,17 @@ add_executable(scheduler_cli
     src/strategy/schedule_policy.cpp
 )
 
+add_executable(stage_pipeline_demo
+    tools/stage_pipeline_demo.cpp
+    src/network/rpc_client.cpp
+)
+
+add_executable(distributed_generate_demo
+    tools/distributed_generate_demo.cpp
+    src/network/rpc_client.cpp
+    src/tokenizer/tokenizer_adapter.cpp
+)
+
 target_compile_definitions(scheduler_cli PRIVATE
     SCHEDULER_REPO_ROOT="${RK3588_NPU_REPO_ROOT}"
 )
@@ -47,7 +58,25 @@ target_compile_definitions(scheduler_cli PRIVATE
 if(SCHEDULER_USE_WORKER_CORE)
     target_compile_definitions(scheduler_cli PRIVATE SCHEDULER_USE_WORKER_CORE=1)
     target_link_libraries(scheduler_cli PRIVATE worker_core pthread)
+    target_link_libraries(stage_pipeline_demo PRIVATE worker_core pthread)
+    target_link_libraries(distributed_generate_demo PRIVATE worker_core pthread)
 else()
     target_link_libraries(scheduler_cli PRIVATE pthread)
+    target_link_libraries(stage_pipeline_demo PRIVATE pthread)
+    target_link_libraries(distributed_generate_demo PRIVATE pthread)
     message(WARNING "Building scheduler_cli without worker_core integration. LocalWorker will be a host-side stub.")
 endif()
+
+target_include_directories(stage_pipeline_demo PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+)
+
+target_include_directories(distributed_generate_demo PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+)
+
+target_compile_definitions(distributed_generate_demo PRIVATE
+    SCHEDULER_REPO_ROOT="${RK3588_NPU_REPO_ROOT}"
+)

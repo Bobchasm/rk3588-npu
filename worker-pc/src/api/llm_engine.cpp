@@ -45,6 +45,12 @@ LLMEngine::LLMEngine() : model_(new Qwen2Model()) {}
 LLMEngine::~LLMEngine() { destroy(); }
 
 bool LLMEngine::load(const std::string& model_dir, ComputeDevice device) {
+    return load(model_dir, device, PartitionConfig{});
+}
+
+bool LLMEngine::load(const std::string& model_dir,
+                     ComputeDevice device,
+                     const PartitionConfig& partition) {
     const int64_t t0 = now_us();
     std::fprintf(stderr, "[worker-pc/LLMEngine] load begin model_dir=%s\n", model_dir.c_str());
     device_cfg_ = resolve_device_config(device);
@@ -58,7 +64,7 @@ bool LLMEngine::load(const std::string& model_dir, ComputeDevice device) {
                      compute_device_name(device_cfg_.resolved));
     }
 
-    const bool ok = model_->load(model_dir, device_cfg_.resolved);
+    const bool ok = model_->load(model_dir, device_cfg_.resolved, partition);
     if (!ok) {
         model_->destroy();
         std::fprintf(stderr, "[worker-pc/LLMEngine] load failed elapsed_ms=%.2f\n",
@@ -144,4 +150,68 @@ GenerationResult LLMEngine::generate(
     }
 
     return result;
+}
+
+bool LLMEngine::forward_tokens_to_hidden(const std::vector<int>& input_ids,
+                                         std::vector<uint16_t>& output_f16,
+                                         std::string* error) {
+    if (!model_) {
+        if (error) *error = "worker-pc engine not initialized";
+        return false;
+    }
+    try {
+        if (!model_->forward_tokens_to_hidden(input_ids, output_f16)) {
+            if (error) *error = "worker-pc tokens_to_hidden returned false";
+            return false;
+        }
+        return true;
+    } catch (const std::exception& e) {
+        if (error) *error = e.what();
+        model_->reset_kv_cache();
+        return false;
+    }
+}
+
+bool LLMEngine::forward_hidden_states(const std::vector<uint16_t>& input_f16,
+                                      int seq,
+                                      int pos_base,
+                                      std::vector<uint16_t>& output_f16,
+                                      std::string* error) {
+    if (!model_) {
+        if (error) *error = "worker-pc engine not initialized";
+        return false;
+    }
+    try {
+        if (!model_->forward_hidden_states(input_f16.data(), seq, pos_base, output_f16)) {
+            if (error) *error = "worker-pc stage forward returned false";
+            return false;
+        }
+        return true;
+    } catch (const std::exception& e) {
+        if (error) *error = e.what();
+        model_->reset_kv_cache();
+        return false;
+    }
+}
+
+bool LLMEngine::forward_hidden_to_token(const std::vector<uint16_t>& input_f16,
+                                        int seq,
+                                        int pos_base,
+                                        int& output_token_id,
+                                        std::string* error) {
+    if (!model_) {
+        if (error) *error = "worker-pc engine not initialized";
+        return false;
+    }
+    try {
+        if (!model_->forward_hidden_to_token(input_f16.data(), seq, pos_base, output_token_id)) {
+            if (error) *error = "worker-pc hidden_to_token returned false";
+            return false;
+        }
+        return true;
+    } catch (const std::exception& e) {
+        if (error) *error = e.what();
+        model_->reset_kv_cache();
+        return false;
+    }
 }

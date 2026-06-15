@@ -44,6 +44,21 @@ bool run_command(const std::string& command, std::string& output) {
     return status == 0;
 }
 
+std::string json_escape(const std::string& text) {
+    std::ostringstream oss;
+    for (char ch : text) {
+        switch (ch) {
+        case '\\': oss << "\\\\"; break;
+        case '"': oss << "\\\""; break;
+        case '\n': oss << "\\n"; break;
+        case '\r': oss << "\\r"; break;
+        case '\t': oss << "\\t"; break;
+        default: oss << ch; break;
+        }
+    }
+    return oss.str();
+}
+
 }  // namespace
 
 TokenizerAdapter::TokenizerAdapter(std::string model_dir)
@@ -60,6 +75,40 @@ bool TokenizerAdapter::encode(const std::string& text, std::vector<int>& out_ids
     std::string raw;
     if (!run_command(cmd, raw)) {
         std::cerr << "[TokenizerAdapter] encode command failed" << std::endl;
+        return false;
+    }
+
+    std::istringstream iss(raw);
+    int token_id = 0;
+    while (iss >> token_id) {
+        out_ids.push_back(token_id);
+    }
+    return !out_ids.empty();
+}
+
+bool TokenizerAdapter::encode_chat(const std::vector<ChatMessage>& messages,
+                                   std::vector<int>& out_ids) const {
+    out_ids.clear();
+
+    std::ostringstream payload;
+    payload << "[";
+    for (size_t i = 0; i < messages.size(); ++i) {
+        if (i != 0) {
+            payload << ",";
+        }
+        payload << "{\"role\":\"" << json_escape(messages[i].role)
+                << "\",\"content\":\"" << json_escape(messages[i].text) << "\"}";
+    }
+    payload << "]";
+
+    const std::string cmd =
+        "python3 " + escape_shell_arg(tokenizer_script_path()) + " encode_chat " +
+        escape_shell_arg(model_dir_) + " " +
+        escape_shell_arg(payload.str());
+
+    std::string raw;
+    if (!run_command(cmd, raw)) {
+        std::cerr << "[TokenizerAdapter] encode_chat command failed" << std::endl;
         return false;
     }
 

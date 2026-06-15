@@ -19,6 +19,7 @@ public:
     bool append_user_message(const SessionId& session_id, const std::string& text);
     bool append_assistant_message(const SessionId& session_id, const std::string& text);
     std::string get_prompt(const SessionId& session_id, int max_tokens = 2048) const;
+    std::vector<ChatMessage> get_history(const SessionId& session_id) const;
 
 private:
     struct SessionData {

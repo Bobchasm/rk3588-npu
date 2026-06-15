@@ -6,9 +6,12 @@
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <model_dir> [remote_endpoint|ray:<actor_name>]" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <model_dir> [remote_endpoint|ray:<actor_name>|head:<endpoint> tail:<endpoint> [stage:<endpoint> ...]]" << std::endl;
         std::cerr << "Example: " << argv[0] << " models/qwen1.5b-instruct 127.0.0.1:5001" << std::endl;
         std::cerr << "Example: " << argv[0] << " models/qwen1.5b-instruct ray:pc-full-model" << std::endl;
+        std::cerr << "Example distributed: " << argv[0]
+                  << " models/qwen1.5b-instruct head:127.0.0.1:5001 tail:127.0.0.1:5004 stage:127.0.0.1:5002 stage:127.0.0.1:5003"
+                  << std::endl;
         return 1;
     }
 
@@ -17,7 +20,40 @@ int main(int argc, char** argv) {
     std::unique_ptr<WorkerInterface> worker;
     if (argc >= 3) {
         const std::string endpoint = argv[2];
-        if (endpoint.rfind("ray:", 0) == 0) {
+        if (endpoint.rfind("head:", 0) == 0) {
+            const std::string head_endpoint = endpoint.substr(5);
+            if (argc < 4) {
+                std::cerr << "Distributed mode requires tail endpoint" << std::endl;
+                return 1;
+            }
+            const std::string tail_arg = argv[3];
+            if (tail_arg.rfind("tail:", 0) != 0) {
+                std::cerr << "Expected tail:<endpoint>" << std::endl;
+                return 1;
+            }
+            const std::string tail_endpoint = tail_arg.substr(5);
+            std::vector<std::string> stage_endpoints;
+            for (int i = 4; i < argc; ++i) {
+                const std::string arg = argv[i];
+                if (arg.rfind("stage:", 0) != 0) {
+                    std::cerr << "Expected stage:<endpoint>, got: " << arg << std::endl;
+                    return 1;
+                }
+                stage_endpoints.push_back(arg.substr(6));
+            }
+            worker = make_distributed_worker(
+                head_endpoint,
+                stage_endpoints,
+                tail_endpoint,
+                "distributed-worker");
+            if (!worker) {
+                std::cerr << "Failed to create distributed worker chain" << std::endl;
+                return 1;
+            }
+            std::cerr << "Using distributed workers: head=" << head_endpoint
+                      << " tail=" << tail_endpoint
+                      << " stages=" << stage_endpoints.size() << std::endl;
+        } else if (endpoint.rfind("ray:", 0) == 0) {
             const std::string actor_name = endpoint.substr(4);
             if (actor_name.empty()) {
                 std::cerr << "Invalid Ray actor name" << std::endl;
@@ -61,7 +97,7 @@ int main(int argc, char** argv) {
         GenerationResult result = coordinator.submit_text_request(
             session_id,
             line,
-            10,
+            64,
             nullptr);
 
         if (!result.error_message.empty()) {

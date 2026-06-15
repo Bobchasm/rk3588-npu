@@ -104,6 +104,17 @@ bool RpcClient::send_ping() {
     return ok;
 }
 
+bool RpcClient::send_reset_cache() {
+    int sock;
+    if (!open_connection(endpoint_, sock)) return false;
+    std::string response;
+    bool ok = send_line(sock, distributed::serialize_reset_cache_request()) &&
+              recv_line(sock, response) &&
+              response == "OK";
+    close(sock);
+    return ok;
+}
+
 bool RpcClient::send_generate_tokens(const GenerateTokensRequest& req,
                                      GenerateTokensResponse& resp) {
     int sock;
@@ -120,6 +131,22 @@ bool RpcClient::send_generate_tokens(const GenerateTokensRequest& req,
     return distributed::deserialize_generate_response(response, resp);
 }
 
+bool RpcClient::send_tokens_to_hidden(const distributed::TokensToHiddenRequest& req,
+                                      distributed::TokensToHiddenResponse& resp) {
+    int sock;
+    if (!open_connection(endpoint_, sock)) return false;
+    if (!send_line(sock, distributed::serialize_tokens_to_hidden_request(req))) {
+        close(sock);
+        return false;
+    }
+
+    std::string response;
+    bool ok = recv_line(sock, response);
+    close(sock);
+    if (!ok) return false;
+    return distributed::deserialize_tokens_to_hidden_response(response, resp);
+}
+
 bool RpcClient::send_forward_stage(const StageForwardRequest& req,
                                    StageForwardResponse& resp) {
     int sock;
@@ -134,4 +161,20 @@ bool RpcClient::send_forward_stage(const StageForwardRequest& req,
     close(sock);
     if (!ok) return false;
     return distributed::deserialize_stage_response(response, resp);
+}
+
+bool RpcClient::send_hidden_to_token(const distributed::HiddenToTokenRequest& req,
+                                     distributed::HiddenToTokenResponse& resp) {
+    int sock;
+    if (!open_connection(endpoint_, sock)) return false;
+    if (!send_line(sock, distributed::serialize_hidden_to_token_request(req))) {
+        close(sock);
+        return false;
+    }
+
+    std::string response;
+    bool ok = recv_line(sock, response);
+    close(sock);
+    if (!ok) return false;
+    return distributed::deserialize_hidden_to_token_response(response, resp);
 }

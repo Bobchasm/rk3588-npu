@@ -1,5 +1,7 @@
 #pragma once
 
+#include "session_manager.h"
+
 #include <string>
 #include <vector>
 
@@ -11,6 +13,7 @@ public:
     explicit TokenizerAdapter(std::string model_dir);
 
     bool encode(const std::string& text, std::vector<int>& out_ids) const;
+    bool encode_chat(const std::vector<ChatMessage>& messages, std::vector<int>& out_ids) const;
     bool decode(const std::vector<int>& ids, std::string& out_text) const;
 
 private:

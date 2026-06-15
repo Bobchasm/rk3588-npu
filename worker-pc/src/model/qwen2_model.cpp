@@ -63,6 +63,10 @@ bool debug_layer_progress() {
 Qwen2Model::Qwen2Model() = default;
 Qwen2Model::~Qwen2Model() { destroy(); }
 
+bool Qwen2Model::load(const std::string& model_dir, ComputeDevice device) {
+    return load(model_dir, device, PartitionConfig{});
+}
+
 void Qwen2Model::destroy() {
     if (lm_head_) {
         lm_head_->destroy();
@@ -86,11 +90,15 @@ void Qwen2Model::destroy() {
     kv_cache_ = KVCache();
     gpu_kv_cache_.destroy();
     scratch_ = ForwardScratch{};
+    partition_ = PartitionConfig{};
 }
 
-bool Qwen2Model::load(const std::string& model_dir, ComputeDevice device) {
+bool Qwen2Model::load(const std::string& model_dir,
+                      ComputeDevice device,
+                      const PartitionConfig& partition) {
     destroy();
     device_ = device;
+    partition_ = partition;
 
     const std::string sf_path = model_dir + "/model.safetensors";
     try {
@@ -101,11 +109,21 @@ bool Qwen2Model::load(const std::string& model_dir, ComputeDevice device) {
         const int kvd = c.kv_dim();
         const int IS = c.intermediate_size;
         const int V = c.vocab_size;
+        const int layer_begin = std::max(0, partition_.layer_begin);
+        const int layer_end = (partition_.layer_end < 0)
+            ? IL
+            : std::min(IL, partition_.layer_end);
 
-        embed_tokens_ = load_tensor_f16(sf_path, meta.at("model.embed_tokens.weight"));
+        if (layer_begin >= layer_end) {
+            throw std::runtime_error("worker-pc invalid partition layer range");
+        }
 
-        layers_.resize(IL);
-        for (int i = 0; i < IL; ++i) {
+        if (partition_.include_embedding) {
+            embed_tokens_ = load_tensor_f16(sf_path, meta.at("model.embed_tokens.weight"));
+        }
+
+        layers_.resize(static_cast<size_t>(layer_end - layer_begin));
+        for (int i = layer_begin; i < layer_end; ++i) {
             std::unique_ptr<TransformerLayer> layer(new TransformerLayer());
             const std::string pfx = "model.layers." + std::to_string(i) + ".";
 
@@ -125,15 +143,17 @@ bool Qwen2Model::load(const std::string& model_dir, ComputeDevice device) {
             if (!init_linear(layer->up_proj, device_, sf_path, meta, pfx + "mlp.up_proj.weight", H, IS)) return false;
             if (!init_linear(layer->down_proj, device_, sf_path, meta, pfx + "mlp.down_proj.weight", IS, H)) return false;
 
-            layers_[i] = std::move(layer);
+            layers_[static_cast<size_t>(i - layer_begin)] = std::move(layer);
         }
 
-        norm_weight_ = load_tensor_f32(sf_path, meta.at("model.norm.weight"));
-        if (!init_linear(lm_head_, device_, sf_path, meta, "model.embed_tokens.weight", H, V)) return false;
+        if (partition_.include_final_norm_and_head) {
+            norm_weight_ = load_tensor_f32(sf_path, meta.at("model.norm.weight"));
+            if (!init_linear(lm_head_, device_, sf_path, meta, "model.embed_tokens.weight", H, V)) return false;
+        }
 
-        kv_cache_.init(IL, c.max_position, kvd);
+        kv_cache_.init(static_cast<int>(layers_.size()), c.max_position, kvd);
         if (device_ == ComputeDevice::kGpu) {
-            if (!gpu_kv_cache_.init(IL, c.max_position, kvd)) {
+            if (!gpu_kv_cache_.init(static_cast<int>(layers_.size()), c.max_position, kvd)) {
                 std::fprintf(stderr, "[worker-pc/Qwen2Model] gpu kv cache init failed, keep cpu-only kv\n");
             }
         }
@@ -231,6 +251,9 @@ int Qwen2Model::forward_next_token(const std::vector<int>& tokens) {
     if (tokens.empty()) {
         throw std::runtime_error("worker-pc/Qwen2Model received empty token list");
     }
+    if (!can_generate_tokens()) {
+        throw std::runtime_error("worker-pc/Qwen2Model partition does not support token generation");
+    }
 
     const auto& c = config_;
     const int H = c.hidden_size;
@@ -246,14 +269,61 @@ int Qwen2Model::forward_next_token(const std::vector<int>& tokens) {
 
     ensure_scratch(seq);
     op_embedding_lookup(embed_tokens_.data(), tokens, scratch_.hidden.data(), H);
+    execute_loaded_layers(scratch_.hidden.data(), seq, pos);
 
-    for (int li = 0; li < c.num_hidden_layers; ++li) {
+    op_rmsnorm(scratch_.hidden.data() + static_cast<size_t>(seq - 1) * H,
+               norm_weight_.data(),
+               scratch_.last.data(),
+               1, H, c.rms_norm_eps);
+    op_f32_to_f16(scratch_.last.data(), scratch_.lm_in.data(), H);
+    if (!lm_head_->forward(scratch_.lm_in.data(), 1, scratch_.lm_out.data())) {
+        throw std::runtime_error("worker-pc linear forward failed in lm_head");
+    }
+
+    kv_cache_.set_cur_pos(total_len);
+    return argmax_f16(scratch_.lm_out);
+}
+
+bool Qwen2Model::forward_tokens_to_hidden(const std::vector<int>& tokens,
+                                          std::vector<uint16_t>& output_f16) {
+    if (tokens.empty() || !can_tokens_to_hidden()) {
+        return false;
+    }
+
+    const auto& c = config_;
+    const int H = c.hidden_size;
+    const int seq = static_cast<int>(tokens.size());
+    const int pos = kv_cache_.cur_pos();
+    const int total_len = pos + seq;
+    if (total_len > kv_cache_.capacity()) {
+        return false;
+    }
+
+    ensure_scratch(seq);
+    op_embedding_lookup(embed_tokens_.data(), tokens, scratch_.hidden.data(), H);
+    execute_loaded_layers(scratch_.hidden.data(), seq, pos);
+    output_f16.resize(static_cast<size_t>(seq) * H);
+    op_f32_to_f16(scratch_.hidden.data(), output_f16.data(), seq * H);
+    kv_cache_.set_cur_pos(total_len);
+    return true;
+}
+
+void Qwen2Model::execute_loaded_layers(float* hidden, int seq, int pos_base) {
+    const auto& c = config_;
+    const int H = c.hidden_size;
+    const int kvd = c.kv_dim();
+    const int IS = c.intermediate_size;
+    const int total_len = pos_base + seq;
+
+    for (int li = 0; li < static_cast<int>(layers_.size()); ++li) {
         if (debug_layer_progress()) {
-            std::fprintf(stderr, "[worker-pc/Qwen2Model] seq=%d layer=%d begin\n", seq, li);
+            std::fprintf(stderr,
+                         "[worker-pc/Qwen2Model] seq=%d local_layer=%d global_layer=%d begin\n",
+                         seq, li, partition_.layer_begin + li);
         }
         TransformerLayer& layer = *layers_[li];
 
-        op_rmsnorm(scratch_.hidden.data(),
+        op_rmsnorm(hidden,
                    layer.input_layernorm.data(),
                    scratch_.norm_buf.data(),
                    seq, H, c.rms_norm_eps);
@@ -280,7 +350,7 @@ int Qwen2Model::forward_next_token(const std::vector<int>& tokens) {
         for (int s = 0; s < seq; ++s) {
             apply_rope(scratch_.q.data() + static_cast<size_t>(s) * H,
                        scratch_.k.data() + static_cast<size_t>(s) * kvd,
-                       pos + s);
+                       pos_base + s);
         }
 
         uint16_t* kc = kv_cache_.k_ptr(li);
@@ -288,17 +358,17 @@ int Qwen2Model::forward_next_token(const std::vector<int>& tokens) {
         for (int s = 0; s < seq; ++s) {
             const float* ksrc = scratch_.k.data() + static_cast<size_t>(s) * kvd;
             const float* vsrc = scratch_.v.data() + static_cast<size_t>(s) * kvd;
-            uint16_t* kdst = kc + static_cast<size_t>(pos + s) * kvd;
-            uint16_t* vdst = vc + static_cast<size_t>(pos + s) * kvd;
+            uint16_t* kdst = kc + static_cast<size_t>(pos_base + s) * kvd;
+            uint16_t* vdst = vc + static_cast<size_t>(pos_base + s) * kvd;
             for (int d = 0; d < kvd; ++d) {
                 kdst[d] = f32_to_f16(ksrc[d]);
                 vdst[d] = f32_to_f16(vsrc[d]);
             }
         }
         if (gpu_kv_cache_.ready()) {
-            const uint16_t* ksrc = kc + static_cast<size_t>(pos) * kvd;
-            const uint16_t* vsrc = vc + static_cast<size_t>(pos) * kvd;
-            if (!gpu_kv_cache_.copy_layer_slice_from_host(li, pos, ksrc, vsrc, seq)) {
+            const uint16_t* ksrc = kc + static_cast<size_t>(pos_base) * kvd;
+            const uint16_t* vsrc = vc + static_cast<size_t>(pos_base) * kvd;
+            if (!gpu_kv_cache_.copy_layer_slice_from_host(li, pos_base, ksrc, vsrc, seq)) {
                 throw std::runtime_error("worker-pc gpu kv cache update failed");
             }
         }
@@ -327,7 +397,7 @@ int Qwen2Model::forward_next_token(const std::vector<int>& tokens) {
                     c.num_attention_heads,
                     c.num_kv_heads,
                     c.head_dim,
-                    pos)) {
+                    pos_base)) {
                 throw std::runtime_error("worker-pc gpu attention prefill failed");
             }
         } else if (seq == 1) {
@@ -347,11 +417,11 @@ int Qwen2Model::forward_next_token(const std::vector<int>& tokens) {
                 vc,
                 scratch_.attn_out.data(),
                 seq,
-                total_len,
+                pos_base + seq,
                 c.num_attention_heads,
                 c.num_kv_heads,
                 c.head_dim,
-                pos);
+                pos_base);
         }
 
         op_f32_to_f16(scratch_.attn_out.data(), scratch_.in_f16.data(), seq * H);
@@ -361,9 +431,9 @@ int Qwen2Model::forward_next_token(const std::vector<int>& tokens) {
         for (int i = 0; i < seq * H; ++i) {
             scratch_.attn_out[i] = f16_to_f32(scratch_.out_f16[static_cast<size_t>(i)]);
         }
-        add_residual(scratch_.hidden.data(), scratch_.attn_out.data(), seq * H);
+        add_residual(hidden, scratch_.attn_out.data(), seq * H);
 
-        op_rmsnorm(scratch_.hidden.data(),
+        op_rmsnorm(hidden,
                    layer.post_attention_layernorm.data(),
                    scratch_.norm_buf.data(),
                    seq, H, c.rms_norm_eps);
@@ -390,21 +460,72 @@ int Qwen2Model::forward_next_token(const std::vector<int>& tokens) {
         for (int i = 0; i < seq * H; ++i) {
             scratch_.ffn_out[i] = f16_to_f32(scratch_.ffn_out_f16[static_cast<size_t>(i)]);
         }
-        add_residual(scratch_.hidden.data(), scratch_.ffn_out.data(), seq * H);
+        add_residual(hidden, scratch_.ffn_out.data(), seq * H);
         if (debug_layer_progress()) {
-            std::fprintf(stderr, "[worker-pc/Qwen2Model] seq=%d layer=%d end\n", seq, li);
+            std::fprintf(stderr,
+                         "[worker-pc/Qwen2Model] seq=%d local_layer=%d global_layer=%d end\n",
+                         seq, li, partition_.layer_begin + li);
         }
     }
+}
 
+bool Qwen2Model::forward_hidden_states(const uint16_t* input_f16,
+                                       int seq,
+                                       int pos_base,
+                                       std::vector<uint16_t>& output_f16) {
+    if (!input_f16 || seq <= 0 || !can_forward_hidden()) {
+        return false;
+    }
+    const int H = config_.hidden_size;
+    const int total_len = pos_base + seq;
+    if (total_len > kv_cache_.capacity()) {
+        return false;
+    }
+
+    ensure_scratch(seq);
+    scratch_.hidden.resize(static_cast<size_t>(seq) * H);
+    for (int i = 0; i < seq * H; ++i) {
+        scratch_.hidden[static_cast<size_t>(i)] = f16_to_f32(input_f16[static_cast<size_t>(i)]);
+    }
+
+    execute_loaded_layers(scratch_.hidden.data(), seq, pos_base);
+    output_f16.resize(static_cast<size_t>(seq) * H);
+    op_f32_to_f16(scratch_.hidden.data(), output_f16.data(), seq * H);
+    kv_cache_.set_cur_pos(total_len);
+    return true;
+}
+
+bool Qwen2Model::forward_hidden_to_token(const uint16_t* input_f16,
+                                         int seq,
+                                         int pos_base,
+                                         int& output_token_id) {
+    if (!input_f16 || seq <= 0 || !can_hidden_to_token()) {
+        return false;
+    }
+
+    const auto& c = config_;
+    const int H = c.hidden_size;
+    const int total_len = pos_base + seq;
+    if (total_len > kv_cache_.capacity()) {
+        return false;
+    }
+
+    ensure_scratch(seq);
+    for (int i = 0; i < seq * H; ++i) {
+        scratch_.hidden[static_cast<size_t>(i)] = f16_to_f32(input_f16[static_cast<size_t>(i)]);
+    }
+
+    execute_loaded_layers(scratch_.hidden.data(), seq, pos_base);
     op_rmsnorm(scratch_.hidden.data() + static_cast<size_t>(seq - 1) * H,
                norm_weight_.data(),
                scratch_.last.data(),
                1, H, c.rms_norm_eps);
     op_f32_to_f16(scratch_.last.data(), scratch_.lm_in.data(), H);
     if (!lm_head_->forward(scratch_.lm_in.data(), 1, scratch_.lm_out.data())) {
-        throw std::runtime_error("worker-pc linear forward failed in lm_head");
+        return false;
     }
 
     kv_cache_.set_cur_pos(total_len);
-    return argmax_f16(scratch_.lm_out);
+    output_token_id = argmax_f16(scratch_.lm_out);
+    return true;
 }

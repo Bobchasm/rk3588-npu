@@ -77,10 +77,10 @@ GenerationResult Coordinator::submit_text_request(const SessionId& session_id,
         return make_error_result("failed to append user message");
     }
 
-    const std::string prompt = session_manager_.get_prompt(session_id);
     std::vector<int> prompt_ids;
-    if (!tokenizer_->encode(prompt, prompt_ids)) {
-        return make_error_result("failed to tokenize prompt");
+    const std::vector<ChatMessage> history = session_manager_.get_history(session_id);
+    if (!tokenizer_->encode_chat(history, prompt_ids)) {
+        return make_error_result("failed to tokenize chat history");
     }
 
     GenerationResult result = submit_token_request(session_id, prompt_ids, max_new_tokens, on_token);

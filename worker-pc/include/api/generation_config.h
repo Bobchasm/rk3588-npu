@@ -7,7 +7,7 @@
 // ============================================================
 
 struct GenerationConfig {
-    int  max_new_tokens = 10;
+    int  max_new_tokens = 64;
     bool greedy         = true;
 
     // 停止 token id（遇到即停止）
