@@ -1,9 +1,11 @@
 #include "model/weight_loader.h"
 #include "core/half.h"
+#include "ops/op_cast.h"
 
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 
 // ============================================================
@@ -235,8 +237,11 @@ std::vector<float> load_tensor_f32(const std::string& path, const TensorMeta& me
     std::vector<float> out(n);
 
     if (meta.dtype == "BF16") {
+        if (n > std::numeric_limits<int>::max()) {
+            throw std::runtime_error("Tensor too large for BF16->FP32 cast");
+        }
         const uint16_t* src = reinterpret_cast<const uint16_t*>(raw.data());
-        for (int64_t i = 0; i < n; ++i) out[i] = bf16_to_f32(src[i]);
+        op_bf16_to_f32(src, out.data(), (int)n);
     } else if (meta.dtype == "F16") {
         const uint16_t* src = reinterpret_cast<const uint16_t*>(raw.data());
         for (int64_t i = 0; i < n; ++i) out[i] = f16_to_f32(src[i]);

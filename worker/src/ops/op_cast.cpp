@@ -5,6 +5,20 @@
 #include <arm_neon.h>
 #endif
 
+void op_bf16_to_f32(const uint16_t* src, float* dst, int n) {
+    // BF16 -> FP32 的批量转换。aarch64 上直接用 NEON 扩展位模式。
+    int i = 0;
+#if defined(__aarch64__)
+    for (; i + 4 <= n; i += 4) {
+        uint16x4_t b = vld1_u16(src + i);
+        uint32x4_t w = vmovl_u16(b);
+        uint32x4_t x = vshlq_n_u32(w, 16);
+        vst1q_f32(dst + i, vreinterpretq_f32_u32(x));
+    }
+#endif
+    for (; i < n; ++i) dst[i] = bf16_to_f32(src[i]);
+}
+
 void op_f32_to_f16(const float* src, uint16_t* dst, int n) {
     // CPU FP32 激活进入 NPU 前的通用转换。aarch64 上用 NEON 批量转。
     int i = 0;
