@@ -1,6 +1,7 @@
 # Model files (large, not tracked)
 # models/
 models/qwen1.5b-instruct/Qwen2-1.5B-Instruct
+tmp
 
 # Temp scripts
 dl_miniforge.py
