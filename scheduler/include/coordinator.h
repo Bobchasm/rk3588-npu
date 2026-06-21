@@ -17,6 +17,9 @@ public:
 
     SessionId create_session(const std::string& system_prompt = "");
     bool session_exists(const SessionId& session_id) const;
+    std::vector<SessionId> list_sessions() const;
+    bool reset_session(const SessionId& session_id, const std::string& system_prompt = "");
+    std::vector<ChatMessage> get_session_history(const SessionId& session_id) const;
 
     bool register_worker(std::unique_ptr<WorkerInterface> worker);
     GenerationResult submit_text_request(const SessionId& session_id,

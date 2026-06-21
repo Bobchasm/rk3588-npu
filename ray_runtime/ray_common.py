@@ -26,6 +26,26 @@ def add_runtime_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser
         default=1.0,
         help="GPU resource fraction requested by each GPU-backed Ray actor.",
     )
+    parser.add_argument(
+        "--head-resource",
+        default=None,
+        help="Custom Ray resource key required by the head actor, e.g. role_head.",
+    )
+    parser.add_argument(
+        "--stage-resource",
+        default=None,
+        help="Custom Ray resource key required by each stage actor, e.g. role_stage.",
+    )
+    parser.add_argument(
+        "--tail-resource",
+        default=None,
+        help="Custom Ray resource key required by the tail actor, e.g. role_tail.",
+    )
+    parser.add_argument(
+        "--pipeline-resource",
+        default=None,
+        help="Custom Ray resource key required by the pipeline actor.",
+    )
     return parser
 
 
@@ -52,3 +72,10 @@ def build_actor_options(device: str, detached: bool = True, gpu_fraction: float 
     if device in {"gpu", "auto"}:
         options["num_gpus"] = gpu_fraction
     return options
+
+
+def with_custom_resource(options: dict, resource_key: str | None) -> dict:
+    updated = dict(options)
+    if resource_key:
+        updated["resources"] = {resource_key: 0.001}
+    return updated

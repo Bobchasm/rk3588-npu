@@ -29,6 +29,18 @@ bool Coordinator::session_exists(const SessionId& session_id) const {
     return session_manager_.session_exists(session_id);
 }
 
+std::vector<SessionId> Coordinator::list_sessions() const {
+    return session_manager_.list_sessions();
+}
+
+bool Coordinator::reset_session(const SessionId& session_id, const std::string& system_prompt) {
+    return session_manager_.reset_session(session_id, system_prompt);
+}
+
+std::vector<ChatMessage> Coordinator::get_session_history(const SessionId& session_id) const {
+    return session_manager_.get_history(session_id);
+}
+
 bool Coordinator::register_worker(std::unique_ptr<WorkerInterface> worker) {
     if (!worker) return false;
     if (worker->worker_id().empty()) {

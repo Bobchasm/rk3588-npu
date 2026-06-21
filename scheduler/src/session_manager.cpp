@@ -18,6 +18,25 @@ bool SessionManager::session_exists(const SessionId& session_id) const {
     return sessions_.find(session_id) != sessions_.end();
 }
 
+std::vector<SessionId> SessionManager::list_sessions() const {
+    std::vector<SessionId> session_ids;
+    session_ids.reserve(sessions_.size());
+    for (const auto& entry : sessions_) {
+        session_ids.push_back(entry.first);
+    }
+    return session_ids;
+}
+
+bool SessionManager::reset_session(const SessionId& session_id, const std::string& system_prompt) {
+    auto it = sessions_.find(session_id);
+    if (it == sessions_.end()) return false;
+    it->second.history.clear();
+    if (!system_prompt.empty()) {
+        it->second.history.push_back({"system", system_prompt});
+    }
+    return true;
+}
+
 bool SessionManager::append_user_message(const SessionId& session_id, const std::string& text) {
     auto it = sessions_.find(session_id);
     if (it == sessions_.end()) return false;

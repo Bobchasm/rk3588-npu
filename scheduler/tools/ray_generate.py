@@ -20,6 +20,7 @@ def parse_args():
     parser.add_argument("--ray-address", default="auto")
     parser.add_argument("--max-new-tokens", type=int, default=10)
     parser.add_argument("--repetition-window", type=int, default=6)
+    parser.add_argument("--pipeline-mode", default=None, choices=["centralized", "p2p"])
     parser.add_argument("token_ids", nargs="+", type=int)
     return parser.parse_args()
 
@@ -44,6 +45,7 @@ def main() -> int:
                 input_ids=args.token_ids,
                 max_new_tokens=args.max_new_tokens,
                 repetition_window=args.repetition_window,
+                pipeline_mode=args.pipeline_mode,
             )
         )
     except Exception as exc:

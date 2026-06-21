@@ -239,6 +239,83 @@ PYTHONPATH=bindings/python python3 ray_runtime/serve_worker.py \
   --gpu-fraction 0.25
 ```
 
+集群连接：
+
+```bash
+PYTHONPATH=bindings/python python3 ray_runtime/serve_worker.py \
+  models/qwen1.5b-instruct/Qwen2-1.5B-Instruct \
+  --target pc \
+  --device cpu \
+  --mode distributed \
+  --num-stages 1 \
+  --actor-name pc-distributed \
+  --ray-address 机器IP:6379
+```
+
+如果要把不同角色固定到不同机器，可以给不同节点声明自定义资源，再在创建 actor 时使用对应资源键。
+
+示例：
+
+- 机器 A 作为 `head` 节点，启动 Ray 时声明 `role_head`
+- 机器 B 作为 `stage` 节点，启动 Ray 时声明 `role_stage`
+- 机器 C 作为 `tail` 节点，启动 Ray 时声明 `role_tail`
+
+例如节点加入集群时可以分别这样启动：
+
+```bash
+ray start --address='Head机器IP:6379' --resources='{"role_head": 1}'
+```
+
+```bash
+ray start --address='Head机器IP:6379' --resources='{"role_stage": 1}'
+```
+
+```bash
+ray start --address='Head机器IP:6379' --resources='{"role_tail": 1}'
+```
+
+然后创建 distributed actor 时显式指定：
+
+```bash
+PYTHONPATH=bindings/python python3 ray_runtime/serve_worker.py \
+  models/qwen1.5b-instruct/Qwen2-1.5B-Instruct \
+  --target pc \
+  --device cpu \
+  --mode distributed \
+  --num-stages 1 \
+  --actor-name pc-distributed \
+  --ray-address Head机器IP:6379 \
+  --head-resource role_head \
+  --stage-resource role_stage \
+  --tail-resource role_tail
+```
+
+这样当前这套 PC worker 的角色部署方式就和后续板子侧保持一致：都是“底层 engine 不关心节点位置，部署层通过角色资源决定 actor 落点”。
+
+当前 pipeline 逻辑还支持两种模式选择：
+
+- `--pipeline-mode centralized`
+  由 `DistributedPipelineActor` 统一串联 `head -> stage -> tail`
+- `--pipeline-mode p2p`
+  当前先保留为可切换模式接口，底层仍复用同一套 actor 计算接口，后续会继续把 forwarding 逻辑做得更接近真正的 stage-to-stage 传递
+
+示例：
+
+```bash
+PYTHONPATH=bindings/python python3 ray_runtime/serve_worker.py \
+  models/qwen1.5b-instruct/Qwen2-1.5B-Instruct \
+  --target pc \
+  --device cpu \
+  --mode distributed \
+  --pipeline-mode centralized \
+  --num-stages 1 \
+  --actor-name pc-distributed \
+  --ray-address Head机器IP:6379 \
+  --head-resource role_head \
+  --stage-resource role_stage \
+  --tail-resource role_tail
+```
+
 参数含义：
 
 - `--num-stages 1`
@@ -247,6 +324,25 @@ PYTHONPATH=bindings/python python3 ray_runtime/serve_worker.py \
   降低本地 Ray object store 预留，适合低内存机器
 - `--gpu-fraction 0.25`
   每个 GPU actor 向 Ray 申请 `0.25` 张卡，便于单卡机器同时调度多个 stage actor
+- `--head-resource / --stage-resource / --tail-resource`
+  为不同角色指定 Ray 自定义资源键，用于把不同角色固定到不同机器
+- `--pipeline-mode centralized / p2p`
+  选择当前 Ray distributed 逻辑模式。当前 `centralized` 更稳定，`p2p` 先用于统一接口和部署抽象
+
+### 3.1 板子侧同步状态
+
+当前这套角色部署和 pipeline mode 的抽象已经先在 `pc` 版本接好了，后续迁到 `rk3588` 时希望尽量保持同样模式：
+
+- 上层仍然使用 `target + role + pipeline_mode + resource` 这一套部署参数
+- 节点角色落点仍由部署层决定，而不是写死在 worker 内部
+
+但需要注意：截至目前，`rk3588_engine` 还只有完整 `generate()` 能力，还没有补齐：
+
+- `tokens_to_hidden`
+- `hidden_forward`
+- `hidden_to_token`
+
+因此板子侧目前还不能直接复用 `head / stage / tail` 的分段 Ray pipeline，只能说部署抽象和入口形式已经开始和 PC 对齐，真正的分段能力还需要继续补齐。
 
 如果日志里最终出现：
 
@@ -290,6 +386,29 @@ Scheduler CLI started. Enter text to generate, or type /exit.
 ```text
 你好
 ```
+
+当前 `scheduler_cli` 也支持基础多会话管理，适合先做“多会话串行正确”验证。可用命令包括：
+
+```text
+/new
+/new 你是一个简洁的中文助手。
+/sessions
+/switch session-2
+/help
+```
+
+其中：
+
+- `/new`
+  创建一个新会话并切换过去
+- `/new <system_prompt>`
+  使用自定义 system prompt 创建新会话
+- `/sessions`
+  列出当前所有会话
+- `/switch <session_id>`
+  切换到指定会话
+
+当前这层会话隔离主要在调度器上层完成，底层仍按单请求串行执行，因此适合先验证“不同会话历史不串”这一目标。
 
 ### 6. 当前注意事项
 

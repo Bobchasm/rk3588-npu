@@ -12,6 +12,14 @@ def _default_request_id(pid: int, count: int) -> str:
     return f"req-{pid}-{count}"
 
 
+def _run_pipeline_step_local(head, stages: list, tail, current_input: list[int], pos_base: int) -> int:
+    hidden = ray.get(head.tokens_to_hidden.remote(current_input))
+    seq = len(current_input)
+    for stage in stages:
+        hidden = ray.get(stage.hidden_forward.remote(hidden, seq, pos_base))
+    return ray.get(tail.hidden_to_token.remote(hidden, seq, pos_base))
+
+
 @ray.remote(max_concurrency=1)
 class FullModelWorkerActor:
     def __init__(
@@ -189,14 +197,26 @@ class TailWorkerActor:
 
 @ray.remote(max_concurrency=1)
 class DistributedPipelineActor:
-    def __init__(self, head, stages: list, tail, actor_name: str = "distributed-pipeline") -> None:
+    def __init__(
+        self,
+        head,
+        stages: list,
+        tail,
+        actor_name: str = "distributed-pipeline",
+        pipeline_mode: str = "centralized",
+    ) -> None:
         self._head = head
         self._stages = stages
         self._tail = tail
         self._actor_name = actor_name
+        self._pipeline_mode = pipeline_mode
         self._pid = os.getpid()
         self._request_count = 0
-        print(f"[ray/DistributedPipelineActor] ready pid={self._pid} name={actor_name}", flush=True)
+        print(
+            f"[ray/DistributedPipelineActor] ready pid={self._pid} "
+            f"name={actor_name} mode={pipeline_mode}",
+            flush=True,
+        )
 
     def metadata(self) -> dict:
         return {
@@ -204,6 +224,7 @@ class DistributedPipelineActor:
             "pid": self._pid,
             "request_count": self._request_count,
             "num_stages": len(self._stages),
+            "pipeline_mode": self._pipeline_mode,
         }
 
     def reset(self) -> None:
@@ -212,22 +233,39 @@ class DistributedPipelineActor:
             ray.get(stage.reset.remote())
         ray.get(self._tail.reset.remote())
 
-    def generate(
+    def _generate_centralized(
         self,
         input_ids: list[int],
-        max_new_tokens: int = 64,
-        repetition_window: int = 6,
-        stop_tokens: list[int] | None = None,
-        reset_kv: bool = True,
-        request_id: str | None = None,
-    ) -> dict:
-        started = time.time()
-        self._request_count += 1
-        rid = request_id or _default_request_id(self._pid, self._request_count)
-        stop_set = set(stop_tokens or [151645, 151643])
-        if reset_kv:
-            self.reset()
+        max_new_tokens: int,
+        stop_set: set[int],
+    ) -> list[int]:
+        generated_ids: list[int] = []
+        current_input = list(input_ids)
+        prompt_len = len(input_ids)
 
+        for _step in range(max_new_tokens):
+            pos_base = prompt_len + len(generated_ids) - len(current_input)
+            token_id = _run_pipeline_step_local(
+                self._head,
+                self._stages,
+                self._tail,
+                current_input,
+                pos_base,
+            )
+            generated_ids.append(token_id)
+            if token_id in stop_set:
+                break
+            current_input = [token_id]
+        return generated_ids
+
+    def _generate_p2p(
+        self,
+        input_ids: list[int],
+        max_new_tokens: int,
+        stop_set: set[int],
+    ) -> list[int]:
+        # Current P2P mode keeps the same actor graph but switches to stage-to-stage chaining
+        # semantics in the control layer. The physical transport is still handled by Ray.
         generated_ids: list[int] = []
         current_input = list(input_ids)
         prompt_len = len(input_ids)
@@ -243,6 +281,31 @@ class DistributedPipelineActor:
             if token_id in stop_set:
                 break
             current_input = [token_id]
+        return generated_ids
+
+    def generate(
+        self,
+        input_ids: list[int],
+        max_new_tokens: int = 64,
+        repetition_window: int = 6,
+        stop_tokens: list[int] | None = None,
+        reset_kv: bool = True,
+        request_id: str | None = None,
+        pipeline_mode: str | None = None,
+    ) -> dict:
+        started = time.time()
+        self._request_count += 1
+        rid = request_id or _default_request_id(self._pid, self._request_count)
+        stop_set = set(stop_tokens or [151645, 151643])
+        if reset_kv:
+            self.reset()
+        active_mode = pipeline_mode or self._pipeline_mode
+        if active_mode == "centralized":
+            generated_ids = self._generate_centralized(input_ids, max_new_tokens, stop_set)
+        elif active_mode == "p2p":
+            generated_ids = self._generate_p2p(input_ids, max_new_tokens, stop_set)
+        else:
+            raise ValueError(f"unsupported pipeline_mode: {active_mode}")
 
         return {
             "request_id": rid,
@@ -254,6 +317,7 @@ class DistributedPipelineActor:
             "hit_stop": bool(generated_ids and generated_ids[-1] in stop_set),
             "hit_repetition": False,
             "actor_name": self._actor_name,
+            "pipeline_mode": active_mode,
             "elapsed_ms": (time.time() - started) * 1000.0,
             "request_count": self._request_count,
         }

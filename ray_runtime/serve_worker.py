@@ -8,7 +8,7 @@ import ray
 from ray.exceptions import RayError
 
 from actors import DistributedPipelineActor, FullModelWorkerActor, HeadWorkerActor, StageWorkerActor, TailWorkerActor
-from ray_common import add_runtime_args, build_actor_options, init_ray
+from ray_common import add_runtime_args, build_actor_options, init_ray, with_custom_resource
 
 
 def parse_args():
@@ -17,6 +17,7 @@ def parse_args():
     parser.add_argument("--target", default="pc", choices=["pc"])
     parser.add_argument("--device", default="auto", choices=["cpu", "gpu", "auto"])
     parser.add_argument("--mode", default="full", choices=["full", "distributed"])
+    parser.add_argument("--pipeline-mode", default="centralized", choices=["centralized", "p2p"])
     parser.add_argument("--num-stages", type=int, default=2)
     parser.add_argument("--detach-only", action="store_true",
                         help="Create detached actor and exit without keeping the driver alive")
@@ -51,7 +52,7 @@ def main():
         else:
             raise ValueError("currently only --num-stages 1 or 2 is supported")
 
-        head_actor_options = dict(actor_options)
+        head_actor_options = with_custom_resource(actor_options, args.head_resource)
         head_actor_options["name"] = args.actor_name + "-head"
         head = HeadWorkerActor.options(**head_actor_options).remote(
             args.target,
@@ -67,9 +68,9 @@ def main():
             for _ in range(args.num_stages)
         ]
         for i in range(args.num_stages):
-            stages[i] = StageWorkerActor.options(
-                **{**actor_options, "name": f"{args.actor_name}-stage-{i}"}
-            ).remote(
+            stage_actor_options = with_custom_resource(actor_options, args.stage_resource)
+            stage_actor_options["name"] = f"{args.actor_name}-stage-{i}"
+            stages[i] = StageWorkerActor.options(**stage_actor_options).remote(
                 args.target,
                 args.model_dir,
                 args.device,
@@ -78,7 +79,7 @@ def main():
                 stage_ranges[i][1],
             )
             ray.get(stages[i].metadata.remote())
-        tail_actor_options = dict(actor_options)
+        tail_actor_options = with_custom_resource(actor_options, args.tail_resource)
         tail_actor_options["name"] = args.actor_name + "-tail"
         tail = TailWorkerActor.options(**tail_actor_options).remote(
             args.target,
@@ -89,10 +90,10 @@ def main():
             28,
         )
         ray.get(tail.metadata.remote())
-        pipeline_actor_options = {
+        pipeline_actor_options = with_custom_resource({
             "name": args.actor_name,
             "max_restarts": 0,
-        }
+        }, args.pipeline_resource)
         if actor_options.get("lifetime") == "detached":
             pipeline_actor_options["lifetime"] = "detached"
         actor = DistributedPipelineActor.options(**pipeline_actor_options).remote(
@@ -100,6 +101,7 @@ def main():
             stages,
             tail,
             args.actor_name,
+            args.pipeline_mode,
         )
         metadata = ray.get(actor.metadata.remote())
         print(f"[ray/serve_worker] distributed actor ready: {metadata}", flush=True)

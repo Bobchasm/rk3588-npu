@@ -79,6 +79,12 @@ class _ModuleEngineAdapter:
     def hidden_to_token(self, input_f16: Sequence[int], seq: int, pos_base: int):
         return int(self._engine.hidden_to_token(list(input_f16), seq, pos_base))
 
+    def supports_partition_pipeline(self) -> bool:
+        return all(
+            hasattr(self._engine, name)
+            for name in ("tokens_to_hidden", "hidden_forward", "hidden_to_token")
+        )
+
 
 class PcEngineAdapter(_ModuleEngineAdapter):
     module_name = ".pc_engine"
