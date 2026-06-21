@@ -212,6 +212,49 @@ export RAY_memory_monitor_refresh_ms=0
 
 这会关闭 Ray 的内存监控自动杀进程逻辑，避免 `tail actor` 在模型加载过程中因为单机内存接近阈值而被提前杀掉。
 
+### 2.1 服务器节点编译说明
+
+如果远端服务器只是作为 `pc` 版 Ray 节点参与推理，不需要编译 `worker_pc_rpc_server`、`qwen2_pc_demo` 这些可执行文件，优先保证 `pc_engine` Python binding 可用即可。
+
+在服务器上建议执行：
+
+```bash
+cd ~/rk3588/rk3588-npu
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate rk3588
+
+rm -rf bindings/build
+
+cmake -S bindings -B bindings/build \
+  -DBUILD_WORKER_PC_APPS=OFF \
+  -DBUILD_WORKER_PC_RPC=OFF \
+  -DBUILD_WORKER_PC_CUDA=OFF \
+  -DCMAKE_C_COMPILER=/usr/bin/gcc \
+  -DCMAKE_CXX_COMPILER=/usr/bin/g++
+
+cmake --build bindings/build -j4 --target pc_engine
+```
+
+编译完成后，建议立刻验证：
+
+```bash
+cd ~/rk3588/rk3588-npu
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate rk3588
+export PYTHONPATH=bindings/python
+
+python3 - <<'PY'
+from runtime import create_engine
+e = create_engine("pc")
+print("import ok")
+e.load("models/qwen1.5b-instruct/Qwen2-1.5B-Instruct", "cpu", 0, 4, True, False)
+print("load ok")
+e.destroy()
+PY
+```
+
+如果这里通过，说明这台服务器已经具备作为 `pc` Ray 节点的基础条件。
+
 ### 3. 启动 Ray distributed actor
 
 ```bash
@@ -418,3 +461,118 @@ Scheduler CLI started. Enter text to generate, or type /exit.
 - 当前最外层 `DistributedPipelineActor` 不占 GPU，GPU 资源只分配给 `head/stage/tail`
 - `scheduler_cli` 走 Ray 时，内部会调用 `scheduler/tools/ray_generate.py`，所以必须保证 `SCHEDULER_RAY_PYTHON` 指向和 Ray 集群一致的 Python 环境
 - 如果前一次请求挂住，`DistributedPipelineActor` 由于 `max_concurrency=1` 会阻塞后续请求；这种情况下建议直接停掉当前 Ray 服务，重新启动整组 actor
+
+### 7. 本地 PC + 服务器双机流程
+
+下面给出一个“本地 PC 作为 head/control，远端服务器作为 stage 或 tail 节点”的最小流程。
+
+假设：
+
+- 本地 PC 项目目录：`/home/deep/rk3588-npu`
+- 服务器项目目录：`/home/ubuntu/rk3588/rk3588-npu`
+- 本地 PC IP：`PC_IP`
+- 模型路径两端都已准备好：`models/qwen1.5b-instruct/Qwen2-1.5B-Instruct`
+
+#### 7.1 本地 PC：启动 Ray head
+
+```bash
+cd /home/deep/rk3588-npu
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate rk3588
+
+ray stop --force
+ray start --head --port=6379 --resources='{"role_head": 1, "role_tail": 1}'
+```
+
+这里把 `head` 和 `tail` 都先放在本地，服务器先承担 `stage`，这样最容易测通双机链路。
+
+#### 7.2 服务器：加入 Ray 集群
+
+```bash
+cd /home/ubuntu/rk3588/rk3588-npu
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate rk3588
+
+ray stop --force
+ray start --address='PC_IP:6379' --resources='{"role_stage": 1}'
+```
+
+#### 7.3 本地 PC：创建 distributed actor
+
+```bash
+cd /home/deep/rk3588-npu
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate rk3588
+
+export PYTHONPATH=bindings/python
+export SCHEDULER_RAY_PYTHON=/home/deep/miniforge3/envs/rk3588/bin/python3.10
+export RAY_memory_monitor_refresh_ms=0
+
+python3 ray_runtime/serve_worker.py \
+  models/qwen1.5b-instruct/Qwen2-1.5B-Instruct \
+  --target pc \
+  --device cpu \
+  --mode distributed \
+  --pipeline-mode centralized \
+  --num-stages 1 \
+  --actor-name pc-distributed \
+  --ray-address PC_IP:6379 \
+  --head-resource role_head \
+  --stage-resource role_stage \
+  --tail-resource role_tail
+```
+
+#### 7.4 本地 PC：验证 actor 是否存在
+
+```bash
+cd /home/deep/rk3588-npu
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate rk3588
+
+export PYTHONPATH=bindings/python
+python3 ray_runtime/actor_status.py \
+  --ray-address PC_IP:6379 \
+  --actor-name pc-distributed
+```
+
+#### 7.5 本地 PC：最小 token 请求验证
+
+```bash
+cd /home/deep/rk3588-npu
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate rk3588
+
+export PYTHONPATH=bindings/python
+export SCHEDULER_RAY_PYTHON=/home/deep/miniforge3/envs/rk3588/bin/python3.10
+
+python3 scheduler/tools/ray_generate.py \
+  --ray-address PC_IP:6379 \
+  --actor-name pc-distributed \
+  151644 8948 198
+```
+
+#### 7.6 本地 PC：启动调度器，跑完整文本链路
+
+```bash
+cd /home/deep/rk3588-npu
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate rk3588
+
+export SCHEDULER_RAY_PYTHON=/home/deep/miniforge3/envs/rk3588/bin/python3.10
+
+./scheduler/build/scheduler_cli \
+  models/qwen1.5b-instruct/Qwen2-1.5B-Instruct \
+  ray:pc-distributed
+```
+
+如果想结束服务，可以在本地执行：
+
+```bash
+cd /home/deep/rk3588-npu
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate rk3588
+
+python3 ray_runtime/stop_worker.py \
+  --ray-address PC_IP:6379 \
+  --actor-name pc-distributed
+```

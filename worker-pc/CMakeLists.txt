@@ -24,6 +24,7 @@ set(WORKER_PC_OPS_SOURCES
     src/ops/op_cast.cpp
     src/ops/op_embedding.cpp
     src/ops/op_attention.cpp
+    src/ops/op_attention_cuda_stub.cpp
 )
 
 set(WORKER_PC_BACKEND_SOURCES
