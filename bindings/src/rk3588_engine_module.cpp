@@ -46,9 +46,18 @@ class PyRk3588Engine {
 public:
     PyRk3588Engine() = default;
 
-    void load(const std::string&, const std::string&) {}
+    void load(const std::string&, const std::string&, int, int, bool, bool) {}
     void reset() {}
     void destroy() {}
+    std::vector<uint16_t> tokens_to_hidden(const std::vector<int>&) {
+        throw std::runtime_error("rk3588 smoke test module: worker_core is disabled");
+    }
+    std::vector<uint16_t> hidden_forward(const std::vector<uint16_t>&, int, int) {
+        throw std::runtime_error("rk3588 smoke test module: worker_core is disabled");
+    }
+    int hidden_to_token(const std::vector<uint16_t>&, int, int) {
+        throw std::runtime_error("rk3588 smoke test module: worker_core is disabled");
+    }
     py::dict generate(const std::vector<int>&, int, int, const std::vector<int>&) {
         throw std::runtime_error("rk3588 smoke test module: worker_core is disabled");
     }
@@ -56,13 +65,25 @@ public:
 #else
 class PyRk3588Engine {
 public:
+    using KvState = LLMEngine::KvState;
+
     PyRk3588Engine() : engine_(std::make_unique<LLMEngine>()) {}
 
-    void load(const std::string& model_dir, const std::string& backend) {
+    void load(const std::string& model_dir,
+              const std::string& backend,
+              int layer_begin = 0,
+              int layer_end = -1,
+              bool include_embedding = true,
+              bool include_final_norm_and_head = true) {
         std::fprintf(stderr, "[bindings/rk3588_engine] load enter backend=%s model_dir=%s\n",
                      backend.c_str(), model_dir.c_str());
         const LinearBackend parsed = parse_linear_backend(backend);
-        if (!engine_->load(model_dir, parsed)) {
+        LLMEngine::PartitionConfig partition;
+        partition.layer_begin = layer_begin;
+        partition.layer_end = layer_end;
+        partition.include_embedding = include_embedding;
+        partition.include_final_norm_and_head = include_final_norm_and_head;
+        if (!engine_->load(model_dir, parsed, partition)) {
             throw std::runtime_error("failed to load rk3588 worker model");
         }
         std::fprintf(stderr, "[bindings/rk3588_engine] load leave\n");
@@ -74,6 +95,47 @@ public:
 
     void destroy() {
         engine_->destroy();
+    }
+
+    KvState snapshot_kv_state() const {
+        return engine_->snapshot_kv_state();
+    }
+
+    void restore_kv_state(const KvState& state) {
+        if (!engine_->restore_kv_state(state)) {
+            throw std::runtime_error("restore_kv_state failed");
+        }
+    }
+
+    std::vector<uint16_t> tokens_to_hidden(const std::vector<int>& input_ids) {
+        std::vector<uint16_t> output;
+        std::string error;
+        if (!engine_->forward_tokens_to_hidden(input_ids, output, &error)) {
+            throw std::runtime_error(error.empty() ? "tokens_to_hidden failed" : error);
+        }
+        return output;
+    }
+
+    std::vector<uint16_t> hidden_forward(const std::vector<uint16_t>& input_f16,
+                                         int seq,
+                                         int pos_base) {
+        std::vector<uint16_t> output;
+        std::string error;
+        if (!engine_->forward_hidden_states(input_f16, seq, pos_base, output, &error)) {
+            throw std::runtime_error(error.empty() ? "hidden_forward failed" : error);
+        }
+        return output;
+    }
+
+    int hidden_to_token(const std::vector<uint16_t>& input_f16,
+                        int seq,
+                        int pos_base) {
+        int token_id = 0;
+        std::string error;
+        if (!engine_->forward_hidden_to_token(input_f16, seq, pos_base, token_id, &error)) {
+            throw std::runtime_error(error.empty() ? "hidden_to_token failed" : error);
+        }
+        return token_id;
     }
 
     GenerationResult generate(const std::vector<int>& input_ids,
@@ -108,9 +170,19 @@ PYBIND11_MODULE(rk3588_engine, m) {
     m.doc() = "smoke test pybind11 binding for rk3588 module import";
     py::class_<PyRk3588Engine>(m, "Engine")
         .def(py::init<>())
-        .def("load", &PyRk3588Engine::load, py::arg("model_dir"), py::arg("backend") = "npu")
+        .def("load",
+             &PyRk3588Engine::load,
+             py::arg("model_dir"),
+             py::arg("backend") = "npu",
+             py::arg("layer_begin") = 0,
+             py::arg("layer_end") = -1,
+             py::arg("include_embedding") = true,
+             py::arg("include_final_norm_and_head") = true)
         .def("reset", &PyRk3588Engine::reset)
         .def("destroy", &PyRk3588Engine::destroy)
+        .def("tokens_to_hidden", &PyRk3588Engine::tokens_to_hidden)
+        .def("hidden_forward", &PyRk3588Engine::hidden_forward)
+        .def("hidden_to_token", &PyRk3588Engine::hidden_to_token)
         .def("generate",
              &PyRk3588Engine::generate,
              py::arg("input_ids"),
@@ -120,6 +192,18 @@ PYBIND11_MODULE(rk3588_engine, m) {
     m.def("ping", []() { return "rk3588_engine_smoke_ok"; });
 #else
     m.doc() = "pybind11 binding for rk3588 worker LLMEngine";
+
+    py::class_<KVCache::State>(m, "KvCacheState")
+        .def(py::init<>())
+        .def_readwrite("k_cache", &KVCache::State::k_cache)
+        .def_readwrite("v_cache", &KVCache::State::v_cache)
+        .def_readwrite("capacity", &KVCache::State::capacity)
+        .def_readwrite("kv_dim", &KVCache::State::kv_dim)
+        .def_readwrite("cur_pos", &KVCache::State::cur_pos);
+
+    py::class_<Qwen2Model::KvState>(m, "KvState")
+        .def(py::init<>())
+        .def_readwrite("kv_cache", &Qwen2Model::KvState::kv_cache);
 
     py::class_<GenerationResult>(m, "GenerationResult")
         .def_readonly("output_ids", &GenerationResult::output_ids)
@@ -132,9 +216,21 @@ PYBIND11_MODULE(rk3588_engine, m) {
 
     py::class_<PyRk3588Engine>(m, "Engine")
         .def(py::init<>())
-        .def("load", &PyRk3588Engine::load, py::arg("model_dir"), py::arg("backend") = "npu")
+        .def("load",
+             &PyRk3588Engine::load,
+             py::arg("model_dir"),
+             py::arg("backend") = "npu",
+             py::arg("layer_begin") = 0,
+             py::arg("layer_end") = -1,
+             py::arg("include_embedding") = true,
+             py::arg("include_final_norm_and_head") = true)
         .def("reset", &PyRk3588Engine::reset)
         .def("destroy", &PyRk3588Engine::destroy)
+        .def("snapshot_kv_state", &PyRk3588Engine::snapshot_kv_state)
+        .def("restore_kv_state", &PyRk3588Engine::restore_kv_state)
+        .def("tokens_to_hidden", &PyRk3588Engine::tokens_to_hidden)
+        .def("hidden_forward", &PyRk3588Engine::hidden_forward)
+        .def("hidden_to_token", &PyRk3588Engine::hidden_to_token)
         .def("generate",
              &PyRk3588Engine::generate,
              py::arg("input_ids"),

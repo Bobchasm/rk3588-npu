@@ -18,13 +18,24 @@
 
 class KVCache {
 public:
+    struct State {
+        std::vector<std::vector<uint16_t>> k_cache;
+        std::vector<std::vector<uint16_t>> v_cache;
+        int capacity = 0;
+        int kv_dim = 0;
+        int cur_pos = 0;
+    };
+
     void init(int num_layers, int capacity, int kv_dim);
     void reset();
+    State snapshot() const;
+    bool restore(const State& state);
 
     int  cur_pos()  const { return cur_pos_; }
     void set_cur_pos(int pos) { cur_pos_ = pos; }
     int  capacity() const { return capacity_; }
     int  kv_dim()   const { return kv_dim_; }
+    int  num_layers() const { return static_cast<int>(k_cache_.size()); }
 
     // 直接暴露每层底层指针，attention 算子和写入路径都通过它访问
     uint16_t*       k_ptr(int layer)       { return k_cache_[layer].data(); }

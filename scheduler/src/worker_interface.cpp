@@ -111,6 +111,8 @@ public:
     bool reset_cache() override {
 #ifdef SCHEDULER_USE_WORKER_CORE
         engine_.reset();
+        active_session_id_.clear();
+        cached_prompt_ids_.clear();
         return true;
 #else
         return false;
@@ -120,14 +122,45 @@ public:
     GenerationResult generate_tokens(const GenerateTokensRequest& req,
                                      TokenCallback on_token = nullptr) override
     {
-        (void)req.context;
 #ifdef SCHEDULER_USE_WORKER_CORE
         GenerationConfig cfg;
         cfg.max_new_tokens = req.generation.max_new_tokens;
         cfg.repetition_window = req.generation.repetition_window;
 
+        std::vector<int> effective_input_ids(req.input_token_ids.begin(), req.input_token_ids.end());
+        bool can_reuse = false;
+        int reused_tokens = 0;
+        if (!req.context.session_id.empty()) {
+            if (active_session_id_ == req.context.session_id &&
+                cached_prompt_ids_.size() < req.input_token_ids.size()) {
+                bool matches = true;
+                for (size_t i = 0; i < cached_prompt_ids_.size(); ++i) {
+                    if (cached_prompt_ids_[i] != req.input_token_ids[i]) {
+                        matches = false;
+                        break;
+                    }
+                }
+                if (matches) {
+                    reused_tokens = static_cast<int>(cached_prompt_ids_.size());
+                    effective_input_ids.assign(req.input_token_ids.begin() + reused_tokens,
+                                               req.input_token_ids.end());
+                    can_reuse = !effective_input_ids.empty();
+                }
+            }
+            if (!can_reuse) {
+                engine_.reset();
+                active_session_id_ = req.context.session_id;
+                cached_prompt_ids_.clear();
+                effective_input_ids.assign(req.input_token_ids.begin(), req.input_token_ids.end());
+            }
+        } else {
+            engine_.reset();
+            active_session_id_.clear();
+            cached_prompt_ids_.clear();
+        }
+
         const auto local_result = engine_.generate(
-            std::vector<int>(req.input_token_ids.begin(), req.input_token_ids.end()),
+            effective_input_ids,
             cfg,
             on_token);
 
@@ -139,6 +172,12 @@ public:
         result.decode_ms = local_result.decode_ms;
         result.hit_stop = local_result.hit_stop;
         result.hit_repetition = local_result.hit_repetition;
+        if (!req.context.session_id.empty()) {
+            cached_prompt_ids_.assign(req.input_token_ids.begin(), req.input_token_ids.end());
+            cached_prompt_ids_.insert(cached_prompt_ids_.end(),
+                                      local_result.output_ids.begin(),
+                                      local_result.output_ids.end());
+        }
         return result;
 #else
         GenerationResult result;
@@ -176,6 +215,8 @@ private:
     std::string model_dir_;
 #ifdef SCHEDULER_USE_WORKER_CORE
     LLMEngine engine_;
+    std::string active_session_id_;
+    std::vector<int> cached_prompt_ids_;
 #endif
 };
 
@@ -365,7 +406,6 @@ public:
     GenerationResult generate_tokens(const GenerateTokensRequest& req,
                                      TokenCallback on_token = nullptr) override
     {
-        (void)req.context;
         std::ostringstream cmd;
         cmd << "PYTHONPATH=" << escape_shell_arg(std::string(SCHEDULER_REPO_ROOT) + "/bindings/python")
             << " " << scheduler_python_executable()
@@ -374,6 +414,12 @@ public:
             << " --actor-name " << escape_shell_arg(actor_name_)
             << " --max-new-tokens " << req.generation.max_new_tokens
             << " --repetition-window " << req.generation.repetition_window;
+        if (!req.context.session_id.empty()) {
+            cmd << " --session-id " << escape_shell_arg(req.context.session_id);
+        }
+        if (req.context.request_id != 0) {
+            cmd << " --request-id " << escape_shell_arg(std::to_string(req.context.request_id));
+        }
         for (int token_id : req.input_token_ids) {
             cmd << " " << token_id;
         }

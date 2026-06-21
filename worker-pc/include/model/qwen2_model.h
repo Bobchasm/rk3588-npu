@@ -22,6 +22,10 @@
 
 class Qwen2Model {
 public:
+    struct KvState {
+        KVCache::State kv_cache;
+    };
+
     struct PartitionConfig {
         int layer_begin = 0;
         int layer_end = -1;  // <0 means [layer_begin, num_hidden_layers)
@@ -43,6 +47,8 @@ public:
 
     void destroy();
     void reset_kv_cache();
+    KvState snapshot_kv_state() const;
+    bool restore_kv_state(const KvState& state);
     int forward_next_token(const std::vector<int>& tokens);
     bool forward_tokens_to_hidden(const std::vector<int>& tokens,
                                   std::vector<uint16_t>& output_f16);

@@ -6,6 +6,7 @@
 #include "backend/device_type.h"
 
 #include <memory>
+#include <pybind11/stl_bind.h>
 #include <cstdio>
 #include <stdexcept>
 #include <string>
@@ -17,6 +18,8 @@ namespace {
 
 class PyPcEngine {
 public:
+    using KvState = LLMEngine::KvState;
+
     PyPcEngine() : engine_(std::make_unique<LLMEngine>()) {}
 
     void load(const std::string& model_dir,
@@ -45,6 +48,16 @@ public:
 
     void destroy() {
         engine_->destroy();
+    }
+
+    KvState snapshot_kv_state() const {
+        return engine_->snapshot_kv_state();
+    }
+
+    void restore_kv_state(const KvState& state) {
+        if (!engine_->restore_kv_state(state)) {
+            throw std::runtime_error("restore_kv_state failed");
+        }
     }
 
     std::vector<uint16_t> tokens_to_hidden(const std::vector<int>& input_ids) {
@@ -107,6 +120,18 @@ private:
 PYBIND11_MODULE(pc_engine, m) {
     m.doc() = "pybind11 binding for worker-pc LLMEngine";
 
+    py::class_<KVCache::State>(m, "KvCacheState")
+        .def(py::init<>())
+        .def_readwrite("k_cache", &KVCache::State::k_cache)
+        .def_readwrite("v_cache", &KVCache::State::v_cache)
+        .def_readwrite("capacity", &KVCache::State::capacity)
+        .def_readwrite("kv_dim", &KVCache::State::kv_dim)
+        .def_readwrite("cur_pos", &KVCache::State::cur_pos);
+
+    py::class_<Qwen2Model::KvState>(m, "KvState")
+        .def(py::init<>())
+        .def_readwrite("kv_cache", &Qwen2Model::KvState::kv_cache);
+
     py::class_<GenerationResult>(m, "GenerationResult")
         .def_readonly("output_ids", &GenerationResult::output_ids)
         .def_readonly("prefill_tokens", &GenerationResult::prefill_tokens)
@@ -128,6 +153,8 @@ PYBIND11_MODULE(pc_engine, m) {
              py::arg("include_final_norm_and_head") = true)
         .def("reset", &PyPcEngine::reset)
         .def("destroy", &PyPcEngine::destroy)
+        .def("snapshot_kv_state", &PyPcEngine::snapshot_kv_state)
+        .def("restore_kv_state", &PyPcEngine::restore_kv_state)
         .def("tokens_to_hidden", &PyPcEngine::tokens_to_hidden)
         .def("hidden_forward", &PyPcEngine::hidden_forward)
         .def("hidden_to_token", &PyPcEngine::hidden_to_token)

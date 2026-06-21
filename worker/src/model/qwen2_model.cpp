@@ -457,6 +457,10 @@ static void apply_rope_cached(float* q, float* k,
 Qwen2Model::Qwen2Model()  = default;
 Qwen2Model::~Qwen2Model() { destroy(); }
 
+bool Qwen2Model::load(const std::string& model_dir, LinearBackend backend) {
+    return load(model_dir, backend, PartitionConfig{});
+}
+
 void Qwen2Model::destroy() {
     // 显式释放所有线性层（顺序：先 lm_head，再逐层），确保 NPU handle 全部归还
     if (lm_head_) { lm_head_->destroy(); lm_head_.reset(); }
@@ -465,6 +469,7 @@ void Qwen2Model::destroy() {
     std::vector<float>().swap(norm_weight_);
     kv_cache_ = KVCache();
     scratch_ = ForwardScratch();
+    partition_ = PartitionConfig{};
     std::vector<float>().swap(rope_cos_);
     std::vector<float>().swap(rope_sin_);
     rope_cached_positions_ = 0;
@@ -474,6 +479,16 @@ void Qwen2Model::destroy() {
 
 void Qwen2Model::reset_kv_cache() {
     kv_cache_.reset();
+}
+
+Qwen2Model::KvState Qwen2Model::snapshot_kv_state() const {
+    KvState state;
+    state.kv_cache = kv_cache_.snapshot();
+    return state;
+}
+
+bool Qwen2Model::restore_kv_state(const KvState& state) {
+    return kv_cache_.restore(state.kv_cache);
 }
 
 void Qwen2Model::ensure_rope_cache(int required_positions) {
@@ -516,8 +531,11 @@ void Qwen2Model::ensure_rope_cache(int required_positions) {
 // ============================================================
 // load: 解析 safetensors、创建每层后端、填充 KV Cache
 // ============================================================
-bool Qwen2Model::load(const std::string& model_dir, LinearBackend backend) {
+bool Qwen2Model::load(const std::string& model_dir,
+                      LinearBackend backend,
+                      const PartitionConfig& partition) {
     destroy();
+    partition_ = partition;
 
     std::string sf_path = model_dir + "/model.safetensors";
     try {
@@ -531,23 +549,33 @@ bool Qwen2Model::load(const std::string& model_dir, LinearBackend backend) {
         const int kvd  = c.kv_dim();
         const int IS   = c.intermediate_size;
         const int V    = c.vocab_size;
+        const int layer_begin = std::max(0, partition_.layer_begin);
+        const int layer_end = (partition_.layer_end < 0)
+            ? IL
+            : std::min(IL, partition_.layer_end);
 
         auto fail = [this]() {
             destroy();
             return false;
         };
 
+        if (layer_begin >= layer_end) {
+            throw std::runtime_error("invalid rk3588 partition layer range");
+        }
+
         // ---- Embedding ----
-        std::printf("[load] embed_tokens...\n");
-        embed_tokens_ = load_tensor_f16(sf_path, meta.at("model.embed_tokens.weight"));
+        if (partition_.include_embedding) {
+            std::printf("[load] embed_tokens...\n");
+            embed_tokens_ = load_tensor_f16(sf_path, meta.at("model.embed_tokens.weight"));
+        }
 
         // ---- 每层 ----
-        layers_.resize(IL);
-        for (int i = 0; i < IL; ++i) {
+        layers_.resize(static_cast<size_t>(layer_end - layer_begin));
+        for (int i = layer_begin; i < layer_end; ++i) {
             std::unique_ptr<TransformerLayer> L(new TransformerLayer());
             std::string pfx = "model.layers." + std::to_string(i) + ".";
 
-            std::printf("[load] layer %d/%d\r", i+1, IL);
+            std::printf("[load] layer %d/%d\r", i + 1, IL);
             std::fflush(stdout);
 
             L->input_layernorm = load_tensor_f32(sf_path, meta.at(pfx + "input_layernorm.weight"));
@@ -586,21 +614,23 @@ bool Qwen2Model::load(const std::string& model_dir, LinearBackend backend) {
             }
             if (!init_linear(L->down_proj, backend, sf_path, meta, pfx + "mlp.down_proj.weight", IS, H, i, "down")) return fail();
 
-            layers_[i] = std::move(L);
+            layers_[static_cast<size_t>(i - layer_begin)] = std::move(L);
         }
         std::printf("\n[load] 所有层加载完毕\n");
 
         // ---- final norm ----
-        norm_weight_ = load_tensor_f32(sf_path, meta.at("model.norm.weight"));
+        if (partition_.include_final_norm_and_head) {
+            norm_weight_ = load_tensor_f32(sf_path, meta.at("model.norm.weight"));
 
-        // ---- lm_head（tied weights，复用 embed_tokens 的转置 = [H, V]）----
-        LinearBackend lm_head_backend = select_lm_head_backend();
-        std::printf("[load] lm_head (%s)...\n", linear_backend_name(lm_head_backend));
-        if (!init_linear(lm_head_, lm_head_backend, sf_path, meta, "model.embed_tokens.weight", H, V, -1, "lm_head"))
-            return fail();
+            // ---- lm_head（tied weights，复用 embed_tokens 的转置 = [H, V]）----
+            LinearBackend lm_head_backend = select_lm_head_backend();
+            std::printf("[load] lm_head (%s)...\n", linear_backend_name(lm_head_backend));
+            if (!init_linear(lm_head_, lm_head_backend, sf_path, meta, "model.embed_tokens.weight", H, V, -1, "lm_head"))
+                return fail();
+        }
 
         // ---- KV Cache ----
-        kv_cache_.init(IL, c.max_position, kvd);
+        kv_cache_.init(static_cast<int>(layers_.size()), c.max_position, kvd);
         silu_f16_lut();
 
         std::printf("[load] 加载完成\n");
@@ -613,7 +643,231 @@ bool Qwen2Model::load(const std::string& model_dir, LinearBackend backend) {
 }
 
 int Qwen2Model::forward_next_token(const std::vector<int>& tokens) {
+    if (!can_generate_tokens()) {
+        throw std::runtime_error("rk3588 partition does not support token generation");
+    }
     return forward_internal(tokens);
+}
+
+bool Qwen2Model::forward_tokens_to_hidden(const std::vector<int>& tokens,
+                                          std::vector<uint16_t>& output_f16) {
+    if (tokens.empty() || !can_tokens_to_hidden()) {
+        return false;
+    }
+
+    const auto& c = config_;
+    const int H = c.hidden_size;
+    const int seq = static_cast<int>(tokens.size());
+    const int pos = kv_cache_.cur_pos();
+    const int total_len = pos + seq;
+    if (total_len > kv_cache_.capacity()) {
+        return false;
+    }
+
+    scratch_.hidden.resize(static_cast<size_t>(seq) * H);
+    op_embedding_lookup(embed_tokens_.data(), tokens, scratch_.hidden.data(), H);
+    execute_loaded_layers(scratch_.hidden.data(), seq, pos);
+    output_f16.resize(static_cast<size_t>(seq) * H);
+    op_f32_to_f16(scratch_.hidden.data(), output_f16.data(), seq * H);
+    kv_cache_.set_cur_pos(total_len);
+    return true;
+}
+
+bool Qwen2Model::forward_hidden_states(const uint16_t* input_f16,
+                                       int seq,
+                                       int pos_base,
+                                       std::vector<uint16_t>& output_f16) {
+    if (!input_f16 || seq <= 0 || !can_forward_hidden()) {
+        return false;
+    }
+
+    const int H = config_.hidden_size;
+    const int total_len = pos_base + seq;
+    if (total_len > kv_cache_.capacity()) {
+        return false;
+    }
+
+    scratch_.hidden.resize(static_cast<size_t>(seq) * H);
+    for (int i = 0; i < seq * H; ++i) {
+        scratch_.hidden[static_cast<size_t>(i)] = f16_to_f32(input_f16[static_cast<size_t>(i)]);
+    }
+
+    execute_loaded_layers(scratch_.hidden.data(), seq, pos_base);
+    output_f16.resize(static_cast<size_t>(seq) * H);
+    op_f32_to_f16(scratch_.hidden.data(), output_f16.data(), seq * H);
+    kv_cache_.set_cur_pos(total_len);
+    return true;
+}
+
+bool Qwen2Model::forward_hidden_to_token(const uint16_t* input_f16,
+                                         int seq,
+                                         int pos_base,
+                                         int& output_token_id) {
+    if (!input_f16 || seq <= 0 || !can_hidden_to_token()) {
+        return false;
+    }
+
+    const auto& c = config_;
+    const int H = c.hidden_size;
+    const int total_len = pos_base + seq;
+    if (total_len > kv_cache_.capacity()) {
+        return false;
+    }
+
+    scratch_.hidden.resize(static_cast<size_t>(seq) * H);
+    for (int i = 0; i < seq * H; ++i) {
+        scratch_.hidden[static_cast<size_t>(i)] = f16_to_f32(input_f16[static_cast<size_t>(i)]);
+    }
+
+    execute_loaded_layers(scratch_.hidden.data(), seq, pos_base);
+    scratch_.last.resize(H);
+    scratch_.lm_in.resize(H);
+    op_rmsnorm(scratch_.hidden.data() + static_cast<size_t>(seq - 1) * H,
+               norm_weight_.data(),
+               scratch_.last.data(),
+               1, H, c.rms_norm_eps);
+    op_f32_to_f16(scratch_.last.data(), scratch_.lm_in.data(), H);
+    if (!lm_head_ || !lm_head_->forward_argmax(scratch_.lm_in.data(), 1, &output_token_id)) {
+        return false;
+    }
+
+    kv_cache_.set_cur_pos(total_len);
+    return true;
+}
+
+void Qwen2Model::execute_loaded_layers(float* hidden, int seq, int pos_base) {
+    const auto& c = config_;
+    const int H          = c.hidden_size;
+    const int total_len  = pos_base + seq;
+
+    auto& S = scratch_;
+    S.npu_in.resize((size_t)seq * std::max(H, c.intermediate_size));
+
+    for (int li = 0; li < static_cast<int>(layers_.size()); ++li) {
+        TransformerLayer& L = *layers_[li];
+
+        op_rmsnorm_to_f16(hidden, L.input_layernorm.data(),
+                          S.npu_in.data(), seq, H, c.rms_norm_eps);
+
+        S.q.resize((size_t)seq * H);
+        S.k.resize((size_t)seq * c.kv_dim());
+        S.v.resize((size_t)seq * c.kv_dim());
+        if (L.qkv_proj) {
+            const int qkv_dim = H + c.kv_dim() * 2;
+            S.qkv_f16.resize((size_t)seq * qkv_dim);
+            run_linear_batched_or_throw(L.qkv_proj, "qkv_proj",
+                                        S.npu_in.data(), seq, H, qkv_dim,
+                                        S.qkv_f16.data());
+            for (int sidx = 0; sidx < seq; ++sidx) {
+                const uint16_t* row = S.qkv_f16.data() + (size_t)sidx * qkv_dim;
+                float* qrow = S.q.data() + (size_t)sidx * H;
+                float* krow = S.k.data() + (size_t)sidx * c.kv_dim();
+                float* vrow = S.v.data() + (size_t)sidx * c.kv_dim();
+                f16_to_f32_add_bias(row, L.q_bias.data(), qrow, H);
+                f16_to_f32_add_bias(row + H, L.k_bias.data(), krow, c.kv_dim());
+                f16_to_f32_add_bias(row + H + c.kv_dim(), L.v_bias.data(), vrow, c.kv_dim());
+            }
+        } else {
+            S.q_f16.resize((size_t)seq * H);
+            S.k_f16.resize((size_t)seq * c.kv_dim());
+            S.v_f16.resize((size_t)seq * c.kv_dim());
+            run_linear_batched_or_throw(L.q_proj, "q_proj",
+                                        S.npu_in.data(), seq, H, H,
+                                        S.q_f16.data());
+            run_linear_batched_or_throw(L.k_proj, "k_proj",
+                                        S.npu_in.data(), seq, H, c.kv_dim(),
+                                        S.k_f16.data());
+            run_linear_batched_or_throw(L.v_proj, "v_proj",
+                                        S.npu_in.data(), seq, H, c.kv_dim(),
+                                        S.v_f16.data());
+            for (int sidx = 0; sidx < seq; ++sidx) {
+                float* qrow = S.q.data() + (size_t)sidx * H;
+                float* krow = S.k.data() + (size_t)sidx * c.kv_dim();
+                float* vrow = S.v.data() + (size_t)sidx * c.kv_dim();
+                const uint16_t* qsrc = S.q_f16.data() + (size_t)sidx * H;
+                const uint16_t* ksrc = S.k_f16.data() + (size_t)sidx * c.kv_dim();
+                const uint16_t* vsrc = S.v_f16.data() + (size_t)sidx * c.kv_dim();
+                f16_to_f32_add_bias(qsrc, L.q_bias.data(), qrow, H);
+                f16_to_f32_add_bias(ksrc, L.k_bias.data(), krow, c.kv_dim());
+                f16_to_f32_add_bias(vsrc, L.v_bias.data(), vrow, c.kv_dim());
+            }
+        }
+
+        ensure_rope_cache(total_len);
+        const int half = c.head_dim / 2;
+        for (int sidx = 0; sidx < seq; ++sidx) {
+            const int abs_pos = pos_base + sidx;
+            const float* cos_row = rope_cos_.data() + (size_t)abs_pos * half;
+            const float* sin_row = rope_sin_.data() + (size_t)abs_pos * half;
+            apply_rope_cached(S.q.data() + sidx * H,
+                              S.k.data() + sidx * c.kv_dim(),
+                              c.num_attention_heads, c.num_kv_heads, c.head_dim,
+                              cos_row, sin_row);
+        }
+
+        uint16_t* kc = kv_cache_.k_ptr(li);
+        uint16_t* vc = kv_cache_.v_ptr(li);
+        for (int sidx = 0; sidx < seq; ++sidx) {
+            const float* ksrc = S.k.data() + sidx * c.kv_dim();
+            const float* vsrc = S.v.data() + sidx * c.kv_dim();
+            uint16_t* kdst = kc + (pos_base + sidx) * c.kv_dim();
+            uint16_t* vdst = vc + (pos_base + sidx) * c.kv_dim();
+            op_f32_to_f16(ksrc, kdst, c.kv_dim());
+            op_f32_to_f16(vsrc, vdst, c.kv_dim());
+        }
+
+        S.attn_out.resize((size_t)seq * H);
+        if (seq == 1) {
+            op_attention_decode(S.q.data(), kc, vc, S.attn_out.data(),
+                                total_len, c.num_attention_heads, c.num_kv_heads, c.head_dim);
+        } else {
+            op_attention(S.q.data(), kc, vc, S.attn_out.data(),
+                         seq, total_len, c.num_attention_heads, c.num_kv_heads, c.head_dim,
+                         pos_base);
+        }
+
+        run_linear_f32_accumulate_or_throw(L.o_proj, "o_proj",
+                                           S.attn_out.data(), seq, H, H,
+                                           S.npu_in, S.npu_out,
+                                           hidden);
+
+        op_rmsnorm_to_f16(hidden, L.post_attention_layernorm.data(),
+                          S.npu_in.data(), seq, H, c.rms_norm_eps);
+
+        const bool fused_gate_up = static_cast<bool>(L.gate_up_proj);
+        S.ffn_in_f16.resize((size_t)seq * c.intermediate_size);
+        if (fused_gate_up) {
+            S.gate_up_f16.resize((size_t)seq * c.intermediate_size * 2);
+            run_linear_batched_or_throw(L.gate_up_proj, "gate_up_proj",
+                                        S.npu_in.data(), seq, H, c.intermediate_size * 2,
+                                        S.gate_up_f16.data());
+        } else {
+            S.gate_f16.resize((size_t)seq * c.intermediate_size);
+            S.up_f16.resize((size_t)seq * c.intermediate_size);
+            run_linear_batched_or_throw(L.gate_proj, "gate_proj",
+                                        S.npu_in.data(), seq, H, c.intermediate_size,
+                                        S.gate_f16.data());
+            run_linear_batched_or_throw(L.up_proj, "up_proj",
+                                        S.npu_in.data(), seq, H, c.intermediate_size,
+                                        S.up_f16.data());
+        }
+
+        const float* silu_lut = silu_f16_lut().data();
+        if (fused_gate_up) {
+            for (int sidx = 0; sidx < seq; ++sidx) {
+                const uint16_t* row = S.gate_up_f16.data() + (size_t)sidx * c.intermediate_size * 2;
+                uint16_t* out = S.ffn_in_f16.data() + (size_t)sidx * c.intermediate_size;
+                swiglu_lut_to_f16(row, row + c.intermediate_size, out, c.intermediate_size, silu_lut);
+            }
+        } else {
+            swiglu_lut_to_f16(S.gate_f16.data(), S.up_f16.data(),
+                              S.ffn_in_f16.data(), seq * c.intermediate_size, silu_lut);
+        }
+
+        run_linear_accumulate_or_throw(L.down_proj, "down_proj",
+                                       S.ffn_in_f16.data(), seq, c.intermediate_size, H,
+                                       S.ffn_out_f16, hidden);
+    }
 }
 
 // ============================================================

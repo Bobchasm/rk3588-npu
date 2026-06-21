@@ -22,6 +22,7 @@ using TokenCallback = std::function<void(int step, int id, float elapsed_ms)>;
 class LLMEngine {
 public:
     using PartitionConfig = Qwen2Model::PartitionConfig;
+    using KvState = Qwen2Model::KvState;
 
     LLMEngine();
     ~LLMEngine();
@@ -37,6 +38,8 @@ public:
 
     void destroy();
     void reset();
+    KvState snapshot_kv_state() const;
+    bool restore_kv_state(const KvState& state);
 
     GenerationResult generate(
         const std::vector<int>& input_ids,

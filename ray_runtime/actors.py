@@ -12,6 +12,14 @@ def _default_request_id(pid: int, count: int) -> str:
     return f"req-{pid}-{count}"
 
 
+def _common_prefix_len(lhs: list[int], rhs: list[int]) -> int:
+    limit = min(len(lhs), len(rhs))
+    index = 0
+    while index < limit and lhs[index] == rhs[index]:
+        index += 1
+    return index
+
+
 def _run_pipeline_step_local(head, stages: list, tail, current_input: list[int], pos_base: int) -> int:
     hidden = ray.get(head.tokens_to_hidden.remote(current_input))
     seq = len(current_input)
@@ -37,6 +45,9 @@ class FullModelWorkerActor:
         self._request_count = 0
         self._engine = create_engine(target)
         self._engine.load(model_dir, device)
+        self._active_session_id: str | None = None
+        self._cached_tokens: list[int] = []
+        self._session_caches: dict[str, dict] = {}
         print(
             f"[ray/FullModelWorkerActor] ready pid={self._pid} "
             f"name={self._actor_name} target={target} device={device}",
@@ -51,7 +62,46 @@ class FullModelWorkerActor:
             "device": self._device,
             "model_dir": self._model_dir,
             "request_count": self._request_count,
+            "active_session_id": self._active_session_id,
+            "cached_tokens": len(self._cached_tokens),
+            "cached_sessions": len(self._session_caches),
         }
+
+    def _reset_session_state(self) -> None:
+        self._engine.reset()
+        self._active_session_id = None
+        self._cached_tokens = []
+
+    def _prepare_prompt(self,
+                        session_id: str | None,
+                        input_ids: list[int],
+                        reset_kv: bool) -> tuple[list[int], int, bool]:
+        if reset_kv or not session_id:
+            self._reset_session_state()
+            if session_id:
+                self._active_session_id = session_id
+            return list(input_ids), 0, False
+
+        if self._active_session_id != session_id:
+            cached = self._session_caches.get(session_id)
+            if cached is not None:
+                self._engine.restore_kv_state(cached["kv_state"])
+                self._active_session_id = session_id
+                self._cached_tokens = list(cached["cached_tokens"])
+            else:
+                self._reset_session_state()
+                self._active_session_id = session_id
+                self._cached_tokens = []
+
+        prefix_len = _common_prefix_len(self._cached_tokens, input_ids)
+        if prefix_len == len(self._cached_tokens) and prefix_len < len(input_ids):
+            delta = list(input_ids[prefix_len:])
+            if delta:
+                return delta, prefix_len, True
+
+        self._reset_session_state()
+        self._active_session_id = session_id
+        return list(input_ids), 0, False
 
     def generate(
         self,
@@ -61,18 +111,31 @@ class FullModelWorkerActor:
         stop_tokens: list[int] | None = None,
         reset_kv: bool = True,
         request_id: str | None = None,
+        session_id: str | None = None,
     ) -> dict:
         started = time.time()
         self._request_count += 1
         rid = request_id or _default_request_id(self._pid, self._request_count)
-        if reset_kv:
-            self._engine.reset()
+        effective_input_ids, reused_tokens, cache_reused = self._prepare_prompt(
+            session_id,
+            list(input_ids),
+            reset_kv,
+        )
         result = self._engine.generate(
-            input_ids=input_ids,
+            input_ids=effective_input_ids,
             max_new_tokens=max_new_tokens,
             repetition_window=repetition_window,
             stop_tokens=stop_tokens or [],
         )
+        if session_id:
+            self._active_session_id = session_id
+            self._cached_tokens = list(input_ids) + list(result.output_ids)
+            self._session_caches[session_id] = {
+                "kv_state": self._engine.snapshot_kv_state(),
+                "cached_tokens": list(self._cached_tokens),
+            }
+        elif reset_kv:
+            self._cached_tokens = []
         return {
             "request_id": rid,
             "output_ids": result.output_ids,
@@ -87,10 +150,24 @@ class FullModelWorkerActor:
             "actor_name": self._actor_name,
             "elapsed_ms": (time.time() - started) * 1000.0,
             "request_count": self._request_count,
+            "session_id": session_id or "",
+            "cache_reused": cache_reused,
+            "reused_tokens": reused_tokens,
+            "effective_prefill_tokens": len(effective_input_ids),
         }
 
     def reset(self) -> None:
-        self._engine.reset()
+        self._reset_session_state()
+
+    def clear_session(self, session_id: str | None = None) -> None:
+        if session_id is None:
+            self._session_caches.clear()
+            self._reset_session_state()
+        elif session_id == self._active_session_id:
+            self._session_caches.pop(session_id, None)
+            self._reset_session_state()
+        else:
+            self._session_caches.pop(session_id, None)
 
     def shutdown(self) -> None:
         self._engine.destroy()
@@ -114,6 +191,8 @@ class HeadWorkerActor:
         self._pid = os.getpid()
         self._engine = create_engine(target)
         self._engine.load(model_dir, device, layer_begin, layer_end, True, False)
+        self._active_session_id: str | None = None
+        self._session_caches: dict[str, object] = {}
         print(f"[ray/HeadWorkerActor] ready pid={self._pid} name={actor_name}", flush=True)
 
     def tokens_to_hidden(self, input_ids: list[int]) -> list[int]:
@@ -121,9 +200,41 @@ class HeadWorkerActor:
 
     def reset(self) -> None:
         self._engine.reset()
+        self._active_session_id = None
+
+    def activate_session(self, session_id: str) -> bool:
+        if self._active_session_id == session_id:
+            return True
+        state = self._session_caches.get(session_id)
+        if state is None:
+            self._engine.reset()
+            self._active_session_id = session_id
+            return False
+        self._engine.restore_kv_state(state)
+        self._active_session_id = session_id
+        return True
+
+    def save_active_session(self, session_id: str) -> None:
+        self._session_caches[session_id] = self._engine.snapshot_kv_state()
+        self._active_session_id = session_id
+
+    def clear_session(self, session_id: str | None = None) -> None:
+        if session_id is None:
+            self._session_caches.clear()
+            self.reset()
+            return
+        self._session_caches.pop(session_id, None)
+        if session_id == self._active_session_id:
+            self.reset()
 
     def metadata(self) -> dict:
-        return {"actor_name": self._actor_name, "pid": self._pid, "role": "head"}
+        return {
+            "actor_name": self._actor_name,
+            "pid": self._pid,
+            "role": "head",
+            "active_session_id": self._active_session_id,
+            "cached_sessions": len(self._session_caches),
+        }
 
     def shutdown(self) -> None:
         self._engine.destroy()
@@ -147,6 +258,8 @@ class StageWorkerActor:
         self._pid = os.getpid()
         self._engine = create_engine(target)
         self._engine.load(model_dir, device, layer_begin, layer_end, False, False)
+        self._active_session_id: str | None = None
+        self._session_caches: dict[str, object] = {}
         print(f"[ray/StageWorkerActor] ready pid={self._pid} name={actor_name}", flush=True)
 
     def hidden_forward(self, input_f16: list[int], seq: int, pos_base: int) -> list[int]:
@@ -154,9 +267,41 @@ class StageWorkerActor:
 
     def reset(self) -> None:
         self._engine.reset()
+        self._active_session_id = None
+
+    def activate_session(self, session_id: str) -> bool:
+        if self._active_session_id == session_id:
+            return True
+        state = self._session_caches.get(session_id)
+        if state is None:
+            self._engine.reset()
+            self._active_session_id = session_id
+            return False
+        self._engine.restore_kv_state(state)
+        self._active_session_id = session_id
+        return True
+
+    def save_active_session(self, session_id: str) -> None:
+        self._session_caches[session_id] = self._engine.snapshot_kv_state()
+        self._active_session_id = session_id
+
+    def clear_session(self, session_id: str | None = None) -> None:
+        if session_id is None:
+            self._session_caches.clear()
+            self.reset()
+            return
+        self._session_caches.pop(session_id, None)
+        if session_id == self._active_session_id:
+            self.reset()
 
     def metadata(self) -> dict:
-        return {"actor_name": self._actor_name, "pid": self._pid, "role": "stage"}
+        return {
+            "actor_name": self._actor_name,
+            "pid": self._pid,
+            "role": "stage",
+            "active_session_id": self._active_session_id,
+            "cached_sessions": len(self._session_caches),
+        }
 
     def shutdown(self) -> None:
         self._engine.destroy()
@@ -180,6 +325,8 @@ class TailWorkerActor:
         self._pid = os.getpid()
         self._engine = create_engine(target)
         self._engine.load(model_dir, device, layer_begin, layer_end, False, True)
+        self._active_session_id: str | None = None
+        self._session_caches: dict[str, object] = {}
         print(f"[ray/TailWorkerActor] ready pid={self._pid} name={actor_name}", flush=True)
 
     def hidden_to_token(self, input_f16: list[int], seq: int, pos_base: int) -> int:
@@ -187,9 +334,41 @@ class TailWorkerActor:
 
     def reset(self) -> None:
         self._engine.reset()
+        self._active_session_id = None
+
+    def activate_session(self, session_id: str) -> bool:
+        if self._active_session_id == session_id:
+            return True
+        state = self._session_caches.get(session_id)
+        if state is None:
+            self._engine.reset()
+            self._active_session_id = session_id
+            return False
+        self._engine.restore_kv_state(state)
+        self._active_session_id = session_id
+        return True
+
+    def save_active_session(self, session_id: str) -> None:
+        self._session_caches[session_id] = self._engine.snapshot_kv_state()
+        self._active_session_id = session_id
+
+    def clear_session(self, session_id: str | None = None) -> None:
+        if session_id is None:
+            self._session_caches.clear()
+            self.reset()
+            return
+        self._session_caches.pop(session_id, None)
+        if session_id == self._active_session_id:
+            self.reset()
 
     def metadata(self) -> dict:
-        return {"actor_name": self._actor_name, "pid": self._pid, "role": "tail"}
+        return {
+            "actor_name": self._actor_name,
+            "pid": self._pid,
+            "role": "tail",
+            "active_session_id": self._active_session_id,
+            "cached_sessions": len(self._session_caches),
+        }
 
     def shutdown(self) -> None:
         self._engine.destroy()
@@ -212,6 +391,9 @@ class DistributedPipelineActor:
         self._pipeline_mode = pipeline_mode
         self._pid = os.getpid()
         self._request_count = 0
+        self._active_session_id: str | None = None
+        self._cached_tokens: list[int] = []
+        self._session_caches: dict[str, dict] = {}
         print(
             f"[ray/DistributedPipelineActor] ready pid={self._pid} "
             f"name={actor_name} mode={pipeline_mode}",
@@ -225,13 +407,66 @@ class DistributedPipelineActor:
             "request_count": self._request_count,
             "num_stages": len(self._stages),
             "pipeline_mode": self._pipeline_mode,
+            "active_session_id": self._active_session_id,
+            "cached_tokens": len(self._cached_tokens),
+            "cached_sessions": len(self._session_caches),
         }
 
-    def reset(self) -> None:
+    def _reset_pipeline_state(self) -> None:
         ray.get(self._head.reset.remote())
         for stage in self._stages:
             ray.get(stage.reset.remote())
         ray.get(self._tail.reset.remote())
+        self._active_session_id = None
+        self._cached_tokens = []
+
+    def reset(self) -> None:
+        self._reset_pipeline_state()
+
+    def clear_session(self, session_id: str | None = None) -> None:
+        if session_id is None:
+            self._session_caches.clear()
+            self._reset_pipeline_state()
+        elif session_id == self._active_session_id:
+            self._session_caches.pop(session_id, None)
+            self._reset_pipeline_state()
+        else:
+            self._session_caches.pop(session_id, None)
+
+    def _prepare_prompt(self,
+                        session_id: str | None,
+                        input_ids: list[int],
+                        reset_kv: bool) -> tuple[list[int], int, bool]:
+        if reset_kv or not session_id:
+            self._reset_pipeline_state()
+            if session_id:
+                self._active_session_id = session_id
+            return list(input_ids), 0, False
+
+        if self._active_session_id != session_id:
+            head_hit, *stage_hits, tail_hit = ray.get(
+                [
+                    self._head.activate_session.remote(session_id),
+                    *[stage.activate_session.remote(session_id) for stage in self._stages],
+                    self._tail.activate_session.remote(session_id),
+                ]
+            )
+            cached = self._session_caches.get(session_id)
+            self._active_session_id = session_id
+            if cached is not None and head_hit and tail_hit and all(stage_hits):
+                self._cached_tokens = list(cached["cached_tokens"])
+            else:
+                self._cached_tokens = []
+
+        prefix_len = _common_prefix_len(self._cached_tokens, input_ids)
+        if prefix_len == len(self._cached_tokens) and prefix_len < len(input_ids):
+            delta = list(input_ids[prefix_len:])
+            if delta:
+                return delta, prefix_len, True
+
+        self._reset_pipeline_state()
+        self._active_session_id = session_id
+        return list(input_ids), 0, False
 
     def _generate_centralized(
         self,
@@ -292,20 +527,37 @@ class DistributedPipelineActor:
         reset_kv: bool = True,
         request_id: str | None = None,
         pipeline_mode: str | None = None,
+        session_id: str | None = None,
     ) -> dict:
         started = time.time()
         self._request_count += 1
         rid = request_id or _default_request_id(self._pid, self._request_count)
         stop_set = set(stop_tokens or [151645, 151643])
-        if reset_kv:
-            self.reset()
+        effective_input_ids, reused_tokens, cache_reused = self._prepare_prompt(
+            session_id,
+            list(input_ids),
+            reset_kv,
+        )
         active_mode = pipeline_mode or self._pipeline_mode
         if active_mode == "centralized":
-            generated_ids = self._generate_centralized(input_ids, max_new_tokens, stop_set)
+            generated_ids = self._generate_centralized(effective_input_ids, max_new_tokens, stop_set)
         elif active_mode == "p2p":
-            generated_ids = self._generate_p2p(input_ids, max_new_tokens, stop_set)
+            generated_ids = self._generate_p2p(effective_input_ids, max_new_tokens, stop_set)
         else:
             raise ValueError(f"unsupported pipeline_mode: {active_mode}")
+
+        if session_id:
+            self._active_session_id = session_id
+            self._cached_tokens = list(input_ids) + list(generated_ids)
+            ray.get(self._head.save_active_session.remote(session_id))
+            for stage in self._stages:
+                ray.get(stage.save_active_session.remote(session_id))
+            ray.get(self._tail.save_active_session.remote(session_id))
+            self._session_caches[session_id] = {
+                "cached_tokens": list(self._cached_tokens),
+            }
+        elif reset_kv:
+            self._cached_tokens = []
 
         return {
             "request_id": rid,
@@ -320,6 +572,10 @@ class DistributedPipelineActor:
             "pipeline_mode": active_mode,
             "elapsed_ms": (time.time() - started) * 1000.0,
             "request_count": self._request_count,
+            "session_id": session_id or "",
+            "cache_reused": cache_reused,
+            "reused_tokens": reused_tokens,
+            "effective_prefill_tokens": len(effective_input_ids),
         }
 
     def shutdown(self) -> None:

@@ -14,8 +14,9 @@ from ray_common import add_runtime_args, build_actor_options, init_ray, with_cus
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("model_dir")
-    parser.add_argument("--target", default="pc", choices=["pc"])
-    parser.add_argument("--device", default="auto", choices=["cpu", "gpu", "auto"])
+    parser.add_argument("--target", default="pc", choices=["pc", "rk3588"])
+    parser.add_argument("--device", default="auto",
+                        help="pc target: cpu/gpu/auto; rk3588 target: cpu/npu/auto/single/sharded")
     parser.add_argument("--mode", default="full", choices=["full", "distributed"])
     parser.add_argument("--pipeline-mode", default="centralized", choices=["centralized", "p2p"])
     parser.add_argument("--num-stages", type=int, default=2)
@@ -29,7 +30,7 @@ def main():
     args = parse_args()
     init_ray(args.ray_address, args.ray_namespace, args.object_store_memory_mb)
 
-    actor_options = build_actor_options(args.device, detached=True, gpu_fraction=args.gpu_fraction)
+    actor_options = build_actor_options(args.target, args.device, detached=True, gpu_fraction=args.gpu_fraction)
 
     if args.mode == "full":
         full_actor_options = dict(actor_options)

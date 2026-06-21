@@ -39,7 +39,13 @@ LLMEngine::LLMEngine()  : model_(new Qwen2Model()) {}
 LLMEngine::~LLMEngine() { destroy(); }
 
 bool LLMEngine::load(const std::string& model_dir, LinearBackend backend) {
-    bool ok = model_->load(model_dir, backend);
+    return load(model_dir, backend, PartitionConfig{});
+}
+
+bool LLMEngine::load(const std::string& model_dir,
+                     LinearBackend backend,
+                     const PartitionConfig& partition) {
+    bool ok = model_->load(model_dir, backend, partition);
     if (!ok) model_->destroy();
     return ok;
 }
@@ -50,6 +56,14 @@ void LLMEngine::destroy() {
 
 void LLMEngine::reset() {
     model_->reset_kv_cache();
+}
+
+LLMEngine::KvState LLMEngine::snapshot_kv_state() const {
+    return model_->snapshot_kv_state();
+}
+
+bool LLMEngine::restore_kv_state(const KvState& state) {
+    return model_->restore_kv_state(state);
 }
 
 GenerationResult LLMEngine::generate(
@@ -112,4 +126,68 @@ GenerationResult LLMEngine::generate(
         model_->reset_kv_cache();
     }
     return r;
+}
+
+bool LLMEngine::forward_tokens_to_hidden(const std::vector<int>& input_ids,
+                                         std::vector<uint16_t>& output_f16,
+                                         std::string* error) {
+    if (!model_) {
+        if (error) *error = "rk3588 engine not initialized";
+        return false;
+    }
+    try {
+        if (!model_->forward_tokens_to_hidden(input_ids, output_f16)) {
+            if (error) *error = "rk3588 tokens_to_hidden returned false";
+            return false;
+        }
+        return true;
+    } catch (const std::exception& e) {
+        if (error) *error = e.what();
+        model_->reset_kv_cache();
+        return false;
+    }
+}
+
+bool LLMEngine::forward_hidden_states(const std::vector<uint16_t>& input_f16,
+                                      int seq,
+                                      int pos_base,
+                                      std::vector<uint16_t>& output_f16,
+                                      std::string* error) {
+    if (!model_) {
+        if (error) *error = "rk3588 engine not initialized";
+        return false;
+    }
+    try {
+        if (!model_->forward_hidden_states(input_f16.data(), seq, pos_base, output_f16)) {
+            if (error) *error = "rk3588 stage forward returned false";
+            return false;
+        }
+        return true;
+    } catch (const std::exception& e) {
+        if (error) *error = e.what();
+        model_->reset_kv_cache();
+        return false;
+    }
+}
+
+bool LLMEngine::forward_hidden_to_token(const std::vector<uint16_t>& input_f16,
+                                        int seq,
+                                        int pos_base,
+                                        int& output_token_id,
+                                        std::string* error) {
+    if (!model_) {
+        if (error) *error = "rk3588 engine not initialized";
+        return false;
+    }
+    try {
+        if (!model_->forward_hidden_to_token(input_f16.data(), seq, pos_base, output_token_id)) {
+            if (error) *error = "rk3588 hidden_to_token returned false";
+            return false;
+        }
+        return true;
+    } catch (const std::exception& e) {
+        if (error) *error = e.what();
+        model_->reset_kv_cache();
+        return false;
+    }
 }

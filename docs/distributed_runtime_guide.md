@@ -255,6 +255,71 @@ PY
 
 如果这里通过，说明这台服务器已经具备作为 `pc` Ray 节点的基础条件。
 
+### 2.2 使用 Tailscale 打通本地 PC 与公网服务器
+
+如果本地 PC 在校园网、没有公网 IP，最稳的做法是先让本地 PC 和服务器加入同一个 Tailscale 虚拟内网，再在这个虚拟内网里跑 Ray。
+
+当前推荐拓扑：
+
+- 服务器作为 `Ray head`
+- 本地 PC 作为 `Ray worker node`
+- 调度器、`serve_worker.py`、`scheduler_cli` 都优先在本地 PC 启动
+- 所有跨机地址都使用 `Tailscale IP`，不要使用 `localhost`、校园网内网 IP 或公网 NAT 地址
+
+#### 2.2.1 两台机器安装并登录 Tailscale
+
+本地 PC 和服务器都执行：
+
+```bash
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo systemctl enable --now tailscaled
+sudo tailscale up
+```
+
+完成登录后检查状态：
+
+```bash
+tailscale status
+tailscale ip -4
+tailscale netcheck
+```
+
+#### 2.2.2 你当前这套环境的 Tailscale 地址
+
+根据当前实际输出：
+
+- 本地 PC `chasm` 的 Tailscale IP 是 `100.124.132.113`
+- 服务器 `vm-24-4-ubuntu` 的 Tailscale IP 是 `100.66.163.79`
+
+因此后续命令里可以直接约定：
+
+```text
+PC_TS_IP=100.124.132.113
+SERVER_TS_IP=100.66.163.79
+```
+
+#### 2.2.3 连通性检查
+
+本地 PC 上执行：
+
+```bash
+ping 100.66.163.79
+```
+
+服务器上执行：
+
+```bash
+ping 100.124.132.113
+```
+
+如果 `tailscale status` 里看到对端是 `offline`，先不要继续启动 Ray，先确认：
+
+- 对端机器上的 `tailscaled` 服务正在运行
+- 对端执行过 `sudo tailscale up`
+- 两边登录的是同一个 Tailscale 账号 / tailnet
+
+只要两边 `tailscale status` 都显示在线，后面就统一使用这两个 `100.x.x.x` 地址。
+
 ### 3. 启动 Ray distributed actor
 
 ```bash
@@ -470,23 +535,13 @@ Scheduler CLI started. Enter text to generate, or type /exit.
 
 - 本地 PC 项目目录：`/home/deep/rk3588-npu`
 - 服务器项目目录：`/home/ubuntu/rk3588/rk3588-npu`
-- 本地 PC IP：`PC_IP`
+- 本地 PC Tailscale IP：`100.124.132.113`
+- 服务器 Tailscale IP：`100.66.163.79`
 - 模型路径两端都已准备好：`models/qwen1.5b-instruct/Qwen2-1.5B-Instruct`
 
-#### 7.1 本地 PC：启动 Ray head
+当前推荐让服务器做 `Ray head`，因为本地 PC 在校园网环境里通常更适合主动连出去。
 
-```bash
-cd /home/deep/rk3588-npu
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate rk3588
-
-ray stop --force
-ray start --head --port=6379 --resources='{"role_head": 1, "role_tail": 1}'
-```
-
-这里把 `head` 和 `tail` 都先放在本地，服务器先承担 `stage`，这样最容易测通双机链路。
-
-#### 7.2 服务器：加入 Ray 集群
+#### 7.1 服务器：启动 Ray head
 
 ```bash
 cd /home/ubuntu/rk3588/rk3588-npu
@@ -494,8 +549,29 @@ source ~/miniconda3/etc/profile.d/conda.sh
 conda activate rk3588
 
 ray stop --force
-ray start --address='PC_IP:6379' --resources='{"role_stage": 1}'
+ray start --head \
+  --node-ip-address=100.66.163.79 \
+  --port=6379 \
+  --resources='{"role_stage": 1}'
 ```
+
+这里先让服务器承担 `stage` 角色。
+
+#### 7.2 本地 PC：加入 Ray 集群
+
+```bash
+cd /home/deep/rk3588-npu
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate rk3588
+
+ray stop --force
+ray start \
+  --address='100.66.163.79:6379' \
+  --node-ip-address=100.124.132.113 \
+  --resources='{"role_head": 1, "role_tail": 1, "role_pipeline": 1}'
+```
+
+这里把 `head / tail / pipeline coordinator` 都放在本地 PC，服务器只放一个中间 `stage`，这样最容易先测通双机链路。
 
 #### 7.3 本地 PC：创建 distributed actor
 
@@ -516,10 +592,11 @@ python3 ray_runtime/serve_worker.py \
   --pipeline-mode centralized \
   --num-stages 1 \
   --actor-name pc-distributed \
-  --ray-address PC_IP:6379 \
+  --ray-address 100.66.163.79:6379 \
   --head-resource role_head \
   --stage-resource role_stage \
-  --tail-resource role_tail
+  --tail-resource role_tail \
+  --pipeline-resource role_pipeline
 ```
 
 #### 7.4 本地 PC：验证 actor 是否存在
@@ -531,7 +608,7 @@ conda activate rk3588
 
 export PYTHONPATH=bindings/python
 python3 ray_runtime/actor_status.py \
-  --ray-address PC_IP:6379 \
+  --ray-address 100.66.163.79:6379 \
   --actor-name pc-distributed
 ```
 
@@ -546,7 +623,7 @@ export PYTHONPATH=bindings/python
 export SCHEDULER_RAY_PYTHON=/home/deep/miniforge3/envs/rk3588/bin/python3.10
 
 python3 scheduler/tools/ray_generate.py \
-  --ray-address PC_IP:6379 \
+  --ray-address 100.66.163.79:6379 \
   --actor-name pc-distributed \
   151644 8948 198
 ```
@@ -573,6 +650,6 @@ source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate rk3588
 
 python3 ray_runtime/stop_worker.py \
-  --ray-address PC_IP:6379 \
+  --ray-address 100.66.163.79:6379 \
   --actor-name pc-distributed
 ```

@@ -290,6 +290,91 @@ cd /scheduler/build
 ./scheduler_cli ~/rk3588-npu/models/qwen1.5b-instruct/Qwen2-1.5B-Instruct 172.26.0.1:5001
 ```
 
+### 多会话使用方法
+
+这条 `scheduler_cli -> worker_rpc_server` 路径可以直接在一个 CLI 里使用多个会话。
+
+不需要：
+
+- 多起几个调度器
+- 多起几个 worker
+
+保持前面的启动方式不变，进入 CLI 后直接使用下面这些命令即可。
+
+### 常用命令
+
+- `/new`
+  创建一个新会话，并自动切换到新会话
+
+- `/new <system_prompt>`
+  创建一个带自定义 system prompt 的新会话
+
+- `/sessions`
+  查看当前已有的全部会话
+
+- `/switch <session_id>`
+  切换到指定会话，会话id格式为提示符前面的字符串
+
+- `/history`
+  查看当前会话的历史消息
+
+- `/reset`
+  重置当前会话，恢复默认 system prompt
+
+- `/reset <system_prompt>`
+  重置当前会话，并替换为新的 system prompt
+
+- `/max_tokens <n>`
+  设置后续每轮请求的最大生成 token 数
+
+### 基本使用流程
+
+启动后默认会进入第一个会话，例如：
+
+```text
+Scheduler CLI started. Session=session-1. Enter text to generate, or type /help.
+[session-1] >
+```
+
+此时可以直接输入文本开始对话。
+
+如果想新开一个独立会话：
+
+```text
+/new
+```
+
+创建后会自动切到新会话，例如：
+
+```text
+Created session session-2
+[session-2] >
+```
+
+如果想查看当前有哪些会话：
+
+```text
+/sessions
+```
+
+如果想切回旧会话：
+
+```text
+/switch session-1
+```
+
+如果想看当前会话里之前问过什么：
+
+```text
+/history
+```
+
+如果想把当前会话清空重新开始：
+
+```text
+/reset
+```
+
 
 # 全模型 Ray 方案启动
 

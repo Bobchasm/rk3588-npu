@@ -53,6 +53,15 @@ std::string make_stage_brief(const distributed::StageForwardRequest& request) {
     return oss.str();
 }
 
+size_t common_prefix_len(const std::vector<int32_t>& lhs, const std::vector<int>& rhs) {
+    const size_t limit = std::min(lhs.size(), rhs.size());
+    size_t index = 0;
+    while (index < limit && lhs[index] == rhs[index]) {
+        ++index;
+    }
+    return index;
+}
+
 }  // namespace
 
 WorkerService::WorkerService()
@@ -86,10 +95,44 @@ distributed::GenerateTokensResponse WorkerService::handle_generate_tokens(
         return response;
     }
 
-    engine_.reset();
+    std::vector<int> effective_input_ids(request.input_token_ids.begin(), request.input_token_ids.end());
+    bool cache_reused = false;
+    int32_t reused_tokens = 0;
+    if (!request.context.session_id.empty()) {
+        const auto cached_it = session_caches_.find(request.context.session_id);
+        if (active_session_id_ != request.context.session_id) {
+            if (cached_it != session_caches_.end() &&
+                engine_.restore_kv_state(cached_it->second.kv_state)) {
+                active_session_id_ = request.context.session_id;
+                cached_prompt_ids_ = cached_it->second.cached_prompt_ids;
+            } else {
+                engine_.reset();
+                active_session_id_ = request.context.session_id;
+                cached_prompt_ids_.clear();
+            }
+        }
+
+        const size_t prefix_len = common_prefix_len(request.input_token_ids, cached_prompt_ids_);
+        if (prefix_len == cached_prompt_ids_.size() &&
+            prefix_len < request.input_token_ids.size()) {
+            effective_input_ids.assign(request.input_token_ids.begin() + static_cast<std::ptrdiff_t>(prefix_len),
+                                       request.input_token_ids.end());
+            cache_reused = true;
+            reused_tokens = static_cast<int32_t>(prefix_len);
+        } else if (prefix_len != cached_prompt_ids_.size()) {
+            engine_.reset();
+            cached_prompt_ids_.clear();
+            effective_input_ids.assign(request.input_token_ids.begin(), request.input_token_ids.end());
+        }
+    } else {
+        engine_.reset();
+        active_session_id_.clear();
+        cached_prompt_ids_.clear();
+    }
+
     const GenerationConfig cfg = make_generation_config(request.generation);
     const auto generation = engine_.generate(
-        std::vector<int>(request.input_token_ids.begin(), request.input_token_ids.end()),
+        effective_input_ids,
         cfg,
         nullptr);
 
@@ -101,6 +144,20 @@ distributed::GenerateTokensResponse WorkerService::handle_generate_tokens(
     response.decode_ms = generation.decode_ms;
     response.hit_stop = generation.hit_stop;
     response.hit_repetition = generation.hit_repetition;
+    if (!request.context.session_id.empty()) {
+        cached_prompt_ids_.assign(request.input_token_ids.begin(), request.input_token_ids.end());
+        cached_prompt_ids_.insert(cached_prompt_ids_.end(),
+                                  generation.output_ids.begin(),
+                                  generation.output_ids.end());
+        SessionCacheEntry entry;
+        entry.kv_state = engine_.snapshot_kv_state();
+        entry.cached_prompt_ids = cached_prompt_ids_;
+        session_caches_[request.context.session_id] = std::move(entry);
+        response.message =
+            std::string("cache_reused=") + (cache_reused ? "1" : "0") +
+            " reused_tokens=" + std::to_string(reused_tokens) +
+            " effective_prefill_tokens=" + std::to_string(effective_input_ids.size());
+    }
     return response;
 }
 

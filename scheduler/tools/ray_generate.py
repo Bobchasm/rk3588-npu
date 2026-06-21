@@ -21,6 +21,9 @@ def parse_args():
     parser.add_argument("--max-new-tokens", type=int, default=10)
     parser.add_argument("--repetition-window", type=int, default=6)
     parser.add_argument("--pipeline-mode", default=None, choices=["centralized", "p2p"])
+    parser.add_argument("--session-id", default=None)
+    parser.add_argument("--request-id", default=None)
+    parser.add_argument("--no-reset-kv", action="store_true")
     parser.add_argument("token_ids", nargs="+", type=int)
     return parser.parse_args()
 
@@ -46,6 +49,9 @@ def main() -> int:
                 max_new_tokens=args.max_new_tokens,
                 repetition_window=args.repetition_window,
                 pipeline_mode=args.pipeline_mode,
+                reset_kv=not args.no_reset_kv,
+                request_id=args.request_id,
+                session_id=args.session_id,
             )
         )
     except Exception as exc:

@@ -1,6 +1,8 @@
 #pragma once
 
+#include <map>
 #include <string>
+#include <vector>
 
 #include <api/llm_engine.h>
 #include <distributed/protocol.h>
@@ -18,6 +20,11 @@ public:
                                const ClientEndpoint& client);
 
 private:
+    struct SessionCacheEntry {
+        LLMEngine::KvState kv_state;
+        std::vector<int> cached_prompt_ids;
+    };
+
     distributed::GenerateTokensResponse handle_generate_tokens(
         const distributed::GenerateTokensRequest& request);
     distributed::StageForwardResponse handle_stage_forward(
@@ -34,4 +41,7 @@ private:
     WorkerRpcServer rpc_server_;
     LLMEngine engine_;
     bool loaded_;
+    std::string active_session_id_;
+    std::vector<int> cached_prompt_ids_;
+    std::map<std::string, SessionCacheEntry> session_caches_;
 };

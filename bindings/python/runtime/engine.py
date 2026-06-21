@@ -47,6 +47,12 @@ class _ModuleEngineAdapter:
     def destroy(self) -> None:
         self._engine.destroy()
 
+    def snapshot_kv_state(self):
+        return self._engine.snapshot_kv_state()
+
+    def restore_kv_state(self, state) -> None:
+        self._engine.restore_kv_state(state)
+
     def generate(
         self,
         input_ids: Sequence[int],

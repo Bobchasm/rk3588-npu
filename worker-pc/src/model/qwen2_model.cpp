@@ -170,6 +170,18 @@ void Qwen2Model::reset_kv_cache() {
     gpu_kv_cache_.reset();
 }
 
+Qwen2Model::KvState Qwen2Model::snapshot_kv_state() const {
+    KvState state;
+    state.kv_cache = kv_cache_.snapshot();
+    return state;
+}
+
+bool Qwen2Model::restore_kv_state(const KvState& state) {
+    const bool ok = kv_cache_.restore(state.kv_cache);
+    gpu_kv_cache_.reset();
+    return ok;
+}
+
 void Qwen2Model::ensure_scratch(int seq) {
     const auto& c = config_;
     const int H = c.hidden_size;

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 
 import ray
 
@@ -50,9 +51,19 @@ def add_runtime_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser
 
 
 def init_ray(address: str | None, namespace: str, object_store_memory_mb: int = DEFAULT_OBJECT_STORE_MEMORY_MB) -> None:
+    runtime_env: dict = {}
+    env_vars: dict[str, str] = {}
+    for key in ("PYTHONPATH", "LD_LIBRARY_PATH", "PATH"):
+        value = os.environ.get(key)
+        if value:
+            env_vars[key] = value
+    if env_vars:
+        runtime_env["env_vars"] = env_vars
+
     kwargs = {
         "namespace": namespace,
         "log_to_driver": True,
+        "runtime_env": runtime_env,
     }
     if address:
         kwargs["address"] = address
@@ -62,14 +73,17 @@ def init_ray(address: str | None, namespace: str, object_store_memory_mb: int = 
     ray.init(**kwargs)
 
 
-def build_actor_options(device: str, detached: bool = True, gpu_fraction: float = 1.0) -> dict:
+def build_actor_options(target: str, device: str, detached: bool = True, gpu_fraction: float = 1.0) -> dict:
     options: dict = {
         "name": DEFAULT_ACTOR_NAME,
         "max_restarts": 0,
     }
     if detached:
         options["lifetime"] = "detached"
-    if device in {"gpu", "auto"}:
+    # Only the pc target currently participates in Ray GPU resource scheduling.
+    # rk3588 workers use the board-local NPU/CPU backend selection inside the engine
+    # and should not request Ray GPU slots.
+    if target == "pc" and device in {"gpu", "auto"}:
         options["num_gpus"] = gpu_fraction
     return options
 

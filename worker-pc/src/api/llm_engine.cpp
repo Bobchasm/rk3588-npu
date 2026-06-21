@@ -86,6 +86,14 @@ void LLMEngine::reset() {
     model_->reset_kv_cache();
 }
 
+LLMEngine::KvState LLMEngine::snapshot_kv_state() const {
+    return model_->snapshot_kv_state();
+}
+
+bool LLMEngine::restore_kv_state(const KvState& state) {
+    return model_->restore_kv_state(state);
+}
+
 GenerationResult LLMEngine::generate(
     const std::vector<int>& input_ids,
     const GenerationConfig& cfg,

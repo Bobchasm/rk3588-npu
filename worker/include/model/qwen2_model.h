@@ -22,6 +22,17 @@
 
 class Qwen2Model {
 public:
+    struct KvState {
+        KVCache::State kv_cache;
+    };
+
+    struct PartitionConfig {
+        int layer_begin = 0;
+        int layer_end = -1;  // <0 means [layer_begin, num_hidden_layers)
+        bool include_embedding = true;
+        bool include_final_norm_and_head = true;
+    };
+
     Qwen2Model();
     ~Qwen2Model();
 
@@ -31,16 +42,42 @@ public:
     // 加载权重（model_dir/model.safetensors）
     bool load(const std::string& model_dir,
               LinearBackend backend = LinearBackend::NPU);
+    bool load(const std::string& model_dir,
+              LinearBackend backend,
+              const PartitionConfig& partition);
 
     // 主动释放所有 NPU handle（析构前也会自动调用）
     void destroy();
 
     // 重置 KV Cache（新对话）
     void reset_kv_cache();
+    KvState snapshot_kv_state() const;
+    bool restore_kv_state(const KvState& state);
 
     // 前向：输入 token ids，返回最后一个位置的 greedy token
     // 内部自动使用当前 kv_cache.cur_pos 作为起始位置
     int forward_next_token(const std::vector<int>& tokens);
+    bool forward_tokens_to_hidden(const std::vector<int>& tokens,
+                                  std::vector<uint16_t>& output_f16);
+    bool forward_hidden_states(const uint16_t* input_f16,
+                               int seq,
+                               int pos_base,
+                               std::vector<uint16_t>& output_f16);
+    bool forward_hidden_to_token(const uint16_t* input_f16,
+                                 int seq,
+                                 int pos_base,
+                                 int& output_token_id);
+
+    bool can_generate_tokens() const {
+        return partition_.include_embedding && partition_.include_final_norm_and_head;
+    }
+    bool can_tokens_to_hidden() const {
+        return partition_.include_embedding && !layers_.empty();
+    }
+    bool can_hidden_to_token() const {
+        return !layers_.empty() && partition_.include_final_norm_and_head;
+    }
+    bool can_forward_hidden() const { return !layers_.empty(); }
 
     const Qwen2Config& config() const { return config_; }
 
@@ -67,6 +104,7 @@ private:
     };
 
     int forward_internal(const std::vector<int>& tokens);
+    void execute_loaded_layers(float* hidden, int seq, int pos_base);
     void ensure_rope_cache(int required_positions);
 
     Qwen2Config config_;
@@ -78,6 +116,7 @@ private:
 
     KVCache kv_cache_;
     ForwardScratch scratch_;
+    PartitionConfig partition_;
     std::vector<float> rope_cos_;
     std::vector<float> rope_sin_;
     int rope_cached_positions_ = 0;
