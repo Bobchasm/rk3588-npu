@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
 project(worker_pc LANGUAGES CXX)
 
+include(CheckCXXCompilerFlag)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -105,11 +107,12 @@ if(BUILD_WORKER_PC_CUDA)
     endif()
 endif()
 
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
-    target_compile_options(worker_pc_core PRIVATE -O3 -ffast-math -funroll-loops -march=native)
-else()
-    target_compile_options(worker_pc_core PRIVATE -O3 -ffast-math -funroll-loops)
+set(WORKER_PC_COMMON_COMPILE_OPTIONS -O3 -ffast-math -funroll-loops)
+check_cxx_compiler_flag("-march=native" WORKER_PC_HAS_MARCH_NATIVE)
+if(WORKER_PC_HAS_MARCH_NATIVE)
+    list(APPEND WORKER_PC_COMMON_COMPILE_OPTIONS -march=native)
 endif()
+target_compile_options(worker_pc_core PRIVATE ${WORKER_PC_COMMON_COMPILE_OPTIONS})
 
 target_link_libraries(worker_pc_core PUBLIC m pthread)
 

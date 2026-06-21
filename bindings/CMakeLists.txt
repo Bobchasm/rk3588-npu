@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
 project(rk3588_python_bindings LANGUAGES CXX)
 
+include(CheckCXXCompilerFlag)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -53,11 +55,12 @@ if(BUILD_PC_PYTHON)
         worker_pc_core
     )
 
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
-        target_compile_options(pc_engine PRIVATE -O3 -march=native)
-    else()
-        target_compile_options(pc_engine PRIVATE -O3)
+    set(PC_ENGINE_COMPILE_OPTIONS -O3)
+    check_cxx_compiler_flag("-march=native" PC_ENGINE_HAS_MARCH_NATIVE)
+    if(PC_ENGINE_HAS_MARCH_NATIVE)
+        list(APPEND PC_ENGINE_COMPILE_OPTIONS -march=native)
     endif()
+    target_compile_options(pc_engine PRIVATE ${PC_ENGINE_COMPILE_OPTIONS})
 
     set_target_properties(pc_engine PROPERTIES
         LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/python/runtime
