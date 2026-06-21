@@ -301,6 +301,19 @@ cd /scheduler/build
 
 保持前面的启动方式不变，进入 CLI 后直接使用下面这些命令即可。
 
+CLI 每轮会打印：
+
+- `output_tokens`
+- `prefill_ms`
+- `decode_ms`
+- `decode_tok_s`
+
+其中 `decode_tok_s` 的计算口径与 `qwen2_demo` 一致，都是：
+
+```text
+decode_tokens / (decode_ms / 1000)
+```
+
 ### 常用命令
 
 - `/new`

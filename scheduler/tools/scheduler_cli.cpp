@@ -217,9 +217,14 @@ int main(int argc, char** argv) {
         if (result.request_count > 0) {
             std::cout << "[request #" << result.request_count << "] ";
         }
+        const float decode_tok_s =
+            result.decode_ms > 0.0f
+                ? result.decode_tokens / (result.decode_ms / 1000.0f)
+                : 0.0f;
         std::cout << "output_tokens=" << result.output_ids.size()
                   << " prefill_ms=" << result.prefill_ms
-                  << " decode_ms=" << result.decode_ms << std::endl;
+                  << " decode_ms=" << result.decode_ms
+                  << " decode_tok_s=" << decode_tok_s << std::endl;
         std::cout << result.output_text << std::endl;
     }
 

@@ -345,10 +345,15 @@ std::string WorkerService::handle_request(const std::string& request,
     if (distributed::deserialize_generate_request(request, generate_request)) {
         const auto response = handle_generate_tokens(generate_request);
         std::ostringstream extra;
+        const float decode_tok_s =
+            response.decode_ms > 0.0f
+                ? response.decode_tokens / (response.decode_ms / 1000.0f)
+                : 0.0f;
         extra << "input_tokens=" << generate_request.input_token_ids.size()
               << " output_tokens=" << response.output_token_ids.size()
               << " prefill_ms=" << response.prefill_ms
-              << " decode_ms=" << response.decode_ms;
+              << " decode_ms=" << response.decode_ms
+              << " decode_tok_s=" << decode_tok_s;
         log_request_summary(client, "GENERATE_TOKENS", response.context, response.status,
                             std::chrono::duration<double, std::milli>(Clock::now() - start_time).count(),
                             extra.str());
